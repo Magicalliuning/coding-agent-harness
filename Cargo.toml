@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "crates/harness-core",
+    "crates/harness-events",
+    "crates/harness-db",
+    "crates/harness-policy",
+    "crates/harness-tools",
+    "crates/harness-models",
+    "crates/harness-context",
+    "crates/harness-runtime",
+    "crates/harness-cli",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+repository = "https://github.com/Magicalliuning/coding-agent-harness"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"

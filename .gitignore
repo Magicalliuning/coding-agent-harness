@@ -1,1 +1,3 @@
 .codegraph
+target/
+.env

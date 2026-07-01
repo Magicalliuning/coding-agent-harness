@@ -1,0 +1,14 @@
+[package]
+name = "harness-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+harness-events = { path = "../harness-events" }
+harness-core = { path = "../harness-core" }
+
+[lints]
+workspace = true

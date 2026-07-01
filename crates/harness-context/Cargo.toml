@@ -1,0 +1,13 @@
+[package]
+name = "harness-context"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+
+[lints]
+workspace = true

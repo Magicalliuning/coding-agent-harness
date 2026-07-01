@@ -1,0 +1,19 @@
+[package]
+name = "harness-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+harness-context = { path = "../harness-context" }
+harness-db = { path = "../harness-db" }
+harness-events = { path = "../harness-events" }
+harness-models = { path = "../harness-models" }
+harness-policy = { path = "../harness-policy" }
+harness-tools = { path = "../harness-tools" }
+harness-core = { path = "../harness-core" }
+
+[lints]
+workspace = true
