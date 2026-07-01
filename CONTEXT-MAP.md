@@ -7,6 +7,8 @@ This file is the first domain entry point for agents working in this repository.
 - Current baseline: `docs/releases/v0.0.1.md`
 - Acceptance gate: `docs/development/v0-acceptance.md`
 - PRD: `docs/prd/v0-self-recovering-agent-runtime.md`
+- Next tranche PRD: `docs/prd/v0.1-v0.3-runtime-expansion.md`
+- Domain language: `CONTEXT.md`
 
 ## Runtime Core
 
