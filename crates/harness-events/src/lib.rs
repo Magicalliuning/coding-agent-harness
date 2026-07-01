@@ -20,6 +20,7 @@ pub const RECOVERY_REPAIR_ATTEMPTED_EVENT: &str = "recovery.repair_attempted";
 pub const RECOVERY_STOPPED_EVENT: &str = "recovery.stopped";
 pub const WORKER_LANE_REQUESTED_EVENT: &str = "worker_lane.requested";
 pub const WORKER_LANE_STATE_CHANGED_EVENT: &str = "worker_lane.state_changed";
+pub const WORKER_LANE_WORKTREE_ALLOCATED_EVENT: &str = "worker_lane.worktree_allocated";
 pub const WORKER_LANE_OBSERVATION_RECORDED_EVENT: &str = "worker_lane.observation_recorded";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +40,7 @@ pub enum EventType {
     RecoveryStopped,
     WorkerLaneRequested,
     WorkerLaneStateChanged,
+    WorkerLaneWorktreeAllocated,
     WorkerLaneObservationRecorded,
 }
 
@@ -61,6 +63,7 @@ impl EventType {
             Self::RecoveryStopped => RECOVERY_STOPPED_EVENT,
             Self::WorkerLaneRequested => WORKER_LANE_REQUESTED_EVENT,
             Self::WorkerLaneStateChanged => WORKER_LANE_STATE_CHANGED_EVENT,
+            Self::WorkerLaneWorktreeAllocated => WORKER_LANE_WORKTREE_ALLOCATED_EVENT,
             Self::WorkerLaneObservationRecorded => WORKER_LANE_OBSERVATION_RECORDED_EVENT,
         }
     }
@@ -82,6 +85,7 @@ impl EventType {
             RECOVERY_STOPPED_EVENT => Ok(Self::RecoveryStopped),
             WORKER_LANE_REQUESTED_EVENT => Ok(Self::WorkerLaneRequested),
             WORKER_LANE_STATE_CHANGED_EVENT => Ok(Self::WorkerLaneStateChanged),
+            WORKER_LANE_WORKTREE_ALLOCATED_EVENT => Ok(Self::WorkerLaneWorktreeAllocated),
             WORKER_LANE_OBSERVATION_RECORDED_EVENT => Ok(Self::WorkerLaneObservationRecorded),
             other => Err(HarnessError::new(format!("unknown event type: {other}"))),
         }
@@ -568,6 +572,34 @@ impl WorkerLaneStatePayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerLaneWorktreeAllocatedPayload {
+    pub lane_id: String,
+    pub lane_kind: String,
+    pub session_repo_path: String,
+    pub worktree_path: String,
+    pub base_ref: String,
+}
+
+impl WorkerLaneWorktreeAllocatedPayload {
+    #[must_use]
+    pub fn new(
+        lane_id: impl Into<String>,
+        lane_kind: impl Into<String>,
+        session_repo_path: impl Into<String>,
+        worktree_path: impl Into<String>,
+        base_ref: impl Into<String>,
+    ) -> Self {
+        Self {
+            lane_id: lane_id.into(),
+            lane_kind: lane_kind.into(),
+            session_repo_path: session_repo_path.into(),
+            worktree_path: worktree_path.into(),
+            base_ref: base_ref.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerLaneObservationPayload {
     pub lane_id: String,
     pub lane_kind: String,
@@ -709,6 +741,13 @@ impl NewEvent {
         payload: WorkerLaneStatePayload,
     ) -> HarnessResult<Self> {
         Self::new(session_id, EventType::WorkerLaneStateChanged, payload)
+    }
+
+    pub fn worker_lane_worktree_allocated(
+        session_id: Uuid,
+        payload: WorkerLaneWorktreeAllocatedPayload,
+    ) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::WorkerLaneWorktreeAllocated, payload)
     }
 
     pub fn worker_lane_observation_recorded(
@@ -979,6 +1018,17 @@ mod tests {
             ),
         )
         .expect("worker lane state event");
+        let allocated = NewEvent::worker_lane_worktree_allocated(
+            session_id,
+            WorkerLaneWorktreeAllocatedPayload::new(
+                "lane-1",
+                "codex_cli",
+                "C:/repo",
+                "C:/repo-worktree",
+                "HEAD",
+            ),
+        )
+        .expect("worker lane worktree event");
         let observation = NewEvent::worker_lane_observation_recorded(
             session_id,
             WorkerLaneObservationPayload {
@@ -1002,6 +1052,12 @@ mod tests {
         assert_eq!(running.event_type.as_str(), "worker_lane.state_changed");
         assert_eq!(running.payload["from_state"], "queued");
         assert_eq!(running.payload["to_state"], "running");
+        assert_eq!(
+            allocated.event_type.as_str(),
+            "worker_lane.worktree_allocated"
+        );
+        assert_eq!(allocated.payload["worktree_path"], "C:/repo-worktree");
+        assert_eq!(allocated.payload["base_ref"], "HEAD");
         assert_eq!(
             observation.event_type.as_str(),
             "worker_lane.observation_recorded"
