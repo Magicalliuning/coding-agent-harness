@@ -2,6 +2,12 @@
 
 This file is the first domain entry point for agents working in this repository. It maps the current V0 runtime areas to the code, documentation, and acceptance evidence that govern them.
 
+## Release Baseline
+
+- Current baseline: `docs/releases/v0.0.1.md`
+- Acceptance gate: `docs/development/v0-acceptance.md`
+- PRD: `docs/prd/v0-self-recovering-agent-runtime.md`
+
 ## Runtime Core
 
 - Crates: `crates/harness-runtime`, `crates/harness-events`, `crates/harness-db`
