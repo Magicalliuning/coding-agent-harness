@@ -382,6 +382,8 @@ pub struct DiffSummaryPayload {
     pub insertions: usize,
     pub deletions: usize,
     pub paths: Vec<String>,
+    pub git_status: String,
+    pub git_diff: String,
 }
 
 impl DiffSummaryPayload {
@@ -397,7 +399,20 @@ impl DiffSummaryPayload {
             insertions,
             deletions,
             paths,
+            git_status: String::new(),
+            git_diff: String::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_git_evidence(
+        mut self,
+        git_status: impl Into<String>,
+        git_diff: impl Into<String>,
+    ) -> Self {
+        self.git_status = git_status.into();
+        self.git_diff = git_diff.into();
+        self
     }
 }
 
