@@ -3,8 +3,9 @@ use std::path::PathBuf;
 
 use harness_core::{HarnessError, HarnessResult};
 use harness_runtime::{
-    ContextBudget, Runtime, SessionContextCompileRequest, SessionContextCompileResult,
-    SessionProjection, StartSessionRequest, VerificationCommandRequest, VerificationCommandResult,
+    ContextBudget, FakeModelTurnRequest, FakeModelTurnResult, Runtime,
+    SessionContextCompileRequest, SessionContextCompileResult, SessionProjection,
+    StartSessionRequest, VerificationCommandRequest, VerificationCommandResult,
 };
 use uuid::Uuid;
 
@@ -109,6 +110,36 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
             )?;
 
             print_context_compile_result(&result);
+            Ok(())
+        }
+        "fake-turn" => {
+            let session_id = args
+                .get(1)
+                .ok_or_else(|| HarnessError::new("session id is required"))?;
+            let session_id = Uuid::parse_str(session_id)
+                .map_err(|error| HarnessError::new(error.to_string()))?;
+            let database_url = database_url_from_args(args.clone())?;
+            let task = required_arg_value(&args, "--task")?;
+            let budget = context_budget_from_args(&args)?;
+            let focus_terms = repeated_arg_values(&args, "--focus");
+            let max_output_tokens = optional_arg_value(&args, "--max-output-tokens")
+                .map(|value| parse_usize_arg("--max-output-tokens", value))
+                .transpose()?
+                .unwrap_or(256);
+            let mut runtime = Runtime::connect_postgres(&database_url)?;
+            let result = runtime.run_fake_model_turn(
+                session_id,
+                FakeModelTurnRequest {
+                    task: task.to_owned(),
+                    context: SessionContextCompileRequest {
+                        budget,
+                        focus_terms,
+                    },
+                    max_output_tokens,
+                },
+            )?;
+
+            print_fake_model_turn_result(&result);
             Ok(())
         }
         other => Err(HarnessError::new(format!(
@@ -229,5 +260,16 @@ fn print_context_compile_result(result: &SessionContextCompileResult) {
     println!("context_skills={}", result.bundle.skills.len());
     println!("context_used_bytes={}", result.bundle.used_bytes);
     println!("context_truncated={}", result.bundle.truncated);
+    println!("event_count={}", result.event_count);
+}
+
+fn print_fake_model_turn_result(result: &FakeModelTurnResult) {
+    println!("session_id={}", result.session_id);
+    println!("patch_path={}", result.patch.path);
+    println!("policy_decision={}", result.decision.as_str());
+    println!("policy_reason={}", result.reason);
+    println!("patch_applied={}", result.observation.is_some());
+    println!("prompt_tokens={}", result.prompt_tokens);
+    println!("completion_tokens={}", result.completion_tokens);
     println!("event_count={}", result.event_count);
 }

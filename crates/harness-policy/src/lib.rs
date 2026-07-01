@@ -65,6 +65,22 @@ pub fn evaluate_verification_command(program: &str, args: &[String]) -> PolicyEv
     )
 }
 
+#[must_use]
+pub fn evaluate_file_patch(relative_path: &str, replacement_bytes: usize) -> PolicyEvaluation {
+    if !is_safe_relative_path(relative_path) {
+        return PolicyEvaluation::new(
+            PolicyDecision::Deny,
+            "patch path must stay inside the repository",
+        );
+    }
+
+    if replacement_bytes > 16 * 1024 {
+        return PolicyEvaluation::new(PolicyDecision::Ask, "patch exceeds safe auto-apply size");
+    }
+
+    PolicyEvaluation::new(PolicyDecision::Allow, "patch is safe to apply")
+}
+
 fn normalized_program_name(program: &str) -> &str {
     let program_name = std::path::Path::new(program)
         .file_name()
@@ -115,6 +131,23 @@ fn is_allowed_cargo_verification(program_name: &str, args: &[String]) -> bool {
     )
 }
 
+fn is_safe_relative_path(relative_path: &str) -> bool {
+    let path = std::path::Path::new(relative_path);
+
+    if relative_path.trim().is_empty() || path.is_absolute() {
+        return false;
+    }
+
+    !path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +190,26 @@ mod tests {
 
         assert_eq!(evaluation.decision, PolicyDecision::Ask);
         assert_eq!(evaluation.decision.as_str(), "ask");
+    }
+
+    #[test]
+    fn safe_file_patches_are_allowed() {
+        let evaluation = evaluate_file_patch(".harness/fake-agent-turn.md", 256);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Allow);
+    }
+
+    #[test]
+    fn path_traversal_file_patches_are_denied() {
+        let evaluation = evaluate_file_patch("../outside.md", 256);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn large_file_patches_require_approval() {
+        let evaluation = evaluate_file_patch(".harness/fake-agent-turn.md", 20 * 1024);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Ask);
     }
 }

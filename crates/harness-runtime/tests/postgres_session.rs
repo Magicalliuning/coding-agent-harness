@@ -1,7 +1,13 @@
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use harness_events::EventType;
 use harness_policy::PolicyDecision;
 use harness_runtime::{
-    ContextBudget, Runtime, SessionContextCompileRequest, SessionStatus, StartSessionRequest,
-    VerificationCommandRequest,
+    ContextBudget, FakeModelTurnRequest, Runtime, SessionContextCompileRequest, SessionStatus,
+    StartSessionRequest, VerificationCommandRequest,
 };
 use uuid::Uuid;
 
@@ -91,6 +97,67 @@ fn session_context_compilation_is_recorded() -> Result<(), Box<dyn std::error::E
 }
 
 #[test]
+fn fake_model_turn_records_patch_observation() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = fixture_repo()?;
+    write_file(&repo, "AGENTS.md", "Use deterministic agent fixtures.")?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo.display().to_string()))?;
+
+    let result = runtime.run_fake_model_turn(
+        started.session_id,
+        FakeModelTurnRequest {
+            task: "write the first fake patch".to_owned(),
+            context: SessionContextCompileRequest {
+                budget: ContextBudget {
+                    max_bytes: 4096,
+                    max_files: 8,
+                    max_skill_files: 8,
+                },
+                focus_terms: vec!["agent".to_owned()],
+            },
+            max_output_tokens: 256,
+        },
+    )?;
+    let written = fs::read_to_string(repo.join(".harness/fake-agent-turn.md"))?;
+    let events = runtime.events_for_session(started.session_id)?;
+    let event_types = events
+        .iter()
+        .map(|event| event.event_type)
+        .collect::<Vec<_>>();
+
+    assert_eq!(result.decision, PolicyDecision::Allow);
+    assert!(result.observation.is_some());
+    assert!(written.contains("write the first fake patch"));
+    assert_eq!(result.event_count, 7);
+    assert_eq!(
+        event_types,
+        vec![
+            EventType::SessionStarted,
+            EventType::ContextCompiled,
+            EventType::ModelRequestRecorded,
+            EventType::ModelDecisionRecorded,
+            EventType::ToolCallIntended,
+            EventType::PolicyDecided,
+            EventType::ToolObservationRecorded,
+        ]
+    );
+    assert_eq!(
+        events[3].payload["patch"]["path"],
+        ".harness/fake-agent-turn.md"
+    );
+    assert_eq!(events[4].payload["tool_name"], "apply_file_patch");
+    assert_eq!(events[6].payload["applied"], true);
+
+    Ok(())
+}
+
+#[test]
 fn denied_verification_command_is_not_executed() -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
         return Ok(());
@@ -151,4 +218,30 @@ fn workspace_root() -> Result<String, Box<dyn std::error::Error>> {
         .canonicalize()?
         .display()
         .to_string())
+}
+
+fn fixture_repo() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "coding-agent-harness-runtime-test-{}-{suffix}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
+fn write_file(
+    root: &Path,
+    relative_path: &str,
+    content: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = root.join(relative_path);
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut file = fs::File::create(path)?;
+    file.write_all(content.as_bytes())?;
+    Ok(())
 }

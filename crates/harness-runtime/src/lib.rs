@@ -3,12 +3,17 @@ use harness_context::{CompiledContextBundle, ContextCompileRequest, compile_repo
 use harness_core::{HarnessError, HarnessResult};
 use harness_db::PostgresEventStore;
 use harness_events::{
-    ContextCompiledPayload, ContextSourcePayload, EventEnvelope, EventType, NewEvent,
-    PolicyDecisionPayload, SessionStartedPayload, SkillMetadataPayload, ToolCallIntentPayload,
-    ToolObservationPayload,
+    ContextCompiledPayload, ContextSourcePayload, EventEnvelope, EventType, FilePatchIntentPayload,
+    FilePatchObservationPayload, FilePatchPayload, ModelDecisionPayload, ModelRequestPayload,
+    NewEvent, PolicyDecisionPayload, SessionStartedPayload, SkillMetadataPayload,
+    ToolCallIntentPayload, ToolObservationPayload,
 };
-use harness_policy::{PolicyDecision, evaluate_verification_command};
-use harness_tools::{CommandObservation, CommandToolRuntime, VerifyCommandIntent};
+use harness_models::{DeterministicFakeModelProvider, FakeModelRequest, FilePatchProposal};
+use harness_policy::{PolicyDecision, evaluate_file_patch, evaluate_verification_command};
+use harness_tools::{
+    CommandObservation, CommandToolRuntime, FilePatchIntent, FilePatchObservation,
+    VerifyCommandIntent,
+};
 use uuid::Uuid;
 
 pub struct Runtime {
@@ -89,6 +94,36 @@ pub struct SessionContextCompileResult {
     pub event_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeModelTurnRequest {
+    pub task: String,
+    pub context: SessionContextCompileRequest,
+    pub max_output_tokens: usize,
+}
+
+impl FakeModelTurnRequest {
+    #[must_use]
+    pub fn new(task: impl Into<String>) -> Self {
+        Self {
+            task: task.into(),
+            context: SessionContextCompileRequest::default(),
+            max_output_tokens: 256,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeModelTurnResult {
+    pub session_id: Uuid,
+    pub patch: FilePatchProposal,
+    pub decision: PolicyDecision,
+    pub reason: String,
+    pub observation: Option<FilePatchObservation>,
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub event_count: usize,
+}
+
 impl Runtime {
     #[must_use]
     pub fn new(event_store: PostgresEventStore) -> Self {
@@ -118,6 +153,10 @@ impl Runtime {
     pub fn show_session(&self, session_id: Uuid) -> HarnessResult<SessionProjection> {
         let events = self.event_store.events_for_session(session_id)?;
         project_session(session_id, &events)
+    }
+
+    pub fn events_for_session(&self, session_id: Uuid) -> HarnessResult<Vec<EventEnvelope>> {
+        self.event_store.events_for_session(session_id)
     }
 
     pub fn run_verification_command(
@@ -203,6 +242,113 @@ impl Runtime {
             event_count: self.event_store.events_for_session(session_id)?.len(),
         })
     }
+
+    pub fn run_fake_model_turn(
+        &mut self,
+        session_id: Uuid,
+        request: FakeModelTurnRequest,
+    ) -> HarnessResult<FakeModelTurnResult> {
+        let context = self.compile_session_context(session_id, request.context)?;
+        let model_request = FakeModelRequest::new(
+            request.task,
+            context.bundle.sources.len(),
+            context.bundle.used_bytes,
+            request.max_output_tokens,
+        )?;
+        let provider = DeterministicFakeModelProvider;
+
+        self.event_store
+            .append_event(NewEvent::model_request_recorded(
+                session_id,
+                ModelRequestPayload::new(
+                    "deterministic-fake-model",
+                    model_request.task.clone(),
+                    model_request.context_source_count,
+                    model_request.context_used_bytes,
+                    model_request.max_output_tokens,
+                ),
+            )?)?;
+
+        let decision = provider.decide(model_request)?;
+        let patch_payload = file_patch_payload(&decision.patch);
+
+        self.event_store
+            .append_event(NewEvent::model_decision_recorded(
+                session_id,
+                ModelDecisionPayload::new(
+                    decision.provider,
+                    decision.summary.clone(),
+                    decision.usage.prompt_tokens,
+                    decision.usage.completion_tokens,
+                    decision.usage.max_output_tokens,
+                    patch_payload.clone(),
+                ),
+            )?)?;
+
+        let tool_name = harness_tools::APPLY_FILE_PATCH_TOOL.name;
+        let intent = FilePatchIntent::new(
+            context.bundle.repo_path.clone(),
+            decision.patch.path.clone(),
+            decision.patch.expected_content.clone(),
+            decision.patch.replacement_content.clone(),
+        )?;
+
+        self.event_store
+            .append_event(NewEvent::file_patch_intended(
+                session_id,
+                FilePatchIntentPayload::new(
+                    tool_name,
+                    context.bundle.repo_path.clone(),
+                    patch_payload,
+                ),
+            )?)?;
+
+        let evaluation = evaluate_file_patch(
+            &decision.patch.path,
+            decision.patch.replacement_content.len(),
+        );
+
+        self.event_store.append_event(NewEvent::policy_decided(
+            session_id,
+            PolicyDecisionPayload::new(
+                tool_name,
+                evaluation.decision.as_str(),
+                evaluation.reason.clone(),
+            ),
+        )?)?;
+
+        let observation = if evaluation.decision == PolicyDecision::Allow {
+            let observation = CommandToolRuntime.run_file_patch(&intent)?;
+
+            self.event_store
+                .append_event(NewEvent::file_patch_observation_recorded(
+                    session_id,
+                    FilePatchObservationPayload::new(
+                        tool_name,
+                        observation.path.clone(),
+                        observation.applied,
+                        observation.previous_bytes,
+                        observation.new_bytes,
+                        observation.duration_ms,
+                    ),
+                )?)?;
+
+            Some(observation)
+        } else {
+            None
+        };
+
+        Ok(FakeModelTurnResult {
+            session_id,
+            patch: decision.patch,
+            decision: evaluation.decision,
+            reason: evaluation.reason,
+            observation,
+            prompt_tokens: decision.usage.prompt_tokens,
+            completion_tokens: decision.usage.completion_tokens,
+            event_count: self.event_store.events_for_session(session_id)?.len(),
+        })
+    }
 }
 
 pub fn apply_database_migrations(database_url: &str) -> HarnessResult<()> {
@@ -271,6 +417,14 @@ fn context_compiled_payload(bundle: &CompiledContextBundle) -> ContextCompiledPa
             })
             .collect(),
     }
+}
+
+fn file_patch_payload(patch: &FilePatchProposal) -> FilePatchPayload {
+    FilePatchPayload::new(
+        patch.path.clone(),
+        patch.expected_content.clone(),
+        patch.replacement_content.clone(),
+    )
 }
 
 #[must_use]
