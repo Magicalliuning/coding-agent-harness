@@ -185,6 +185,83 @@ fn cli_runs_fake_model_turn() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[test]
+fn cli_coding_task_stops_pending_commit_approval() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+    let repo = fixture_repo()?;
+    write_file(&repo, "AGENTS.md", "Use deterministic agent fixtures.")?;
+    init_git_repo(&repo)?;
+    let commit_count_before = git_commit_count(&repo)?;
+
+    let migrate = Command::new(bin)
+        .args(["migrate", "--database-url", &database_url])
+        .output()?;
+    assert!(migrate.status.success());
+
+    let repo_path = repo.display().to_string();
+    let start = Command::new(bin)
+        .args([
+            "session",
+            "start",
+            "--repo",
+            &repo_path,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(start.status.success());
+
+    let start_stdout = String::from_utf8(start.stdout)?;
+    let session_id = value_for_key(&start_stdout, "session_id").expect("session_id output");
+
+    let task = Command::new(bin)
+        .args([
+            "session",
+            "coding-task",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task",
+            "write the verified CLI fake patch",
+            "--max-bytes",
+            "4096",
+            "--focus",
+            "agent",
+            "--",
+            "cargo",
+            "--version",
+        ])
+        .output()?;
+    assert!(task.status.success());
+
+    let task_stdout = String::from_utf8(task.stdout)?;
+    let written = fs::read_to_string(repo.join(".harness/fake-agent-turn.md"))?;
+    let commit_count_after = git_commit_count(&repo)?;
+    assert!(task_stdout.contains("patch_path=.harness/fake-agent-turn.md"));
+    assert!(task_stdout.contains("patch_applied=true"));
+    assert!(task_stdout.contains("verification_decision=allow"));
+    assert!(task_stdout.contains("verification_executed=true"));
+    assert!(task_stdout.contains("verification_exit_code=0"));
+    assert!(task_stdout.contains("diff_files_changed=1"));
+    assert!(task_stdout.contains("diff_insertions="));
+    assert!(task_stdout.contains("diff_deletions=0"));
+    assert!(task_stdout.contains("event_replay_total=12"));
+    assert!(task_stdout.contains("event_replay_last=commit.approval_pending"));
+    assert!(task_stdout.contains("token_prompt="));
+    assert!(task_stdout.contains("token_completion="));
+    assert!(task_stdout.contains("token_total="));
+    assert!(task_stdout.contains("final_state=pending_commit_approval"));
+    assert!(task_stdout.contains("event_count=12"));
+    assert!(written.contains("write the verified CLI fake patch"));
+    assert_eq!(commit_count_before, commit_count_after);
+
+    Ok(())
+}
+
 fn database_url() -> Option<String> {
     std::env::var("HARNESS_TEST_DATABASE_URL")
         .or_else(|_| std::env::var("HARNESS_DATABASE_URL"))
@@ -221,4 +298,41 @@ fn write_file(
     let mut file = fs::File::create(path)?;
     file.write_all(content.as_bytes())?;
     Ok(())
+}
+
+fn init_git_repo(repo: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let init = Command::new("git").arg("init").current_dir(repo).output()?;
+    assert!(init.status.success());
+
+    let add = Command::new("git")
+        .args(["add", "AGENTS.md"])
+        .current_dir(repo)
+        .output()?;
+    assert!(add.status.success());
+
+    let commit = Command::new("git")
+        .args([
+            "-c",
+            "user.name=Coding Agent Harness Test",
+            "-c",
+            "user.email=harness-test@example.invalid",
+            "commit",
+            "-m",
+            "initial fixture",
+        ])
+        .current_dir(repo)
+        .output()?;
+    assert!(commit.status.success());
+
+    Ok(())
+}
+
+fn git_commit_count(repo: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("git")
+        .args(["rev-list", "--count", "HEAD"])
+        .current_dir(repo)
+        .output()?;
+    assert!(output.status.success());
+
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }

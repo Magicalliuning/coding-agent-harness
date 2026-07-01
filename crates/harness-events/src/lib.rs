@@ -12,6 +12,8 @@ pub const TOOL_OBSERVATION_RECORDED_EVENT: &str = "tool.observation_recorded";
 pub const CONTEXT_COMPILED_EVENT: &str = "context.compiled";
 pub const MODEL_REQUEST_RECORDED_EVENT: &str = "model.request_recorded";
 pub const MODEL_DECISION_RECORDED_EVENT: &str = "model.decision_recorded";
+pub const DIFF_RECORDED_EVENT: &str = "diff.recorded";
+pub const COMMIT_APPROVAL_PENDING_EVENT: &str = "commit.approval_pending";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventType {
@@ -22,6 +24,8 @@ pub enum EventType {
     ContextCompiled,
     ModelRequestRecorded,
     ModelDecisionRecorded,
+    DiffRecorded,
+    CommitApprovalPending,
 }
 
 impl EventType {
@@ -35,6 +39,8 @@ impl EventType {
             Self::ContextCompiled => CONTEXT_COMPILED_EVENT,
             Self::ModelRequestRecorded => MODEL_REQUEST_RECORDED_EVENT,
             Self::ModelDecisionRecorded => MODEL_DECISION_RECORDED_EVENT,
+            Self::DiffRecorded => DIFF_RECORDED_EVENT,
+            Self::CommitApprovalPending => COMMIT_APPROVAL_PENDING_EVENT,
         }
     }
 
@@ -47,6 +53,8 @@ impl EventType {
             CONTEXT_COMPILED_EVENT => Ok(Self::ContextCompiled),
             MODEL_REQUEST_RECORDED_EVENT => Ok(Self::ModelRequestRecorded),
             MODEL_DECISION_RECORDED_EVENT => Ok(Self::ModelDecisionRecorded),
+            DIFF_RECORDED_EVENT => Ok(Self::DiffRecorded),
+            COMMIT_APPROVAL_PENDING_EVENT => Ok(Self::CommitApprovalPending),
             other => Err(HarnessError::new(format!("unknown event type: {other}"))),
         }
     }
@@ -336,6 +344,47 @@ impl ModelDecisionPayload {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffSummaryPayload {
+    pub files_changed: usize,
+    pub insertions: usize,
+    pub deletions: usize,
+    pub paths: Vec<String>,
+}
+
+impl DiffSummaryPayload {
+    #[must_use]
+    pub fn new(
+        files_changed: usize,
+        insertions: usize,
+        deletions: usize,
+        paths: Vec<String>,
+    ) -> Self {
+        Self {
+            files_changed,
+            insertions,
+            deletions,
+            paths,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitApprovalPendingPayload {
+    pub state: String,
+    pub summary: String,
+}
+
+impl CommitApprovalPendingPayload {
+    #[must_use]
+    pub fn new(state: impl Into<String>, summary: impl Into<String>) -> Self {
+        Self {
+            state: state.into(),
+            summary: summary.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewEvent {
     pub event_id: Uuid,
@@ -411,6 +460,17 @@ impl NewEvent {
         payload: ModelDecisionPayload,
     ) -> HarnessResult<Self> {
         Self::new(session_id, EventType::ModelDecisionRecorded, payload)
+    }
+
+    pub fn diff_recorded(session_id: Uuid, payload: DiffSummaryPayload) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::DiffRecorded, payload)
+    }
+
+    pub fn commit_approval_pending(
+        session_id: Uuid,
+        payload: CommitApprovalPendingPayload,
+    ) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::CommitApprovalPending, payload)
     }
 
     fn new(
@@ -572,5 +632,29 @@ mod tests {
         );
         assert_eq!(intent.event_type.as_str(), "tool.call_intended");
         assert_eq!(intent.payload["tool_name"], "apply_file_patch");
+    }
+
+    #[test]
+    fn coding_task_events_serialize_diff_and_pending_approval() {
+        let session_id = Uuid::new_v4();
+        let diff = NewEvent::diff_recorded(
+            session_id,
+            DiffSummaryPayload::new(1, 4, 0, vec![".harness/fake-agent-turn.md".to_owned()]),
+        )
+        .expect("diff event");
+        let pending = NewEvent::commit_approval_pending(
+            session_id,
+            CommitApprovalPendingPayload::new(
+                "pending_commit_approval",
+                "verification passed; awaiting human commit approval",
+            ),
+        )
+        .expect("commit approval pending event");
+
+        assert_eq!(diff.event_type.as_str(), "diff.recorded");
+        assert_eq!(diff.payload["files_changed"], 1);
+        assert_eq!(diff.payload["paths"][0], ".harness/fake-agent-turn.md");
+        assert_eq!(pending.event_type.as_str(), "commit.approval_pending");
+        assert_eq!(pending.payload["state"], "pending_commit_approval");
     }
 }

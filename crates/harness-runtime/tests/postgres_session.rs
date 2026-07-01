@@ -6,8 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use harness_events::EventType;
 use harness_policy::PolicyDecision;
 use harness_runtime::{
-    ContextBudget, FakeModelTurnRequest, Runtime, SessionContextCompileRequest, SessionStatus,
-    StartSessionRequest, VerificationCommandRequest,
+    ContextBudget, FakeModelTurnRequest, PENDING_COMMIT_APPROVAL_STATE, Runtime,
+    SessionContextCompileRequest, SessionStatus, SmallCodingTaskRequest, StartSessionRequest,
+    VerificationCommandRequest,
 };
 use uuid::Uuid;
 
@@ -153,6 +154,90 @@ fn fake_model_turn_records_patch_observation() -> Result<(), Box<dyn std::error:
     );
     assert_eq!(events[4].payload["tool_name"], "apply_file_patch");
     assert_eq!(events[6].payload["applied"], true);
+
+    Ok(())
+}
+
+#[test]
+fn small_coding_task_stops_at_pending_commit_approval() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = fixture_repo()?;
+    write_file(&repo, "AGENTS.md", "Use deterministic agent fixtures.")?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo.display().to_string()))?;
+
+    let result = runtime.run_small_coding_task(
+        started.session_id,
+        SmallCodingTaskRequest {
+            task: "write the verified fake patch".to_owned(),
+            context: SessionContextCompileRequest {
+                budget: ContextBudget {
+                    max_bytes: 4096,
+                    max_files: 8,
+                    max_skill_files: 8,
+                },
+                focus_terms: vec!["agent".to_owned()],
+            },
+            max_output_tokens: 256,
+            verification: VerificationCommandRequest::new("cargo", vec!["--version".to_owned()]),
+        },
+    )?;
+    let written = fs::read_to_string(repo.join(".harness/fake-agent-turn.md"))?;
+    let events = runtime.events_for_session(started.session_id)?;
+    let event_types = events
+        .iter()
+        .map(|event| event.event_type)
+        .collect::<Vec<_>>();
+
+    assert_eq!(result.final_state, PENDING_COMMIT_APPROVAL_STATE);
+    assert!(written.contains("write the verified fake patch"));
+    assert_eq!(result.diff.files_changed, 1);
+    assert!(result.diff.insertions > 0);
+    assert_eq!(result.diff.deletions, 0);
+    assert_eq!(result.diff.paths, vec![".harness/fake-agent-turn.md"]);
+    assert_eq!(result.verification.decision, PolicyDecision::Allow);
+    assert_eq!(
+        result
+            .verification
+            .observation
+            .as_ref()
+            .and_then(|item| item.exit_code),
+        Some(0)
+    );
+    assert_eq!(
+        result.token_ledger.total_tokens,
+        result.token_ledger.prompt_tokens + result.token_ledger.completion_tokens
+    );
+    assert_eq!(result.event_replay.total_events, 12);
+    assert_eq!(
+        result.event_replay.last_event_type.as_deref(),
+        Some("commit.approval_pending")
+    );
+    assert_eq!(result.event_count, 12);
+    assert_eq!(
+        event_types,
+        vec![
+            EventType::SessionStarted,
+            EventType::ContextCompiled,
+            EventType::ModelRequestRecorded,
+            EventType::ModelDecisionRecorded,
+            EventType::ToolCallIntended,
+            EventType::PolicyDecided,
+            EventType::ToolObservationRecorded,
+            EventType::ToolCallIntended,
+            EventType::PolicyDecided,
+            EventType::ToolObservationRecorded,
+            EventType::DiffRecorded,
+            EventType::CommitApprovalPending,
+        ]
+    );
+    assert_eq!(events[10].payload["files_changed"], 1);
+    assert_eq!(events[11].payload["state"], PENDING_COMMIT_APPROVAL_STATE);
 
     Ok(())
 }

@@ -5,7 +5,8 @@ use harness_core::{HarnessError, HarnessResult};
 use harness_runtime::{
     ContextBudget, FakeModelTurnRequest, FakeModelTurnResult, Runtime,
     SessionContextCompileRequest, SessionContextCompileResult, SessionProjection,
-    StartSessionRequest, VerificationCommandRequest, VerificationCommandResult,
+    SmallCodingTaskRequest, SmallCodingTaskResult, StartSessionRequest, VerificationCommandRequest,
+    VerificationCommandResult,
 };
 use uuid::Uuid;
 
@@ -142,6 +143,42 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
             print_fake_model_turn_result(&result);
             Ok(())
         }
+        "coding-task" => {
+            let session_id = args
+                .get(1)
+                .ok_or_else(|| HarnessError::new("session id is required"))?;
+            let session_id = Uuid::parse_str(session_id)
+                .map_err(|error| HarnessError::new(error.to_string()))?;
+            let database_url = database_url_from_args(args_before_separator(&args).to_vec())?;
+            let task = required_arg_value(args_before_separator(&args), "--task")?;
+            let budget = context_budget_from_args(args_before_separator(&args))?;
+            let focus_terms = repeated_arg_values(args_before_separator(&args), "--focus");
+            let max_output_tokens =
+                optional_arg_value(args_before_separator(&args), "--max-output-tokens")
+                    .map(|value| parse_usize_arg("--max-output-tokens", value))
+                    .transpose()?
+                    .unwrap_or(256);
+            let command = command_after_separator(&args)?;
+            let mut runtime = Runtime::connect_postgres(&database_url)?;
+            let result = runtime.run_small_coding_task(
+                session_id,
+                SmallCodingTaskRequest {
+                    task: task.to_owned(),
+                    context: SessionContextCompileRequest {
+                        budget,
+                        focus_terms,
+                    },
+                    max_output_tokens,
+                    verification: VerificationCommandRequest::new(
+                        command[0].clone(),
+                        command[1..].to_vec(),
+                    ),
+                },
+            )?;
+
+            print_small_coding_task_result(&result);
+            Ok(())
+        }
         other => Err(HarnessError::new(format!(
             "unknown session command: {other}"
         ))),
@@ -271,5 +308,43 @@ fn print_fake_model_turn_result(result: &FakeModelTurnResult) {
     println!("patch_applied={}", result.observation.is_some());
     println!("prompt_tokens={}", result.prompt_tokens);
     println!("completion_tokens={}", result.completion_tokens);
+    println!("event_count={}", result.event_count);
+}
+
+fn print_small_coding_task_result(result: &SmallCodingTaskResult) {
+    println!("session_id={}", result.session_id);
+    println!("patch_path={}", result.patch.path);
+    println!("patch_applied={}", result.patch_applied);
+    println!(
+        "verification_decision={}",
+        result.verification.decision.as_str()
+    );
+    println!(
+        "verification_executed={}",
+        result.verification.observation.is_some()
+    );
+
+    if let Some(observation) = &result.verification.observation {
+        if let Some(exit_code) = observation.exit_code {
+            println!("verification_exit_code={exit_code}");
+        } else {
+            println!("verification_exit_code=signal");
+        }
+    }
+
+    println!("diff_files_changed={}", result.diff.files_changed);
+    println!("diff_insertions={}", result.diff.insertions);
+    println!("diff_deletions={}", result.diff.deletions);
+    println!("diff_paths={}", result.diff.paths.join(","));
+    println!("event_replay_total={}", result.event_replay.total_events);
+    println!(
+        "event_replay_last={}",
+        result.event_replay.last_event_type.as_deref().unwrap_or("")
+    );
+    println!("token_prompt={}", result.token_ledger.prompt_tokens);
+    println!("token_completion={}", result.token_ledger.completion_tokens);
+    println!("token_total={}", result.token_ledger.total_tokens);
+    println!("token_max_output={}", result.token_ledger.max_output_tokens);
+    println!("final_state={}", result.final_state);
     println!("event_count={}", result.event_count);
 }

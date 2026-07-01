@@ -3,10 +3,10 @@ use harness_context::{CompiledContextBundle, ContextCompileRequest, compile_repo
 use harness_core::{HarnessError, HarnessResult};
 use harness_db::PostgresEventStore;
 use harness_events::{
-    ContextCompiledPayload, ContextSourcePayload, EventEnvelope, EventType, FilePatchIntentPayload,
-    FilePatchObservationPayload, FilePatchPayload, ModelDecisionPayload, ModelRequestPayload,
-    NewEvent, PolicyDecisionPayload, SessionStartedPayload, SkillMetadataPayload,
-    ToolCallIntentPayload, ToolObservationPayload,
+    CommitApprovalPendingPayload, ContextCompiledPayload, ContextSourcePayload, DiffSummaryPayload,
+    EventEnvelope, EventType, FilePatchIntentPayload, FilePatchObservationPayload,
+    FilePatchPayload, ModelDecisionPayload, ModelRequestPayload, NewEvent, PolicyDecisionPayload,
+    SessionStartedPayload, SkillMetadataPayload, ToolCallIntentPayload, ToolObservationPayload,
 };
 use harness_models::{DeterministicFakeModelProvider, FakeModelRequest, FilePatchProposal};
 use harness_policy::{PolicyDecision, evaluate_file_patch, evaluate_verification_command};
@@ -15,6 +15,8 @@ use harness_tools::{
     VerifyCommandIntent,
 };
 use uuid::Uuid;
+
+pub const PENDING_COMMIT_APPROVAL_STATE: &str = "pending_commit_approval";
 
 pub struct Runtime {
     event_store: PostgresEventStore,
@@ -121,6 +123,62 @@ pub struct FakeModelTurnResult {
     pub observation: Option<FilePatchObservation>,
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
+    pub event_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmallCodingTaskRequest {
+    pub task: String,
+    pub context: SessionContextCompileRequest,
+    pub max_output_tokens: usize,
+    pub verification: VerificationCommandRequest,
+}
+
+impl SmallCodingTaskRequest {
+    #[must_use]
+    pub fn new(task: impl Into<String>, verification: VerificationCommandRequest) -> Self {
+        Self {
+            task: task.into(),
+            context: SessionContextCompileRequest::default(),
+            max_output_tokens: 256,
+            verification,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffSummary {
+    pub files_changed: usize,
+    pub insertions: usize,
+    pub deletions: usize,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventReplaySummary {
+    pub total_events: usize,
+    pub last_event_type: Option<String>,
+    pub event_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenLedgerSummary {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
+    pub max_output_tokens: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmallCodingTaskResult {
+    pub session_id: Uuid,
+    pub patch: FilePatchProposal,
+    pub patch_applied: bool,
+    pub verification: VerificationCommandResult,
+    pub diff: DiffSummary,
+    pub event_replay: EventReplaySummary,
+    pub token_ledger: TokenLedgerSummary,
+    pub final_state: String,
     pub event_count: usize,
 }
 
@@ -349,6 +407,68 @@ impl Runtime {
             event_count: self.event_store.events_for_session(session_id)?.len(),
         })
     }
+
+    pub fn run_small_coding_task(
+        &mut self,
+        session_id: Uuid,
+        request: SmallCodingTaskRequest,
+    ) -> HarnessResult<SmallCodingTaskResult> {
+        let fake_turn = self.run_fake_model_turn(
+            session_id,
+            FakeModelTurnRequest {
+                task: request.task,
+                context: request.context,
+                max_output_tokens: request.max_output_tokens,
+            },
+        )?;
+
+        if fake_turn.observation.is_none() {
+            return Err(HarnessError::new("coding task patch was not applied"));
+        }
+
+        let verification = self.run_verification_command(session_id, request.verification)?;
+        let Some(observation) = &verification.observation else {
+            return Err(HarnessError::new("verification command was not executed"));
+        };
+
+        if observation.exit_code != Some(0) {
+            return Err(HarnessError::new("verification command failed"));
+        }
+
+        let diff = diff_summary_from_patch(&fake_turn.patch);
+        self.event_store.append_event(NewEvent::diff_recorded(
+            session_id,
+            diff_summary_payload(&diff),
+        )?)?;
+        self.event_store
+            .append_event(NewEvent::commit_approval_pending(
+                session_id,
+                CommitApprovalPendingPayload::new(
+                    PENDING_COMMIT_APPROVAL_STATE,
+                    "verification passed; awaiting human commit approval",
+                ),
+            )?)?;
+
+        let events = self.event_store.events_for_session(session_id)?;
+        let event_replay = event_replay_summary(&events);
+
+        Ok(SmallCodingTaskResult {
+            session_id,
+            patch: fake_turn.patch,
+            patch_applied: true,
+            verification,
+            diff,
+            event_replay,
+            token_ledger: TokenLedgerSummary {
+                prompt_tokens: fake_turn.prompt_tokens,
+                completion_tokens: fake_turn.completion_tokens,
+                total_tokens: fake_turn.prompt_tokens + fake_turn.completion_tokens,
+                max_output_tokens: request.max_output_tokens,
+            },
+            final_state: PENDING_COMMIT_APPROVAL_STATE.to_owned(),
+            event_count: events.len(),
+        })
+    }
 }
 
 pub fn apply_database_migrations(database_url: &str) -> HarnessResult<()> {
@@ -425,6 +545,41 @@ fn file_patch_payload(patch: &FilePatchProposal) -> FilePatchPayload {
         patch.expected_content.clone(),
         patch.replacement_content.clone(),
     )
+}
+
+fn diff_summary_from_patch(patch: &FilePatchProposal) -> DiffSummary {
+    DiffSummary {
+        files_changed: 1,
+        insertions: line_count(&patch.replacement_content),
+        deletions: patch.expected_content.as_deref().map_or(0, line_count),
+        paths: vec![patch.path.clone()],
+    }
+}
+
+fn diff_summary_payload(diff: &DiffSummary) -> DiffSummaryPayload {
+    DiffSummaryPayload::new(
+        diff.files_changed,
+        diff.insertions,
+        diff.deletions,
+        diff.paths.clone(),
+    )
+}
+
+fn event_replay_summary(events: &[EventEnvelope]) -> EventReplaySummary {
+    EventReplaySummary {
+        total_events: events.len(),
+        last_event_type: events
+            .last()
+            .map(|event| event.event_type.as_str().to_owned()),
+        event_types: events
+            .iter()
+            .map(|event| event.event_type.as_str().to_owned())
+            .collect(),
+    }
+}
+
+fn line_count(content: &str) -> usize {
+    content.lines().count()
 }
 
 #[must_use]
