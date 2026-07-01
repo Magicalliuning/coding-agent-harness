@@ -6,9 +6,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use harness_events::EventType;
 use harness_policy::PolicyDecision;
 use harness_runtime::{
+    CodexWorkerLaneBudget, CodexWorkerLaneFixture, CodexWorkerLaneRequest, CodexWorkerUsage,
     ContextBudget, FakeModelTurnRequest, PENDING_COMMIT_APPROVAL_STATE, RECOVERY_FAILED_STATE,
     RecoveryStopReason, Runtime, SelfRecoveryLoopRequest, SessionContextCompileRequest,
-    SessionStatus, SmallCodingTaskRequest, StartSessionRequest, VerificationCommandRequest,
+    SessionStatus, SmallCodingTaskRequest, StartSessionRequest, UsageConfidence,
+    VerificationCommandRequest, WorkerLaneStatus,
 };
 use uuid::Uuid;
 
@@ -428,6 +430,221 @@ fn self_recovery_fixture_stops_when_repair_budget_exceeded()
         event.event_type == EventType::RecoveryStopped
             && event.payload["stop_reason"] == "repair_budget_exceeded"
     }));
+
+    Ok(())
+}
+
+#[test]
+fn codex_worker_lane_records_output_usage_and_state_events()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = fixture_repo()?;
+    let repo_path = repo.display().to_string();
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo_path.clone()))?;
+
+    let result = runtime.run_codex_worker_lane(
+        started.session_id,
+        CodexWorkerLaneRequest {
+            task: "draft the next harness patch".to_owned(),
+            workspace_path: repo_path,
+            worktree_path: None,
+            timeout_ms: 30_000,
+            cancellation_requested: false,
+            budget: CodexWorkerLaneBudget {
+                max_prompt_tokens: 8_192,
+                max_output_tokens: 2_048,
+                max_stdout_bytes: 64 * 1024,
+            },
+            fixture: CodexWorkerLaneFixture {
+                status: WorkerLaneStatus::Succeeded,
+                exit_code: Some(0),
+                stdout: "codex proposed a patch".to_owned(),
+                stderr: String::new(),
+                duration_ms: 42,
+                usage: CodexWorkerUsage {
+                    prompt_tokens: Some(120),
+                    completion_tokens: Some(40),
+                    confidence: UsageConfidence::LocalEstimate,
+                },
+            },
+        },
+    )?;
+    let observation = result.observation.as_ref().expect("worker observation");
+    let events = runtime.events_for_session(started.session_id)?;
+    let event_types = events
+        .iter()
+        .map(|event| event.event_type)
+        .collect::<Vec<_>>();
+
+    assert_eq!(result.decision, PolicyDecision::Allow);
+    assert_eq!(result.final_status, WorkerLaneStatus::Succeeded);
+    assert_eq!(observation.stdout, "codex proposed a patch");
+    assert_eq!(observation.usage.confidence, UsageConfidence::LocalEstimate);
+    assert_eq!(
+        result.event_replay.last_event_type.as_deref(),
+        Some("worker_lane.state_changed")
+    );
+    assert_eq!(
+        event_types,
+        vec![
+            EventType::SessionStarted,
+            EventType::WorkerLaneRequested,
+            EventType::PolicyDecided,
+            EventType::WorkerLaneStateChanged,
+            EventType::WorkerLaneStateChanged,
+            EventType::WorkerLaneObservationRecorded,
+            EventType::WorkerLaneStateChanged,
+        ]
+    );
+    assert_eq!(events[1].payload["lane_kind"], "codex_cli");
+    assert_eq!(events[1].payload["budget"]["max_output_tokens"], 2_048);
+    assert_eq!(events[5].payload["usage_confidence"], "local_estimate");
+    assert_eq!(events[6].payload["to_state"], "succeeded");
+
+    Ok(())
+}
+
+#[test]
+fn codex_worker_lane_policy_rejection_skips_worker_observation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = fixture_repo()?;
+    let repo_path = repo.display().to_string();
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo_path.clone()))?;
+
+    let result = runtime.run_codex_worker_lane(
+        started.session_id,
+        CodexWorkerLaneRequest {
+            task: String::new(),
+            workspace_path: repo_path,
+            worktree_path: None,
+            timeout_ms: 30_000,
+            cancellation_requested: false,
+            budget: CodexWorkerLaneBudget {
+                max_prompt_tokens: 8_192,
+                max_output_tokens: 2_048,
+                max_stdout_bytes: 64 * 1024,
+            },
+            fixture: CodexWorkerLaneFixture::succeeded("should not run"),
+        },
+    )?;
+    let events = runtime.events_for_session(started.session_id)?;
+
+    assert_eq!(result.decision, PolicyDecision::Deny);
+    assert_eq!(result.final_status, WorkerLaneStatus::Rejected);
+    assert_eq!(result.observation, None);
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[2].event_type, EventType::PolicyDecided);
+    assert_eq!(events[2].payload["decision"], "deny");
+    assert_eq!(events[3].event_type, EventType::WorkerLaneStateChanged);
+    assert_eq!(events[3].payload["to_state"], "rejected");
+
+    Ok(())
+}
+
+#[test]
+fn codex_worker_lane_marks_timeout_after_captured_fixture_output()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = fixture_repo()?;
+    let repo_path = repo.display().to_string();
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo_path.clone()))?;
+
+    let result = runtime.run_codex_worker_lane(
+        started.session_id,
+        CodexWorkerLaneRequest {
+            task: "draft the next harness patch".to_owned(),
+            workspace_path: repo_path,
+            worktree_path: None,
+            timeout_ms: 10,
+            cancellation_requested: false,
+            budget: CodexWorkerLaneBudget {
+                max_prompt_tokens: 8_192,
+                max_output_tokens: 2_048,
+                max_stdout_bytes: 64 * 1024,
+            },
+            fixture: CodexWorkerLaneFixture {
+                status: WorkerLaneStatus::Succeeded,
+                exit_code: Some(0),
+                stdout: "late output".to_owned(),
+                stderr: String::new(),
+                duration_ms: 11,
+                usage: CodexWorkerUsage::unknown(),
+            },
+        },
+    )?;
+
+    assert_eq!(result.final_status, WorkerLaneStatus::TimedOut);
+    assert_eq!(
+        result.observation.as_ref().map(|item| item.status),
+        Some(WorkerLaneStatus::TimedOut)
+    );
+    assert_eq!(
+        result.event_replay.last_event_type.as_deref(),
+        Some("worker_lane.state_changed")
+    );
+
+    Ok(())
+}
+
+#[test]
+fn codex_worker_lane_honors_pre_start_cancellation() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = fixture_repo()?;
+    let repo_path = repo.display().to_string();
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo_path.clone()))?;
+
+    let result = runtime.run_codex_worker_lane(
+        started.session_id,
+        CodexWorkerLaneRequest {
+            task: "draft the next harness patch".to_owned(),
+            workspace_path: repo_path,
+            worktree_path: None,
+            timeout_ms: 30_000,
+            cancellation_requested: true,
+            budget: CodexWorkerLaneBudget {
+                max_prompt_tokens: 8_192,
+                max_output_tokens: 2_048,
+                max_stdout_bytes: 64 * 1024,
+            },
+            fixture: CodexWorkerLaneFixture::succeeded("should not run"),
+        },
+    )?;
+    let events = runtime.events_for_session(started.session_id)?;
+
+    assert_eq!(result.final_status, WorkerLaneStatus::Cancelled);
+    assert_eq!(
+        result.observation.as_ref().map(|item| item.status),
+        Some(WorkerLaneStatus::Cancelled)
+    );
+    assert_eq!(
+        events.last().expect("last event").payload["to_state"],
+        "cancelled"
+    );
 
     Ok(())
 }

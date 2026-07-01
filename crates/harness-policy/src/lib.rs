@@ -81,6 +81,98 @@ pub fn evaluate_file_patch(relative_path: &str, replacement_bytes: usize) -> Pol
     PolicyEvaluation::new(PolicyDecision::Allow, "patch is safe to apply")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodexWorkerLanePolicyInput<'a> {
+    pub task: &'a str,
+    pub session_repo_path: &'a str,
+    pub workspace_path: &'a str,
+    pub worktree_path: Option<&'a str>,
+    pub timeout_ms: u64,
+    pub max_prompt_tokens: usize,
+    pub max_output_tokens: usize,
+    pub max_stdout_bytes: usize,
+}
+
+#[must_use]
+pub fn evaluate_codex_worker_lane(input: &CodexWorkerLanePolicyInput<'_>) -> PolicyEvaluation {
+    if input.task.trim().is_empty() {
+        return PolicyEvaluation::new(
+            PolicyDecision::Deny,
+            "codex worker lane task cannot be empty",
+        );
+    }
+
+    if input.task.contains('\0') {
+        return PolicyEvaluation::new(
+            PolicyDecision::Deny,
+            "codex worker lane task contains a nul byte",
+        );
+    }
+
+    if input.session_repo_path.trim().is_empty() {
+        return PolicyEvaluation::new(
+            PolicyDecision::Deny,
+            "codex worker lane session repo cannot be empty",
+        );
+    }
+
+    if input.workspace_path.trim().is_empty() {
+        return PolicyEvaluation::new(
+            PolicyDecision::Deny,
+            "codex worker lane workspace cannot be empty",
+        );
+    }
+
+    if input
+        .worktree_path
+        .is_some_and(|worktree_path| worktree_path.trim().is_empty())
+    {
+        return PolicyEvaluation::new(
+            PolicyDecision::Deny,
+            "codex worker lane worktree cannot be empty",
+        );
+    }
+
+    if input.workspace_path != input.session_repo_path
+        && input.worktree_path != Some(input.workspace_path)
+    {
+        return PolicyEvaluation::new(
+            PolicyDecision::Deny,
+            "codex worker lane workspace must match the session repo or explicit worktree",
+        );
+    }
+
+    if input.timeout_ms == 0 {
+        return PolicyEvaluation::new(
+            PolicyDecision::Deny,
+            "codex worker lane timeout is required",
+        );
+    }
+
+    if input.max_prompt_tokens == 0 || input.max_output_tokens == 0 || input.max_stdout_bytes == 0 {
+        return PolicyEvaluation::new(
+            PolicyDecision::Deny,
+            "codex worker lane budget must be positive",
+        );
+    }
+
+    if input.timeout_ms > 30 * 60 * 1000
+        || input.max_prompt_tokens > 200_000
+        || input.max_output_tokens > 200_000
+        || input.max_stdout_bytes > 4 * 1024 * 1024
+    {
+        return PolicyEvaluation::new(
+            PolicyDecision::Ask,
+            "codex worker lane exceeds the safe local fixture budget",
+        );
+    }
+
+    PolicyEvaluation::new(
+        PolicyDecision::Allow,
+        "codex worker lane contract fits the safe local fixture budget",
+    )
+}
+
 fn normalized_program_name(program: &str) -> &str {
     let program_name = std::path::Path::new(program)
         .file_name()
@@ -211,5 +303,85 @@ mod tests {
         let evaluation = evaluate_file_patch(".harness/fake-agent-turn.md", 20 * 1024);
 
         assert_eq!(evaluation.decision, PolicyDecision::Ask);
+    }
+
+    #[test]
+    fn valid_codex_worker_lane_contract_is_allowed() {
+        let evaluation = evaluate_codex_worker_lane(&CodexWorkerLanePolicyInput {
+            task: "summarize the pending patch",
+            session_repo_path: "C:/repo",
+            workspace_path: "C:/repo",
+            worktree_path: None,
+            timeout_ms: 30_000,
+            max_prompt_tokens: 8_192,
+            max_output_tokens: 2_048,
+            max_stdout_bytes: 64 * 1024,
+        });
+
+        assert_eq!(evaluation.decision, PolicyDecision::Allow);
+    }
+
+    #[test]
+    fn codex_worker_lane_without_task_is_denied() {
+        let evaluation = evaluate_codex_worker_lane(&CodexWorkerLanePolicyInput {
+            task: "",
+            session_repo_path: "C:/repo",
+            workspace_path: "C:/repo",
+            worktree_path: None,
+            timeout_ms: 30_000,
+            max_prompt_tokens: 8_192,
+            max_output_tokens: 2_048,
+            max_stdout_bytes: 64 * 1024,
+        });
+
+        assert_eq!(evaluation.decision, PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn codex_worker_lane_without_timeout_is_denied() {
+        let evaluation = evaluate_codex_worker_lane(&CodexWorkerLanePolicyInput {
+            task: "summarize the pending patch",
+            session_repo_path: "C:/repo",
+            workspace_path: "C:/repo",
+            worktree_path: None,
+            timeout_ms: 0,
+            max_prompt_tokens: 8_192,
+            max_output_tokens: 2_048,
+            max_stdout_bytes: 64 * 1024,
+        });
+
+        assert_eq!(evaluation.decision, PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn codex_worker_lane_outside_session_repo_is_denied_without_explicit_worktree() {
+        let evaluation = evaluate_codex_worker_lane(&CodexWorkerLanePolicyInput {
+            task: "summarize the pending patch",
+            session_repo_path: "C:/repo",
+            workspace_path: "D:/other",
+            worktree_path: None,
+            timeout_ms: 30_000,
+            max_prompt_tokens: 8_192,
+            max_output_tokens: 2_048,
+            max_stdout_bytes: 64 * 1024,
+        });
+
+        assert_eq!(evaluation.decision, PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn codex_worker_lane_explicit_worktree_is_allowed() {
+        let evaluation = evaluate_codex_worker_lane(&CodexWorkerLanePolicyInput {
+            task: "summarize the pending patch",
+            session_repo_path: "C:/repo",
+            workspace_path: "D:/repo-worktree",
+            worktree_path: Some("D:/repo-worktree"),
+            timeout_ms: 30_000,
+            max_prompt_tokens: 8_192,
+            max_output_tokens: 2_048,
+            max_stdout_bytes: 64 * 1024,
+        });
+
+        assert_eq!(evaluation.decision, PolicyDecision::Allow);
     }
 }

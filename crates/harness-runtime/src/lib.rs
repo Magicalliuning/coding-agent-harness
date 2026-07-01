@@ -11,13 +11,21 @@ use harness_events::{
     FilePatchPayload, ModelDecisionPayload, ModelRequestPayload, NewEvent, PolicyDecisionPayload,
     RecoveryFailurePayload, RecoveryPlanPayload, RecoveryRepairAttemptPayload,
     RecoveryStoppedPayload, SessionStartedPayload, SkillMetadataPayload, ToolCallIntentPayload,
-    ToolObservationPayload,
+    ToolObservationPayload, WorkerLaneBudgetPayload, WorkerLaneObservationPayload,
+    WorkerLaneRequestPayload, WorkerLaneStatePayload,
 };
 use harness_models::{DeterministicFakeModelProvider, FakeModelRequest, FilePatchProposal};
-use harness_policy::{PolicyDecision, evaluate_file_patch, evaluate_verification_command};
+use harness_policy::{
+    CodexWorkerLanePolicyInput, PolicyDecision, evaluate_codex_worker_lane, evaluate_file_patch,
+    evaluate_verification_command,
+};
+pub use harness_tools::{
+    CodexWorkerLaneBudget, CodexWorkerLaneFixture, CodexWorkerLaneObservation, CodexWorkerUsage,
+    UsageConfidence, WorkerLaneStatus,
+};
 use harness_tools::{
-    CommandObservation, CommandToolRuntime, FilePatchIntent, FilePatchObservation,
-    VerifyCommandIntent,
+    CodexWorkerLaneFixtureAdapter, CodexWorkerLaneIntent, CommandObservation, CommandToolRuntime,
+    FilePatchIntent, FilePatchObservation, VerifyCommandIntent,
 };
 use uuid::Uuid;
 
@@ -253,6 +261,29 @@ pub struct SelfRecoveryLoopResult {
     pub event_replay: EventReplaySummary,
     pub token_ledger: TokenLedgerSummary,
     pub final_state: String,
+    pub event_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexWorkerLaneRequest {
+    pub task: String,
+    pub workspace_path: String,
+    pub worktree_path: Option<String>,
+    pub timeout_ms: u64,
+    pub cancellation_requested: bool,
+    pub budget: CodexWorkerLaneBudget,
+    pub fixture: CodexWorkerLaneFixture,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexWorkerLaneResult {
+    pub session_id: Uuid,
+    pub lane_id: String,
+    pub decision: PolicyDecision,
+    pub reason: String,
+    pub observation: Option<CodexWorkerLaneObservation>,
+    pub final_status: WorkerLaneStatus,
+    pub event_replay: EventReplaySummary,
     pub event_count: usize,
 }
 
@@ -715,6 +746,124 @@ impl Runtime {
         })
     }
 
+    pub fn run_codex_worker_lane(
+        &mut self,
+        session_id: Uuid,
+        request: CodexWorkerLaneRequest,
+    ) -> HarnessResult<CodexWorkerLaneResult> {
+        let session = self.show_session(session_id)?;
+
+        let lane_id = Uuid::new_v4().to_string();
+        let lane_kind = "codex_cli";
+        let tool_name = harness_tools::CODEX_WORKER_LANE_TOOL.name;
+        let intent = CodexWorkerLaneIntent {
+            task: request.task,
+            workspace_path: request.workspace_path,
+            worktree_path: request.worktree_path,
+            timeout_ms: request.timeout_ms,
+            cancellation_requested: request.cancellation_requested,
+            budget: request.budget,
+        };
+
+        self.event_store
+            .append_event(NewEvent::worker_lane_requested(
+                session_id,
+                worker_lane_request_payload(&lane_id, lane_kind, &intent),
+            )?)?;
+
+        let evaluation = evaluate_codex_worker_lane(&CodexWorkerLanePolicyInput {
+            task: &intent.task,
+            session_repo_path: &session.repo_path,
+            workspace_path: &intent.workspace_path,
+            worktree_path: intent.worktree_path.as_deref(),
+            timeout_ms: intent.timeout_ms,
+            max_prompt_tokens: intent.budget.max_prompt_tokens,
+            max_output_tokens: intent.budget.max_output_tokens,
+            max_stdout_bytes: intent.budget.max_stdout_bytes,
+        });
+
+        self.event_store.append_event(NewEvent::policy_decided(
+            session_id,
+            PolicyDecisionPayload::new(
+                tool_name,
+                evaluation.decision.as_str(),
+                evaluation.reason.clone(),
+            ),
+        )?)?;
+
+        if evaluation.decision != PolicyDecision::Allow {
+            self.append_worker_lane_state(
+                session_id,
+                &lane_id,
+                None,
+                WorkerLaneStatus::Rejected,
+                "worker lane was not allowed by policy",
+            )?;
+
+            let events = self.event_store.events_for_session(session_id)?;
+            return Ok(CodexWorkerLaneResult {
+                session_id,
+                lane_id,
+                decision: evaluation.decision,
+                reason: evaluation.reason,
+                observation: None,
+                final_status: WorkerLaneStatus::Rejected,
+                event_replay: event_replay_summary(&events),
+                event_count: events.len(),
+            });
+        }
+
+        self.append_worker_lane_state(
+            session_id,
+            &lane_id,
+            None,
+            WorkerLaneStatus::Queued,
+            "worker lane accepted by policy",
+        )?;
+
+        let previous_state = if intent.cancellation_requested {
+            WorkerLaneStatus::Queued
+        } else {
+            self.append_worker_lane_state(
+                session_id,
+                &lane_id,
+                Some(WorkerLaneStatus::Queued),
+                WorkerLaneStatus::Running,
+                "fixture worker lane started",
+            )?;
+            WorkerLaneStatus::Running
+        };
+
+        let observation = CodexWorkerLaneFixtureAdapter.run(&intent, &request.fixture);
+        self.event_store
+            .append_event(NewEvent::worker_lane_observation_recorded(
+                session_id,
+                worker_lane_observation_payload(&lane_id, lane_kind, &observation),
+            )?)?;
+
+        self.append_worker_lane_state(
+            session_id,
+            &lane_id,
+            Some(previous_state),
+            observation.status,
+            "fixture worker lane completed",
+        )?;
+
+        let events = self.event_store.events_for_session(session_id)?;
+        let final_status = observation.status;
+
+        Ok(CodexWorkerLaneResult {
+            session_id,
+            lane_id,
+            decision: evaluation.decision,
+            reason: evaluation.reason,
+            observation: Some(observation),
+            final_status,
+            event_replay: event_replay_summary(&events),
+            event_count: events.len(),
+        })
+    }
+
     fn apply_file_patch_with_events(
         &mut self,
         session_id: Uuid,
@@ -765,6 +914,29 @@ impl Runtime {
             )?)?;
 
         Ok(Some(observation))
+    }
+
+    fn append_worker_lane_state(
+        &mut self,
+        session_id: Uuid,
+        lane_id: &str,
+        from_state: Option<WorkerLaneStatus>,
+        to_state: WorkerLaneStatus,
+        reason: &str,
+    ) -> HarnessResult<()> {
+        self.event_store
+            .append_event(NewEvent::worker_lane_state_changed(
+                session_id,
+                WorkerLaneStatePayload::new(
+                    lane_id,
+                    "codex_cli",
+                    from_state.map(|state| state.as_str().to_owned()),
+                    to_state.as_str(),
+                    reason,
+                ),
+            )?)?;
+
+        Ok(())
     }
 
     fn finish_recovery_loop(
@@ -970,6 +1142,46 @@ fn diff_summary_payload(diff: &DiffSummary) -> DiffSummaryPayload {
         diff.deletions,
         diff.paths.clone(),
     )
+}
+
+fn worker_lane_request_payload(
+    lane_id: &str,
+    lane_kind: &str,
+    intent: &CodexWorkerLaneIntent,
+) -> WorkerLaneRequestPayload {
+    WorkerLaneRequestPayload {
+        lane_id: lane_id.to_owned(),
+        lane_kind: lane_kind.to_owned(),
+        task: intent.task.clone(),
+        workspace_path: intent.workspace_path.clone(),
+        worktree_path: intent.worktree_path.clone(),
+        timeout_ms: intent.timeout_ms,
+        cancellation_requested: intent.cancellation_requested,
+        budget: WorkerLaneBudgetPayload::new(
+            intent.budget.max_prompt_tokens,
+            intent.budget.max_output_tokens,
+            intent.budget.max_stdout_bytes,
+        ),
+    }
+}
+
+fn worker_lane_observation_payload(
+    lane_id: &str,
+    lane_kind: &str,
+    observation: &CodexWorkerLaneObservation,
+) -> WorkerLaneObservationPayload {
+    WorkerLaneObservationPayload {
+        lane_id: lane_id.to_owned(),
+        lane_kind: lane_kind.to_owned(),
+        status: observation.status.as_str().to_owned(),
+        exit_code: observation.exit_code,
+        stdout: observation.stdout.clone(),
+        stderr: observation.stderr.clone(),
+        duration_ms: observation.duration_ms,
+        prompt_tokens: observation.usage.prompt_tokens,
+        completion_tokens: observation.usage.completion_tokens,
+        usage_confidence: observation.usage.confidence.as_str().to_owned(),
+    }
 }
 
 fn event_replay_summary(events: &[EventEnvelope]) -> EventReplaySummary {

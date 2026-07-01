@@ -25,6 +25,12 @@ pub const APPLY_FILE_PATCH_TOOL: ToolDescriptor = ToolDescriptor {
     default_decision: PolicyDecision::Ask,
 };
 
+pub const CODEX_WORKER_LANE_TOOL: ToolDescriptor = ToolDescriptor {
+    name: "codex_cli_worker_lane",
+    mutates: true,
+    default_decision: PolicyDecision::Ask,
+};
+
 #[must_use]
 pub const fn verify_command_tool() -> ToolDescriptor {
     VERIFY_COMMAND_TOOL
@@ -33,6 +39,11 @@ pub const fn verify_command_tool() -> ToolDescriptor {
 #[must_use]
 pub const fn apply_file_patch_tool() -> ToolDescriptor {
     APPLY_FILE_PATCH_TOOL
+}
+
+#[must_use]
+pub const fn codex_worker_lane_tool() -> ToolDescriptor {
+    CODEX_WORKER_LANE_TOOL
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +125,175 @@ pub struct FilePatchObservation {
     pub previous_bytes: usize,
     pub new_bytes: usize,
     pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerLaneStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    TimedOut,
+    Rejected,
+}
+
+impl WorkerLaneStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageConfidence {
+    Official,
+    LocalEstimate,
+    Unknown,
+}
+
+impl UsageConfidence {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Official => "official",
+            Self::LocalEstimate => "local_estimate",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexWorkerLaneBudget {
+    pub max_prompt_tokens: usize,
+    pub max_output_tokens: usize,
+    pub max_stdout_bytes: usize,
+}
+
+impl Default for CodexWorkerLaneBudget {
+    fn default() -> Self {
+        Self {
+            max_prompt_tokens: 8_192,
+            max_output_tokens: 2_048,
+            max_stdout_bytes: 64 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexWorkerUsage {
+    pub prompt_tokens: Option<usize>,
+    pub completion_tokens: Option<usize>,
+    pub confidence: UsageConfidence,
+}
+
+impl CodexWorkerUsage {
+    #[must_use]
+    pub const fn unknown() -> Self {
+        Self {
+            prompt_tokens: None,
+            completion_tokens: None,
+            confidence: UsageConfidence::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexWorkerLaneIntent {
+    pub task: String,
+    pub workspace_path: String,
+    pub worktree_path: Option<String>,
+    pub timeout_ms: u64,
+    pub cancellation_requested: bool,
+    pub budget: CodexWorkerLaneBudget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexWorkerLaneFixture {
+    pub status: WorkerLaneStatus,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u64,
+    pub usage: CodexWorkerUsage,
+}
+
+impl CodexWorkerLaneFixture {
+    #[must_use]
+    pub fn succeeded(stdout: impl Into<String>) -> Self {
+        Self {
+            status: WorkerLaneStatus::Succeeded,
+            exit_code: Some(0),
+            stdout: stdout.into(),
+            stderr: String::new(),
+            duration_ms: 0,
+            usage: CodexWorkerUsage::unknown(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexWorkerLaneObservation {
+    pub status: WorkerLaneStatus,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u64,
+    pub usage: CodexWorkerUsage,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CodexWorkerLaneFixtureAdapter;
+
+impl CodexWorkerLaneFixtureAdapter {
+    #[must_use]
+    pub fn run(
+        self,
+        intent: &CodexWorkerLaneIntent,
+        fixture: &CodexWorkerLaneFixture,
+    ) -> CodexWorkerLaneObservation {
+        if intent.cancellation_requested {
+            return CodexWorkerLaneObservation {
+                status: WorkerLaneStatus::Cancelled,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: "worker lane cancelled before start".to_owned(),
+                duration_ms: 0,
+                usage: CodexWorkerUsage::unknown(),
+            };
+        }
+
+        let status = if fixture.duration_ms > intent.timeout_ms {
+            WorkerLaneStatus::TimedOut
+        } else {
+            fixture.status
+        };
+        let exit_code = if matches!(
+            status,
+            WorkerLaneStatus::Cancelled | WorkerLaneStatus::TimedOut
+        ) {
+            None
+        } else {
+            fixture.exit_code
+        };
+
+        CodexWorkerLaneObservation {
+            status,
+            exit_code,
+            stdout: truncate_to_bytes(&fixture.stdout, intent.budget.max_stdout_bytes),
+            stderr: truncate_to_bytes(&fixture.stderr, intent.budget.max_stdout_bytes),
+            duration_ms: fixture.duration_ms,
+            usage: fixture.usage.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -247,6 +427,19 @@ fn is_safe_relative_path(relative_path: &str) -> bool {
     })
 }
 
+fn truncate_to_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    value[..end].to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +522,105 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn codex_worker_fixture_adapter_records_captured_output_and_usage_confidence() {
+        let intent = CodexWorkerLaneIntent {
+            task: "draft a patch".to_owned(),
+            workspace_path: "C:/repo".to_owned(),
+            worktree_path: None,
+            timeout_ms: 30_000,
+            cancellation_requested: false,
+            budget: CodexWorkerLaneBudget {
+                max_prompt_tokens: 8_192,
+                max_output_tokens: 2_048,
+                max_stdout_bytes: 64 * 1024,
+            },
+        };
+        let fixture = CodexWorkerLaneFixture {
+            status: WorkerLaneStatus::Succeeded,
+            exit_code: Some(0),
+            stdout: "codex proposed a patch".to_owned(),
+            stderr: String::new(),
+            duration_ms: 42,
+            usage: CodexWorkerUsage {
+                prompt_tokens: Some(120),
+                completion_tokens: Some(40),
+                confidence: UsageConfidence::LocalEstimate,
+            },
+        };
+
+        let observation = CodexWorkerLaneFixtureAdapter.run(&intent, &fixture);
+
+        assert_eq!(observation.status, WorkerLaneStatus::Succeeded);
+        assert_eq!(observation.stdout, "codex proposed a patch");
+        assert_eq!(observation.usage.confidence, UsageConfidence::LocalEstimate);
+    }
+
+    #[test]
+    fn codex_worker_fixture_adapter_marks_timeout_when_duration_exceeds_contract() {
+        let intent = CodexWorkerLaneIntent {
+            task: "draft a patch".to_owned(),
+            workspace_path: "C:/repo".to_owned(),
+            worktree_path: None,
+            timeout_ms: 10,
+            cancellation_requested: false,
+            budget: CodexWorkerLaneBudget {
+                max_prompt_tokens: 8_192,
+                max_output_tokens: 2_048,
+                max_stdout_bytes: 64 * 1024,
+            },
+        };
+        let fixture = CodexWorkerLaneFixture {
+            status: WorkerLaneStatus::Succeeded,
+            exit_code: Some(0),
+            stdout: "late output".to_owned(),
+            stderr: String::new(),
+            duration_ms: 11,
+            usage: CodexWorkerUsage::unknown(),
+        };
+
+        let observation = CodexWorkerLaneFixtureAdapter.run(&intent, &fixture);
+
+        assert_eq!(observation.status, WorkerLaneStatus::TimedOut);
+        assert_eq!(observation.exit_code, None);
+        assert_eq!(observation.usage.confidence, UsageConfidence::Unknown);
+    }
+
+    #[test]
+    fn codex_worker_fixture_adapter_honors_pre_start_cancellation() {
+        let intent = CodexWorkerLaneIntent {
+            task: "draft a patch".to_owned(),
+            workspace_path: "C:/repo".to_owned(),
+            worktree_path: None,
+            timeout_ms: 30_000,
+            cancellation_requested: true,
+            budget: CodexWorkerLaneBudget {
+                max_prompt_tokens: 8_192,
+                max_output_tokens: 2_048,
+                max_stdout_bytes: 64 * 1024,
+            },
+        };
+        let fixture = CodexWorkerLaneFixture {
+            status: WorkerLaneStatus::Succeeded,
+            exit_code: Some(0),
+            stdout: "should not be used".to_owned(),
+            stderr: String::new(),
+            duration_ms: 42,
+            usage: CodexWorkerUsage {
+                prompt_tokens: Some(120),
+                completion_tokens: Some(40),
+                confidence: UsageConfidence::Official,
+            },
+        };
+
+        let observation = CodexWorkerLaneFixtureAdapter.run(&intent, &fixture);
+
+        assert_eq!(observation.status, WorkerLaneStatus::Cancelled);
+        assert_eq!(observation.exit_code, None);
+        assert_eq!(observation.stdout, "");
+        assert_eq!(observation.usage.confidence, UsageConfidence::Unknown);
     }
 
     fn fixture_repo() -> Result<PathBuf, Box<dyn std::error::Error>> {

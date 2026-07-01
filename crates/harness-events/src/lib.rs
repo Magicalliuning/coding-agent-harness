@@ -18,6 +18,9 @@ pub const RECOVERY_FAILURE_CLASSIFIED_EVENT: &str = "recovery.failure_classified
 pub const RECOVERY_PLAN_RECORDED_EVENT: &str = "recovery.plan_recorded";
 pub const RECOVERY_REPAIR_ATTEMPTED_EVENT: &str = "recovery.repair_attempted";
 pub const RECOVERY_STOPPED_EVENT: &str = "recovery.stopped";
+pub const WORKER_LANE_REQUESTED_EVENT: &str = "worker_lane.requested";
+pub const WORKER_LANE_STATE_CHANGED_EVENT: &str = "worker_lane.state_changed";
+pub const WORKER_LANE_OBSERVATION_RECORDED_EVENT: &str = "worker_lane.observation_recorded";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventType {
@@ -34,6 +37,9 @@ pub enum EventType {
     RecoveryPlanRecorded,
     RecoveryRepairAttempted,
     RecoveryStopped,
+    WorkerLaneRequested,
+    WorkerLaneStateChanged,
+    WorkerLaneObservationRecorded,
 }
 
 impl EventType {
@@ -53,6 +59,9 @@ impl EventType {
             Self::RecoveryPlanRecorded => RECOVERY_PLAN_RECORDED_EVENT,
             Self::RecoveryRepairAttempted => RECOVERY_REPAIR_ATTEMPTED_EVENT,
             Self::RecoveryStopped => RECOVERY_STOPPED_EVENT,
+            Self::WorkerLaneRequested => WORKER_LANE_REQUESTED_EVENT,
+            Self::WorkerLaneStateChanged => WORKER_LANE_STATE_CHANGED_EVENT,
+            Self::WorkerLaneObservationRecorded => WORKER_LANE_OBSERVATION_RECORDED_EVENT,
         }
     }
 
@@ -71,6 +80,9 @@ impl EventType {
             RECOVERY_PLAN_RECORDED_EVENT => Ok(Self::RecoveryPlanRecorded),
             RECOVERY_REPAIR_ATTEMPTED_EVENT => Ok(Self::RecoveryRepairAttempted),
             RECOVERY_STOPPED_EVENT => Ok(Self::RecoveryStopped),
+            WORKER_LANE_REQUESTED_EVENT => Ok(Self::WorkerLaneRequested),
+            WORKER_LANE_STATE_CHANGED_EVENT => Ok(Self::WorkerLaneStateChanged),
+            WORKER_LANE_OBSERVATION_RECORDED_EVENT => Ok(Self::WorkerLaneObservationRecorded),
             other => Err(HarnessError::new(format!("unknown event type: {other}"))),
         }
     }
@@ -493,6 +505,82 @@ impl RecoveryStoppedPayload {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerLaneBudgetPayload {
+    pub max_prompt_tokens: usize,
+    pub max_output_tokens: usize,
+    pub max_stdout_bytes: usize,
+}
+
+impl WorkerLaneBudgetPayload {
+    #[must_use]
+    pub const fn new(
+        max_prompt_tokens: usize,
+        max_output_tokens: usize,
+        max_stdout_bytes: usize,
+    ) -> Self {
+        Self {
+            max_prompt_tokens,
+            max_output_tokens,
+            max_stdout_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerLaneRequestPayload {
+    pub lane_id: String,
+    pub lane_kind: String,
+    pub task: String,
+    pub workspace_path: String,
+    pub worktree_path: Option<String>,
+    pub timeout_ms: u64,
+    pub cancellation_requested: bool,
+    pub budget: WorkerLaneBudgetPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerLaneStatePayload {
+    pub lane_id: String,
+    pub lane_kind: String,
+    pub from_state: Option<String>,
+    pub to_state: String,
+    pub reason: String,
+}
+
+impl WorkerLaneStatePayload {
+    #[must_use]
+    pub fn new(
+        lane_id: impl Into<String>,
+        lane_kind: impl Into<String>,
+        from_state: Option<String>,
+        to_state: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            lane_id: lane_id.into(),
+            lane_kind: lane_kind.into(),
+            from_state,
+            to_state: to_state.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerLaneObservationPayload {
+    pub lane_id: String,
+    pub lane_kind: String,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u64,
+    pub prompt_tokens: Option<usize>,
+    pub completion_tokens: Option<usize>,
+    pub usage_confidence: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewEvent {
     pub event_id: Uuid,
@@ -607,6 +695,31 @@ impl NewEvent {
         payload: RecoveryStoppedPayload,
     ) -> HarnessResult<Self> {
         Self::new(session_id, EventType::RecoveryStopped, payload)
+    }
+
+    pub fn worker_lane_requested(
+        session_id: Uuid,
+        payload: WorkerLaneRequestPayload,
+    ) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::WorkerLaneRequested, payload)
+    }
+
+    pub fn worker_lane_state_changed(
+        session_id: Uuid,
+        payload: WorkerLaneStatePayload,
+    ) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::WorkerLaneStateChanged, payload)
+    }
+
+    pub fn worker_lane_observation_recorded(
+        session_id: Uuid,
+        payload: WorkerLaneObservationPayload,
+    ) -> HarnessResult<Self> {
+        Self::new(
+            session_id,
+            EventType::WorkerLaneObservationRecorded,
+            payload,
+        )
     }
 
     fn new(
@@ -836,5 +949,64 @@ mod tests {
         assert_eq!(plan.payload["max_recovery_rounds"], 2);
         assert_eq!(attempt.payload["applied"], true);
         assert_eq!(stopped.payload["retry_count"], 1);
+    }
+
+    #[test]
+    fn worker_lane_events_serialize_contract_state_and_observation() {
+        let session_id = Uuid::new_v4();
+        let requested = NewEvent::worker_lane_requested(
+            session_id,
+            WorkerLaneRequestPayload {
+                lane_id: "lane-1".to_owned(),
+                lane_kind: "codex_cli".to_owned(),
+                task: "draft a patch".to_owned(),
+                workspace_path: "C:/repo".to_owned(),
+                worktree_path: None,
+                timeout_ms: 30_000,
+                cancellation_requested: false,
+                budget: WorkerLaneBudgetPayload::new(8_192, 2_048, 64 * 1024),
+            },
+        )
+        .expect("worker lane request event");
+        let running = NewEvent::worker_lane_state_changed(
+            session_id,
+            WorkerLaneStatePayload::new(
+                "lane-1",
+                "codex_cli",
+                Some("queued".to_owned()),
+                "running",
+                "worker accepted by policy",
+            ),
+        )
+        .expect("worker lane state event");
+        let observation = NewEvent::worker_lane_observation_recorded(
+            session_id,
+            WorkerLaneObservationPayload {
+                lane_id: "lane-1".to_owned(),
+                lane_kind: "codex_cli".to_owned(),
+                status: "succeeded".to_owned(),
+                exit_code: Some(0),
+                stdout: "codex proposed a patch".to_owned(),
+                stderr: String::new(),
+                duration_ms: 42,
+                prompt_tokens: Some(120),
+                completion_tokens: Some(40),
+                usage_confidence: "local_estimate".to_owned(),
+            },
+        )
+        .expect("worker lane observation event");
+
+        assert_eq!(requested.event_type.as_str(), "worker_lane.requested");
+        assert_eq!(requested.payload["task"], "draft a patch");
+        assert_eq!(requested.payload["budget"]["max_output_tokens"], 2_048);
+        assert_eq!(running.event_type.as_str(), "worker_lane.state_changed");
+        assert_eq!(running.payload["from_state"], "queued");
+        assert_eq!(running.payload["to_state"], "running");
+        assert_eq!(
+            observation.event_type.as_str(),
+            "worker_lane.observation_recorded"
+        );
+        assert_eq!(observation.payload["usage_confidence"], "local_estimate");
+        assert_eq!(observation.payload["stdout"], "codex proposed a patch");
     }
 }
