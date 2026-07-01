@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use harness_core::{HarnessError, HarnessResult};
 use harness_runtime::{
-    Runtime, SessionProjection, StartSessionRequest, VerificationCommandRequest,
-    VerificationCommandResult,
+    ContextBudget, Runtime, SessionContextCompileRequest, SessionContextCompileResult,
+    SessionProjection, StartSessionRequest, VerificationCommandRequest, VerificationCommandResult,
 };
 use uuid::Uuid;
 
@@ -90,6 +90,27 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
             print_verification_result(&result);
             Ok(())
         }
+        "compile-context" => {
+            let session_id = args
+                .get(1)
+                .ok_or_else(|| HarnessError::new("session id is required"))?;
+            let session_id = Uuid::parse_str(session_id)
+                .map_err(|error| HarnessError::new(error.to_string()))?;
+            let database_url = database_url_from_args(args.clone())?;
+            let budget = context_budget_from_args(&args)?;
+            let focus_terms = repeated_arg_values(&args, "--focus");
+            let mut runtime = Runtime::connect_postgres(&database_url)?;
+            let result = runtime.compile_session_context(
+                session_id,
+                SessionContextCompileRequest {
+                    budget,
+                    focus_terms,
+                },
+            )?;
+
+            print_context_compile_result(&result);
+            Ok(())
+        }
         other => Err(HarnessError::new(format!(
             "unknown session command: {other}"
         ))),
@@ -110,6 +131,36 @@ fn required_arg_value<'a>(args: &'a [String], name: &str) -> HarnessResult<&'a s
 fn optional_arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.windows(2)
         .find_map(|window| (window[0] == name).then_some(window[1].as_str()))
+}
+
+fn repeated_arg_values(args: &[String], name: &str) -> Vec<String> {
+    args.windows(2)
+        .filter_map(|window| (window[0] == name).then_some(window[1].clone()))
+        .collect()
+}
+
+fn context_budget_from_args(args: &[String]) -> HarnessResult<ContextBudget> {
+    let mut budget = ContextBudget::default();
+
+    if let Some(value) = optional_arg_value(args, "--max-bytes") {
+        budget.max_bytes = parse_usize_arg("--max-bytes", value)?;
+    }
+
+    if let Some(value) = optional_arg_value(args, "--max-files") {
+        budget.max_files = parse_usize_arg("--max-files", value)?;
+    }
+
+    if let Some(value) = optional_arg_value(args, "--max-skill-files") {
+        budget.max_skill_files = parse_usize_arg("--max-skill-files", value)?;
+    }
+
+    Ok(budget)
+}
+
+fn parse_usize_arg(name: &str, value: &str) -> HarnessResult<usize> {
+    value
+        .parse()
+        .map_err(|error| HarnessError::new(format!("{name} must be a positive integer: {error}")))
 }
 
 fn args_before_separator(args: &[String]) -> &[String] {
@@ -169,5 +220,14 @@ fn print_verification_result(result: &VerificationCommandResult) {
         println!("duration_ms={}", observation.duration_ms);
     }
 
+    println!("event_count={}", result.event_count);
+}
+
+fn print_context_compile_result(result: &SessionContextCompileResult) {
+    println!("session_id={}", result.session_id);
+    println!("context_sources={}", result.bundle.sources.len());
+    println!("context_skills={}", result.bundle.skills.len());
+    println!("context_used_bytes={}", result.bundle.used_bytes);
+    println!("context_truncated={}", result.bundle.truncated);
     println!("event_count={}", result.event_count);
 }

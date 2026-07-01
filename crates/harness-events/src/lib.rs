@@ -9,6 +9,7 @@ pub const SESSION_STARTED_EVENT: &str = "session.started";
 pub const TOOL_CALL_INTENDED_EVENT: &str = "tool.call_intended";
 pub const POLICY_DECIDED_EVENT: &str = "policy.decided";
 pub const TOOL_OBSERVATION_RECORDED_EVENT: &str = "tool.observation_recorded";
+pub const CONTEXT_COMPILED_EVENT: &str = "context.compiled";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventType {
@@ -16,6 +17,7 @@ pub enum EventType {
     ToolCallIntended,
     PolicyDecided,
     ToolObservationRecorded,
+    ContextCompiled,
 }
 
 impl EventType {
@@ -26,6 +28,7 @@ impl EventType {
             Self::ToolCallIntended => TOOL_CALL_INTENDED_EVENT,
             Self::PolicyDecided => POLICY_DECIDED_EVENT,
             Self::ToolObservationRecorded => TOOL_OBSERVATION_RECORDED_EVENT,
+            Self::ContextCompiled => CONTEXT_COMPILED_EVENT,
         }
     }
 
@@ -35,6 +38,7 @@ impl EventType {
             TOOL_CALL_INTENDED_EVENT => Ok(Self::ToolCallIntended),
             POLICY_DECIDED_EVENT => Ok(Self::PolicyDecided),
             TOOL_OBSERVATION_RECORDED_EVENT => Ok(Self::ToolObservationRecorded),
+            CONTEXT_COMPILED_EVENT => Ok(Self::ContextCompiled),
             other => Err(HarnessError::new(format!("unknown event type: {other}"))),
         }
     }
@@ -129,6 +133,67 @@ impl ToolObservationPayload {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSourcePayload {
+    pub kind: String,
+    pub path: String,
+    pub content: String,
+    pub original_bytes: usize,
+    pub included_bytes: usize,
+    pub truncated: bool,
+}
+
+impl ContextSourcePayload {
+    #[must_use]
+    pub fn new(
+        kind: impl Into<String>,
+        path: impl Into<String>,
+        content: impl Into<String>,
+        original_bytes: usize,
+        included_bytes: usize,
+        truncated: bool,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            path: path.into(),
+            content: content.into(),
+            original_bytes,
+            included_bytes,
+            truncated,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillMetadataPayload {
+    pub path: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+}
+
+impl SkillMetadataPayload {
+    #[must_use]
+    pub fn new(path: impl Into<String>, name: Option<String>, description: Option<String>) -> Self {
+        Self {
+            path: path.into(),
+            name,
+            description,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompiledPayload {
+    pub repo_path: String,
+    pub budget_bytes: usize,
+    pub budget_files: usize,
+    pub budget_skill_files: usize,
+    pub used_bytes: usize,
+    pub truncated: bool,
+    pub sources: Vec<ContextSourcePayload>,
+    pub skills: Vec<SkillMetadataPayload>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewEvent {
     pub event_id: Uuid,
@@ -169,6 +234,13 @@ impl NewEvent {
         payload: ToolObservationPayload,
     ) -> HarnessResult<Self> {
         Self::new(session_id, EventType::ToolObservationRecorded, payload)
+    }
+
+    pub fn context_compiled(
+        session_id: Uuid,
+        payload: ContextCompiledPayload,
+    ) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::ContextCompiled, payload)
     }
 
     fn new(
@@ -256,5 +328,42 @@ mod tests {
         assert_eq!(intent.payload["program"], "cargo");
         assert_eq!(decision.payload["decision"], "allow");
         assert_eq!(observation.payload["exit_code"], 0);
+    }
+
+    #[test]
+    fn context_compiled_event_serializes_bounded_bundle() {
+        let session_id = Uuid::new_v4();
+        let event = NewEvent::context_compiled(
+            session_id,
+            ContextCompiledPayload {
+                repo_path: "C:/repo".to_owned(),
+                budget_bytes: 4096,
+                budget_files: 8,
+                budget_skill_files: 4,
+                used_bytes: 12,
+                truncated: false,
+                sources: vec![ContextSourcePayload::new(
+                    "repository_instructions",
+                    "AGENTS.md",
+                    "instructions",
+                    12,
+                    12,
+                    false,
+                )],
+                skills: vec![SkillMetadataPayload::new(
+                    ".codex/skills/demo/SKILL.md",
+                    Some("demo".to_owned()),
+                    Some("Demo skill".to_owned()),
+                )],
+            },
+        )
+        .expect("context compiled event");
+
+        assert_eq!(event.event_type.as_str(), "context.compiled");
+        assert_eq!(event.payload["budget_bytes"], 4096);
+        assert_eq!(event.payload["budget_files"], 8);
+        assert_eq!(event.payload["budget_skill_files"], 4);
+        assert_eq!(event.payload["sources"][0]["path"], "AGENTS.md");
+        assert_eq!(event.payload["skills"][0]["name"], "demo");
     }
 }

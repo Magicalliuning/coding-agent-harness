@@ -1,8 +1,11 @@
+pub use harness_context::ContextBudget;
+use harness_context::{CompiledContextBundle, ContextCompileRequest, compile_repository_context};
 use harness_core::{HarnessError, HarnessResult};
 use harness_db::PostgresEventStore;
 use harness_events::{
-    EventEnvelope, EventType, NewEvent, PolicyDecisionPayload, SessionStartedPayload,
-    ToolCallIntentPayload, ToolObservationPayload,
+    ContextCompiledPayload, ContextSourcePayload, EventEnvelope, EventType, NewEvent,
+    PolicyDecisionPayload, SessionStartedPayload, SkillMetadataPayload, ToolCallIntentPayload,
+    ToolObservationPayload,
 };
 use harness_policy::{PolicyDecision, evaluate_verification_command};
 use harness_tools::{CommandObservation, CommandToolRuntime, VerifyCommandIntent};
@@ -70,6 +73,19 @@ pub struct VerificationCommandResult {
     pub decision: PolicyDecision,
     pub reason: String,
     pub observation: Option<CommandObservation>,
+    pub event_count: usize,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SessionContextCompileRequest {
+    pub budget: ContextBudget,
+    pub focus_terms: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionContextCompileResult {
+    pub session_id: Uuid,
+    pub bundle: CompiledContextBundle,
     pub event_count: usize,
 }
 
@@ -163,6 +179,30 @@ impl Runtime {
             event_count: self.event_store.events_for_session(session_id)?.len(),
         })
     }
+
+    pub fn compile_session_context(
+        &mut self,
+        session_id: Uuid,
+        request: SessionContextCompileRequest,
+    ) -> HarnessResult<SessionContextCompileResult> {
+        let session = self.show_session(session_id)?;
+        let bundle = compile_repository_context(ContextCompileRequest {
+            repo_path: session.repo_path.into(),
+            budget: request.budget,
+            focus_terms: request.focus_terms,
+        })?;
+
+        self.event_store.append_event(NewEvent::context_compiled(
+            session_id,
+            context_compiled_payload(&bundle),
+        )?)?;
+
+        Ok(SessionContextCompileResult {
+            session_id,
+            bundle,
+            event_count: self.event_store.events_for_session(session_id)?.len(),
+        })
+    }
 }
 
 pub fn apply_database_migrations(database_url: &str) -> HarnessResult<()> {
@@ -195,6 +235,42 @@ pub fn project_session(
         status: SessionStatus::Started,
         event_count: events.len(),
     })
+}
+
+fn context_compiled_payload(bundle: &CompiledContextBundle) -> ContextCompiledPayload {
+    ContextCompiledPayload {
+        repo_path: bundle.repo_path.clone(),
+        budget_bytes: bundle.budget.max_bytes,
+        budget_files: bundle.budget.max_files,
+        budget_skill_files: bundle.budget.max_skill_files,
+        used_bytes: bundle.used_bytes,
+        truncated: bundle.truncated,
+        sources: bundle
+            .sources
+            .iter()
+            .map(|source| {
+                ContextSourcePayload::new(
+                    source.kind.as_str(),
+                    source.path.clone(),
+                    source.content.clone(),
+                    source.original_bytes,
+                    source.included_bytes,
+                    source.truncated,
+                )
+            })
+            .collect(),
+        skills: bundle
+            .skills
+            .iter()
+            .map(|skill| {
+                SkillMetadataPayload::new(
+                    skill.path.clone(),
+                    skill.name.clone(),
+                    skill.description.clone(),
+                )
+            })
+            .collect(),
+    }
 }
 
 #[must_use]
@@ -285,5 +361,40 @@ mod tests {
         let projection = project_session(session_id, &events).expect("projection");
 
         assert_eq!(projection.event_count, 2);
+    }
+
+    #[test]
+    fn context_payload_preserves_sources_and_skill_metadata() {
+        let bundle = CompiledContextBundle {
+            repo_path: "C:/repo".to_owned(),
+            budget: ContextBudget {
+                max_bytes: 4096,
+                max_files: 8,
+                max_skill_files: 8,
+            },
+            used_bytes: 12,
+            truncated: false,
+            sources: vec![harness_context::ContextSource {
+                kind: harness_context::ContextSourceKind::RepositoryInstructions,
+                path: "AGENTS.md".to_owned(),
+                content: "instructions".to_owned(),
+                original_bytes: 12,
+                included_bytes: 12,
+                truncated: false,
+            }],
+            skills: vec![harness_context::SkillMetadata {
+                path: ".codex/skills/demo/SKILL.md".to_owned(),
+                name: Some("demo".to_owned()),
+                description: Some("Demo skill".to_owned()),
+            }],
+        };
+
+        let payload = context_compiled_payload(&bundle);
+
+        assert_eq!(payload.budget_bytes, 4096);
+        assert_eq!(payload.budget_files, 8);
+        assert_eq!(payload.budget_skill_files, 8);
+        assert_eq!(payload.sources[0].path, "AGENTS.md");
+        assert_eq!(payload.skills[0].name.as_deref(), Some("demo"));
     }
 }

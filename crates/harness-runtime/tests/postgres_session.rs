@@ -1,5 +1,8 @@
 use harness_policy::PolicyDecision;
-use harness_runtime::{Runtime, SessionStatus, StartSessionRequest, VerificationCommandRequest};
+use harness_runtime::{
+    ContextBudget, Runtime, SessionContextCompileRequest, SessionStatus, StartSessionRequest,
+    VerificationCommandRequest,
+};
 use uuid::Uuid;
 
 #[test]
@@ -33,7 +36,7 @@ fn verification_command_records_allowed_observation() -> Result<(), Box<dyn std:
 
     harness_runtime::apply_database_migrations(&database_url)?;
 
-    let repo_path = std::env::current_dir()?.display().to_string();
+    let repo_path = workspace_root()?;
     let mut runtime = Runtime::connect_postgres(&database_url)?;
     let started = runtime.start_session(StartSessionRequest::new(repo_path))?;
 
@@ -47,6 +50,42 @@ fn verification_command_records_allowed_observation() -> Result<(), Box<dyn std:
     assert!(result.observation.is_some());
     assert_eq!(result.event_count, 4);
     assert_eq!(replayed.event_count, 4);
+
+    Ok(())
+}
+
+#[test]
+fn session_context_compilation_is_recorded() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo_path = workspace_root()?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo_path))?;
+
+    let result = runtime.compile_session_context(
+        started.session_id,
+        SessionContextCompileRequest {
+            budget: ContextBudget {
+                max_bytes: 4096,
+                max_files: 8,
+                max_skill_files: 8,
+            },
+            focus_terms: vec!["agent".to_owned()],
+        },
+    )?;
+
+    assert_eq!(result.event_count, 2);
+    assert!(
+        result
+            .bundle
+            .sources
+            .iter()
+            .any(|source| source.path == "AGENTS.md")
+    );
 
     Ok(())
 }
@@ -104,4 +143,12 @@ fn database_url() -> Option<String> {
     std::env::var("HARNESS_TEST_DATABASE_URL")
         .or_else(|_| std::env::var("HARNESS_DATABASE_URL"))
         .ok()
+}
+
+fn workspace_root() -> Result<String, Box<dyn std::error::Error>> {
+    Ok(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()?
+        .display()
+        .to_string())
 }

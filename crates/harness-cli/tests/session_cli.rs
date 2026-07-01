@@ -69,6 +69,59 @@ fn cli_starts_and_shows_session_from_postgres_eventlog() -> Result<(), Box<dyn s
     Ok(())
 }
 
+#[test]
+fn cli_compiles_session_context() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+
+    let migrate = Command::new(bin)
+        .args(["migrate", "--database-url", &database_url])
+        .output()?;
+    assert!(migrate.status.success());
+
+    let repo_path = std::env::current_dir()?.display().to_string();
+    let start = Command::new(bin)
+        .args([
+            "session",
+            "start",
+            "--repo",
+            &repo_path,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(start.status.success());
+
+    let start_stdout = String::from_utf8(start.stdout)?;
+    let session_id = value_for_key(&start_stdout, "session_id").expect("session_id output");
+
+    let compile = Command::new(bin)
+        .args([
+            "session",
+            "compile-context",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--max-bytes",
+            "4096",
+            "--focus",
+            "agent",
+        ])
+        .output()?;
+    assert!(compile.status.success());
+
+    let compile_stdout = String::from_utf8(compile.stdout)?;
+    assert!(compile_stdout.contains("context_sources="));
+    assert!(compile_stdout.contains("context_used_bytes="));
+    assert!(compile_stdout.contains("context_truncated=false"));
+    assert!(compile_stdout.contains("event_count=2"));
+
+    Ok(())
+}
+
 fn database_url() -> Option<String> {
     std::env::var("HARNESS_TEST_DATABASE_URL")
         .or_else(|_| std::env::var("HARNESS_DATABASE_URL"))
