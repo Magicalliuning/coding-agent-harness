@@ -269,8 +269,7 @@ fn cli_recovers_fixture_task_with_bounded_loop() -> Result<(), Box<dyn std::erro
     };
 
     let bin = env!("CARGO_BIN_EXE_harness-cli");
-    let repo = fixture_repo()?;
-    write_recovery_fixture_project(&repo)?;
+    let repo = v0_acceptance_fixture_repo()?;
     init_git_repo(&repo)?;
     let commit_count_before = git_commit_count(&repo)?;
 
@@ -324,12 +323,23 @@ fn cli_recovers_fixture_task_with_bounded_loop() -> Result<(), Box<dyn std::erro
     assert!(recover_stdout.contains("recovery_attempts=1"));
     assert!(recover_stdout.contains("recovery_retries=1"));
     assert!(recover_stdout.contains("recovery_stop_reason=recovered"));
+    assert!(recover_stdout.contains("recovery_max_rounds=2"));
+    assert!(recover_stdout.contains("recovery_used_repair_bytes="));
     assert!(recover_stdout.contains("verification_decision=allow"));
     assert!(recover_stdout.contains("verification_executed=true"));
     assert!(recover_stdout.contains("verification_exit_code=0"));
     assert!(recover_stdout.contains("diff_files_changed=1"));
+    assert!(recover_stdout.contains("diff_insertions="));
+    assert!(recover_stdout.contains("diff_deletions="));
     assert!(recover_stdout.contains("diff_paths=.harness/fake-agent-turn.md"));
+    assert!(recover_stdout.contains("event_replay_total=22"));
+    assert!(recover_stdout.contains("event_replay_last=recovery.stopped"));
+    assert!(recover_stdout.contains("token_prompt="));
+    assert!(recover_stdout.contains("token_completion="));
+    assert!(recover_stdout.contains("token_total="));
+    assert!(recover_stdout.contains("token_max_output=256"));
     assert!(recover_stdout.contains("final_state=pending_commit_approval"));
+    assert!(recover_stdout.contains("event_count=22"));
     assert!(written.contains("recovered=true"));
     assert_eq!(commit_count_before, commit_count_after);
 
@@ -374,18 +384,35 @@ fn write_file(
     Ok(())
 }
 
-fn write_recovery_fixture_project(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    write_file(root, "AGENTS.md", "Use deterministic recovery fixtures.")?;
-    write_file(
-        root,
-        "Cargo.toml",
-        "[package]\nname = \"recovery-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-    )?;
-    write_file(
-        root,
-        "src/lib.rs",
-        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn fake_patch_contains_recovery_marker() {\n        let content = std::fs::read_to_string(\".harness/fake-agent-turn.md\")\n            .expect(\"fake model patch should exist\");\n        assert!(content.contains(\"recovered=true\"), \"missing recovery marker\");\n    }\n}\n",
-    )?;
+fn v0_acceptance_fixture_repo() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let source = workspace_root()?.join("fixtures/v0-acceptance");
+    let target = fixture_repo()?;
+
+    copy_dir(&source, &target)?;
+    Ok(target)
+}
+
+fn workspace_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()?)
+}
+
+fn copy_dir(source: &Path, target: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(target)?;
+
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+
+        if entry.file_type()?.is_dir() {
+            copy_dir(&source_path, &target_path)?;
+        } else {
+            fs::copy(source_path, target_path)?;
+        }
+    }
+
     Ok(())
 }
 

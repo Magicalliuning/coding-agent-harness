@@ -24,3 +24,8 @@ cargo test -p harness-cli --test session_cli
 ```
 
 These integration tests verify session creation, EventLog append, EventLog replay, and derived CLI session state through PostgreSQL.
+
+Before declaring V0 accepted, also run the manual QA gate in `docs/development/v0-acceptance.md`.
+It exercises the CLI-started self-recovery path against `fixtures/v0-acceptance`
+and checks the recovery report, event replay summary, diff summary, token ledger,
+and pending commit approval state.

@@ -462,6 +462,7 @@ fn print_self_recovery_loop_result(result: &SelfRecoveryLoopResult) {
     println!("token_prompt={}", result.token_ledger.prompt_tokens);
     println!("token_completion={}", result.token_ledger.completion_tokens);
     println!("token_total={}", result.token_ledger.total_tokens);
+    println!("token_max_output={}", result.token_ledger.max_output_tokens);
     println!("final_state={}", result.final_state);
     println!("event_count={}", result.event_count);
 }

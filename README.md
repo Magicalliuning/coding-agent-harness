@@ -25,6 +25,11 @@ cargo run -p harness-cli -- migrate --database-url $env:HARNESS_DATABASE_URL
 cargo run -p harness-cli -- session start --repo . --database-url $env:HARNESS_DATABASE_URL
 ```
 
+The V0 manual QA gate is documented in `docs/development/v0-acceptance.md`.
+It runs the CLI against `fixtures/v0-acceptance`, records PostgreSQL EventLog
+entries, exercises the bounded self-recovery loop, and stops at pending commit
+approval.
+
 ## PostgreSQL Development Baseline
 
 Copy `.env.example` to `.env` and start a local PostgreSQL instance. If Docker Compose is available:
