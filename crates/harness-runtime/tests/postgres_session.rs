@@ -10,12 +10,12 @@ use harness_db::PostgresEventStore;
 use harness_events::{EventType, NewEvent, ToolCallIntentPayload};
 use harness_policy::PolicyDecision;
 use harness_runtime::{
-    CodexWorkerLaneBudget, CodexWorkerLaneFixture, CodexWorkerLaneRequest,
-    CodexWorkerLaneWorkspace, CodexWorkerSubprocess, CodexWorkerUsage, ContextBudget,
-    FakeModelTurnRequest, PENDING_COMMIT_APPROVAL_STATE, RECOVERY_FAILED_STATE, RecoveryStopReason,
-    Runtime, SelfRecoveryLoopRequest, SessionContextCompileRequest, SessionStatus,
-    SmallCodingTaskRequest, StartSessionRequest, UsageConfidence, VerificationCommandRequest,
-    WorkerLaneStatus,
+    CodexCliAvailabilityRequest, CodexWorkerLaneBudget, CodexWorkerLaneFixture,
+    CodexWorkerLaneRequest, CodexWorkerLaneWorkspace, CodexWorkerSubprocess, CodexWorkerUsage,
+    ContextBudget, FakeModelTurnRequest, PENDING_COMMIT_APPROVAL_STATE, RECOVERY_FAILED_STATE,
+    RecoveryStopReason, Runtime, SelfRecoveryLoopRequest, SessionContextCompileRequest,
+    SessionStatus, SmallCodingTaskRequest, StartSessionRequest, UsageConfidence,
+    VerificationCommandRequest, WorkerLaneStatus, detect_codex_cli_availability,
 };
 use uuid::Uuid;
 
@@ -969,6 +969,51 @@ fn codex_worker_lane_fake_subprocess_reports_missing_executable()
     assert_eq!(observation.exit_code, None);
     assert!(observation.stderr.contains("worker executable unavailable"));
     assert_eq!(result.pending_commit_state, None);
+
+    Ok(())
+}
+
+#[test]
+fn codex_cli_availability_reports_missing_executable() {
+    let availability = detect_codex_cli_availability(&CodexCliAvailabilityRequest {
+        program: "missing-codex-cli-for-harness-test".to_owned(),
+        codex_home: None,
+        codex_api_key_present: false,
+    });
+
+    assert!(!availability.available);
+    assert!(!availability.authenticated);
+    assert!(
+        availability
+            .skipped_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("could not be started"))
+    );
+}
+
+#[test]
+fn codex_cli_availability_reports_unauthenticated_skip() -> Result<(), Box<dyn std::error::Error>> {
+    let codex_home = fixture_repo()?;
+    let availability = detect_codex_cli_availability(&CodexCliAvailabilityRequest {
+        program: "cargo".to_owned(),
+        codex_home: Some(codex_home),
+        codex_api_key_present: false,
+    });
+
+    assert!(availability.available);
+    assert!(!availability.authenticated);
+    assert!(
+        availability
+            .version
+            .as_deref()
+            .is_some_and(|version| version.contains("cargo"))
+    );
+    assert!(
+        availability
+            .skipped_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("authentication was not detected"))
+    );
 
     Ok(())
 }

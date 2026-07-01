@@ -1,6 +1,6 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::{env, fs};
 
 pub use harness_context::ContextBudget;
 use harness_context::{CompiledContextBundle, ContextCompileRequest, compile_repository_context};
@@ -34,6 +34,9 @@ use uuid::Uuid;
 pub const PENDING_COMMIT_APPROVAL_STATE: &str = "pending_commit_approval";
 pub const RECOVERY_FAILED_STATE: &str = "recovery_failed";
 pub const SELF_RECOVERY_MAX_ROUNDS: usize = 2;
+pub const DEFAULT_CODEX_CLI_PROGRAM: &str = "codex";
+pub const DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS: u64 = 120_000;
+pub const DEFAULT_CODEX_CLI_ACCEPTANCE_TASK: &str = "Create or update .harness/codex-manual-acceptance.md with a short note saying local Codex CLI manual acceptance ran successfully. Do not commit the change.";
 
 pub struct Runtime {
     event_store: PostgresEventStore,
@@ -345,6 +348,86 @@ pub struct CodexWorkerLaneResult {
     pub pending_commit_state: Option<String>,
     pub event_replay: EventReplaySummary,
     pub event_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexCliAvailabilityRequest {
+    pub program: String,
+    pub codex_home: Option<PathBuf>,
+    pub codex_api_key_present: bool,
+}
+
+impl CodexCliAvailabilityRequest {
+    #[must_use]
+    pub fn from_env(program: impl Into<String>) -> Self {
+        Self {
+            program: program.into(),
+            codex_home: env::var("CODEX_HOME")
+                .ok()
+                .map(PathBuf::from)
+                .or_else(default_codex_home),
+            codex_api_key_present: env::var("CODEX_API_KEY")
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexCliAvailability {
+    pub program: String,
+    pub available: bool,
+    pub authenticated: bool,
+    pub version: Option<String>,
+    pub skipped_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexCliAcceptanceStatus {
+    Skipped,
+    Ran,
+}
+
+impl CodexCliAcceptanceStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::Ran => "ran",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexCliAcceptanceRequest {
+    pub task: String,
+    pub codex_program: String,
+    pub timeout_ms: u64,
+    pub max_stdout_bytes: usize,
+    pub availability: CodexCliAvailabilityRequest,
+}
+
+impl CodexCliAcceptanceRequest {
+    #[must_use]
+    pub fn from_env(task: impl Into<String>, codex_program: impl Into<String>) -> Self {
+        let codex_program = codex_program.into();
+
+        Self {
+            task: task.into(),
+            codex_program: codex_program.clone(),
+            timeout_ms: DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS,
+            max_stdout_bytes: 128 * 1024,
+            availability: CodexCliAvailabilityRequest::from_env(codex_program),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexCliAcceptanceResult {
+    pub session_id: Uuid,
+    pub status: CodexCliAcceptanceStatus,
+    pub availability: CodexCliAvailability,
+    pub worker: Option<CodexWorkerLaneResult>,
 }
 
 impl Runtime {
@@ -991,6 +1074,47 @@ impl Runtime {
         })
     }
 
+    pub fn run_codex_cli_manual_acceptance(
+        &mut self,
+        session_id: Uuid,
+        request: CodexCliAcceptanceRequest,
+    ) -> HarnessResult<CodexCliAcceptanceResult> {
+        let availability = detect_codex_cli_availability(&request.availability);
+        if availability.skipped_reason.is_some() {
+            return Ok(CodexCliAcceptanceResult {
+                session_id,
+                status: CodexCliAcceptanceStatus::Skipped,
+                availability,
+                worker: None,
+            });
+        }
+
+        let mut worker_request = CodexWorkerLaneRequest::new_subprocess(
+            request.task.clone(),
+            CodexWorkerSubprocess::new(
+                request.codex_program,
+                vec![
+                    "exec".to_owned(),
+                    "--sandbox".to_owned(),
+                    "workspace-write".to_owned(),
+                    "--json".to_owned(),
+                    request.task,
+                ],
+            ),
+        );
+        worker_request.timeout_ms = request.timeout_ms;
+        worker_request.budget.max_stdout_bytes = request.max_stdout_bytes;
+
+        let worker = self.run_codex_worker_lane(session_id, worker_request)?;
+
+        Ok(CodexCliAcceptanceResult {
+            session_id,
+            status: CodexCliAcceptanceStatus::Ran,
+            availability,
+            worker: Some(worker),
+        })
+    }
+
     fn apply_file_patch_with_events(
         &mut self,
         session_id: Uuid,
@@ -1287,6 +1411,78 @@ fn diff_summary_from_patch(patch: &FilePatchProposal) -> DiffSummary {
         deletions: patch.expected_content.as_deref().map_or(0, line_count),
         paths: vec![patch.path.clone()],
     }
+}
+
+#[must_use]
+pub fn detect_codex_cli_availability(
+    request: &CodexCliAvailabilityRequest,
+) -> CodexCliAvailability {
+    let output = Command::new(&request.program).arg("--version").output();
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            return CodexCliAvailability {
+                program: request.program.clone(),
+                available: false,
+                authenticated: false,
+                version: None,
+                skipped_reason: Some(format!(
+                    "Codex CLI executable could not be started: {error}"
+                )),
+            };
+        }
+    };
+
+    if !output.status.success() {
+        return CodexCliAvailability {
+            program: request.program.clone(),
+            available: false,
+            authenticated: false,
+            version: None,
+            skipped_reason: Some(format!(
+                "Codex CLI version check failed with status {}: {}{}",
+                output
+                    .status
+                    .code()
+                    .map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )),
+        };
+    }
+
+    let version = version_from_output(&output.stdout, &output.stderr);
+    let authenticated = request.codex_api_key_present
+        || request
+            .codex_home
+            .as_ref()
+            .is_some_and(|codex_home| codex_home.join("auth.json").exists());
+    let skipped_reason = (!authenticated).then_some(
+        "Codex CLI authentication was not detected; set CODEX_API_KEY or run codex login"
+            .to_owned(),
+    );
+
+    CodexCliAvailability {
+        program: request.program.clone(),
+        available: true,
+        authenticated,
+        version,
+        skipped_reason,
+    }
+}
+
+fn version_from_output(stdout: &[u8], stderr: &[u8]) -> Option<String> {
+    let output = if stdout.is_empty() { stderr } else { stdout };
+    let version = String::from_utf8_lossy(output).trim().to_owned();
+
+    (!version.is_empty()).then_some(version)
+}
+
+fn default_codex_home() -> Option<PathBuf> {
+    env::var("USERPROFILE")
+        .or_else(|_| env::var("HOME"))
+        .ok()
+        .map(|home| PathBuf::from(home).join(".codex"))
 }
 
 fn capture_git_diff_evidence(
