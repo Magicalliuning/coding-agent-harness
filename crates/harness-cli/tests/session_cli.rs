@@ -46,6 +46,26 @@ fn cli_starts_and_shows_session_from_postgres_eventlog() -> Result<(), Box<dyn s
     assert!(show_stdout.contains("event_count=1"));
     assert!(show_stdout.contains(&format!("repo_path={repo_path}")));
 
+    let verify = Command::new(bin)
+        .args([
+            "session",
+            "verify-command",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--",
+            "cargo",
+            "--version",
+        ])
+        .output()?;
+    assert!(verify.status.success());
+
+    let verify_stdout = String::from_utf8(verify.stdout)?;
+    assert!(verify_stdout.contains("policy_decision=allow"));
+    assert!(verify_stdout.contains("tool_executed=true"));
+    assert!(verify_stdout.contains("exit_code=0"));
+    assert!(verify_stdout.contains("event_count=4"));
+
     Ok(())
 }
 

@@ -1,6 +1,11 @@
 use harness_core::{HarnessError, HarnessResult};
 use harness_db::PostgresEventStore;
-use harness_events::{EventEnvelope, EventType, NewEvent, SessionStartedPayload};
+use harness_events::{
+    EventEnvelope, EventType, NewEvent, PolicyDecisionPayload, SessionStartedPayload,
+    ToolCallIntentPayload, ToolObservationPayload,
+};
+use harness_policy::{PolicyDecision, evaluate_verification_command};
+use harness_tools::{CommandObservation, CommandToolRuntime, VerifyCommandIntent};
 use uuid::Uuid;
 
 pub struct Runtime {
@@ -43,6 +48,31 @@ pub struct SessionProjection {
     pub event_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationCommandRequest {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+impl VerificationCommandRequest {
+    #[must_use]
+    pub fn new(program: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            program: program.into(),
+            args,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationCommandResult {
+    pub session_id: Uuid,
+    pub decision: PolicyDecision,
+    pub reason: String,
+    pub observation: Option<CommandObservation>,
+    pub event_count: usize,
+}
+
 impl Runtime {
     #[must_use]
     pub fn new(event_store: PostgresEventStore) -> Self {
@@ -72,6 +102,66 @@ impl Runtime {
     pub fn show_session(&self, session_id: Uuid) -> HarnessResult<SessionProjection> {
         let events = self.event_store.events_for_session(session_id)?;
         project_session(session_id, &events)
+    }
+
+    pub fn run_verification_command(
+        &mut self,
+        session_id: Uuid,
+        request: VerificationCommandRequest,
+    ) -> HarnessResult<VerificationCommandResult> {
+        let session = self.show_session(session_id)?;
+        let intent =
+            VerifyCommandIntent::new(request.program, request.args, session.repo_path.clone())?;
+        let tool_name = harness_tools::VERIFY_COMMAND_TOOL.name;
+
+        self.event_store.append_event(NewEvent::tool_call_intended(
+            session_id,
+            ToolCallIntentPayload::new(
+                tool_name,
+                intent.program.clone(),
+                intent.args.clone(),
+                intent.working_dir.clone(),
+            ),
+        )?)?;
+
+        let evaluation = evaluate_verification_command(&intent.program, &intent.args);
+
+        self.event_store.append_event(NewEvent::policy_decided(
+            session_id,
+            PolicyDecisionPayload::new(
+                tool_name,
+                evaluation.decision.as_str(),
+                evaluation.reason.clone(),
+            ),
+        )?)?;
+
+        let observation = if evaluation.decision == PolicyDecision::Allow {
+            let observation = CommandToolRuntime.run_verify_command(&intent)?;
+
+            self.event_store
+                .append_event(NewEvent::tool_observation_recorded(
+                    session_id,
+                    ToolObservationPayload::new(
+                        tool_name,
+                        observation.exit_code,
+                        observation.stdout.clone(),
+                        observation.stderr.clone(),
+                        observation.duration_ms,
+                    ),
+                )?)?;
+
+            Some(observation)
+        } else {
+            None
+        };
+
+        Ok(VerificationCommandResult {
+            session_id,
+            decision: evaluation.decision,
+            reason: evaluation.reason,
+            observation,
+            event_count: self.event_store.events_for_session(session_id)?.len(),
+        })
     }
 }
 
@@ -155,5 +245,45 @@ mod tests {
         assert_eq!(projection.repo_path, "C:/repo");
         assert_eq!(projection.status, SessionStatus::Started);
         assert_eq!(projection.event_count, 1);
+    }
+
+    #[test]
+    fn project_session_keeps_count_after_tool_events() {
+        let session_id = Uuid::new_v4();
+        let session_started =
+            NewEvent::session_started(session_id, SessionStartedPayload::new("C:/repo"))
+                .expect("session started event");
+        let tool_intent = NewEvent::tool_call_intended(
+            session_id,
+            ToolCallIntentPayload::new(
+                "verify_command",
+                "cargo",
+                vec!["--version".to_owned()],
+                "C:/repo",
+            ),
+        )
+        .expect("tool intent event");
+        let events = vec![
+            EventEnvelope {
+                event_id: session_started.event_id,
+                session_id,
+                sequence: 1,
+                event_type: session_started.event_type,
+                schema_version: session_started.schema_version,
+                payload: session_started.payload,
+            },
+            EventEnvelope {
+                event_id: tool_intent.event_id,
+                session_id,
+                sequence: 2,
+                event_type: tool_intent.event_type,
+                schema_version: tool_intent.schema_version,
+                payload: tool_intent.payload,
+            },
+        ];
+
+        let projection = project_session(session_id, &events).expect("projection");
+
+        assert_eq!(projection.event_count, 2);
     }
 }

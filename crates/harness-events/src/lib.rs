@@ -6,10 +6,16 @@ use uuid::Uuid;
 pub const EVENTLOG_SCHEMA_VERSION: u16 = 1;
 
 pub const SESSION_STARTED_EVENT: &str = "session.started";
+pub const TOOL_CALL_INTENDED_EVENT: &str = "tool.call_intended";
+pub const POLICY_DECIDED_EVENT: &str = "policy.decided";
+pub const TOOL_OBSERVATION_RECORDED_EVENT: &str = "tool.observation_recorded";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventType {
     SessionStarted,
+    ToolCallIntended,
+    PolicyDecided,
+    ToolObservationRecorded,
 }
 
 impl EventType {
@@ -17,12 +23,18 @@ impl EventType {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::SessionStarted => SESSION_STARTED_EVENT,
+            Self::ToolCallIntended => TOOL_CALL_INTENDED_EVENT,
+            Self::PolicyDecided => POLICY_DECIDED_EVENT,
+            Self::ToolObservationRecorded => TOOL_OBSERVATION_RECORDED_EVENT,
         }
     }
 
     pub fn parse(value: &str) -> HarnessResult<Self> {
         match value {
             SESSION_STARTED_EVENT => Ok(Self::SessionStarted),
+            TOOL_CALL_INTENDED_EVENT => Ok(Self::ToolCallIntended),
+            POLICY_DECIDED_EVENT => Ok(Self::PolicyDecided),
+            TOOL_OBSERVATION_RECORDED_EVENT => Ok(Self::ToolObservationRecorded),
             other => Err(HarnessError::new(format!("unknown event type: {other}"))),
         }
     }
@@ -38,6 +50,81 @@ impl SessionStartedPayload {
     pub fn new(repo_path: impl Into<String>) -> Self {
         Self {
             repo_path: repo_path.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallIntentPayload {
+    pub tool_name: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub working_dir: String,
+}
+
+impl ToolCallIntentPayload {
+    #[must_use]
+    pub fn new(
+        tool_name: impl Into<String>,
+        program: impl Into<String>,
+        args: Vec<String>,
+        working_dir: impl Into<String>,
+    ) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            program: program.into(),
+            args,
+            working_dir: working_dir.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyDecisionPayload {
+    pub tool_name: String,
+    pub decision: String,
+    pub reason: String,
+}
+
+impl PolicyDecisionPayload {
+    #[must_use]
+    pub fn new(
+        tool_name: impl Into<String>,
+        decision: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            decision: decision.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolObservationPayload {
+    pub tool_name: String,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u64,
+}
+
+impl ToolObservationPayload {
+    #[must_use]
+    pub fn new(
+        tool_name: impl Into<String>,
+        exit_code: Option<i32>,
+        stdout: impl Into<String>,
+        stderr: impl Into<String>,
+        duration_ms: u64,
+    ) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            exit_code,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            duration_ms,
         }
     }
 }
@@ -60,6 +147,39 @@ impl NewEvent {
             event_id: Uuid::new_v4(),
             session_id,
             event_type: EventType::SessionStarted,
+            schema_version: eventlog_schema_version(),
+            payload: serde_json::to_value(payload)
+                .map_err(|error| HarnessError::new(error.to_string()))?,
+        })
+    }
+
+    pub fn tool_call_intended(
+        session_id: Uuid,
+        payload: ToolCallIntentPayload,
+    ) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::ToolCallIntended, payload)
+    }
+
+    pub fn policy_decided(session_id: Uuid, payload: PolicyDecisionPayload) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::PolicyDecided, payload)
+    }
+
+    pub fn tool_observation_recorded(
+        session_id: Uuid,
+        payload: ToolObservationPayload,
+    ) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::ToolObservationRecorded, payload)
+    }
+
+    fn new(
+        session_id: Uuid,
+        event_type: EventType,
+        payload: impl Serialize,
+    ) -> HarnessResult<Self> {
+        Ok(Self {
+            event_id: Uuid::new_v4(),
+            session_id,
+            event_type,
             schema_version: eventlog_schema_version(),
             payload: serde_json::to_value(payload)
                 .map_err(|error| HarnessError::new(error.to_string()))?,
@@ -106,5 +226,35 @@ mod tests {
         assert_eq!(event.session_id, session_id);
         assert_eq!(event.event_type.as_str(), "session.started");
         assert_eq!(event.payload["repo_path"], "C:/repo");
+    }
+
+    #[test]
+    fn tool_events_serialize_policy_and_observation_payloads() {
+        let session_id = Uuid::new_v4();
+        let intent = NewEvent::tool_call_intended(
+            session_id,
+            ToolCallIntentPayload::new(
+                "verify_command",
+                "cargo",
+                vec!["test".to_owned()],
+                "C:/repo",
+            ),
+        )
+        .expect("tool intent event");
+        let decision = NewEvent::policy_decided(
+            session_id,
+            PolicyDecisionPayload::new("verify_command", "allow", "safe"),
+        )
+        .expect("policy decision event");
+        let observation = NewEvent::tool_observation_recorded(
+            session_id,
+            ToolObservationPayload::new("verify_command", Some(0), "ok", "", 10),
+        )
+        .expect("tool observation event");
+
+        assert_eq!(intent.event_type.as_str(), "tool.call_intended");
+        assert_eq!(intent.payload["program"], "cargo");
+        assert_eq!(decision.payload["decision"], "allow");
+        assert_eq!(observation.payload["exit_code"], 0);
     }
 }

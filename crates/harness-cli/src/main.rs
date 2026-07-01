@@ -2,7 +2,10 @@ use std::env;
 use std::path::PathBuf;
 
 use harness_core::{HarnessError, HarnessResult};
-use harness_runtime::{Runtime, SessionProjection, StartSessionRequest};
+use harness_runtime::{
+    Runtime, SessionProjection, StartSessionRequest, VerificationCommandRequest,
+    VerificationCommandResult,
+};
 use uuid::Uuid;
 
 fn main() {
@@ -70,6 +73,23 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
             print_projection(&projection);
             Ok(())
         }
+        "verify-command" => {
+            let session_id = args
+                .get(1)
+                .ok_or_else(|| HarnessError::new("session id is required"))?;
+            let session_id = Uuid::parse_str(session_id)
+                .map_err(|error| HarnessError::new(error.to_string()))?;
+            let database_url = database_url_from_args(args_before_separator(&args).to_vec())?;
+            let command = command_after_separator(&args)?;
+            let mut runtime = Runtime::connect_postgres(&database_url)?;
+            let result = runtime.run_verification_command(
+                session_id,
+                VerificationCommandRequest::new(command[0].clone(), command[1..].to_vec()),
+            )?;
+
+            print_verification_result(&result);
+            Ok(())
+        }
         other => Err(HarnessError::new(format!(
             "unknown session command: {other}"
         ))),
@@ -92,6 +112,31 @@ fn optional_arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .find_map(|window| (window[0] == name).then_some(window[1].as_str()))
 }
 
+fn args_before_separator(args: &[String]) -> &[String] {
+    let index = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+
+    &args[..index]
+}
+
+fn command_after_separator(args: &[String]) -> HarnessResult<&[String]> {
+    let Some(index) = args.iter().position(|arg| arg == "--") else {
+        return Err(HarnessError::new(
+            "verification command must follow -- separator",
+        ));
+    };
+
+    let command = &args[index + 1..];
+
+    if command.is_empty() {
+        return Err(HarnessError::new("verification command is required"));
+    }
+
+    Ok(command)
+}
+
 fn canonical_repo_path(repo_path: &str) -> HarnessResult<String> {
     let path = PathBuf::from(repo_path);
     let canonical = path
@@ -106,4 +151,23 @@ fn print_projection(projection: &SessionProjection) {
     println!("status={}", projection.status.as_str());
     println!("repo_path={}", projection.repo_path);
     println!("event_count={}", projection.event_count);
+}
+
+fn print_verification_result(result: &VerificationCommandResult) {
+    println!("session_id={}", result.session_id);
+    println!("policy_decision={}", result.decision.as_str());
+    println!("policy_reason={}", result.reason);
+    println!("tool_executed={}", result.observation.is_some());
+
+    if let Some(observation) = &result.observation {
+        if let Some(exit_code) = observation.exit_code {
+            println!("exit_code={exit_code}");
+        } else {
+            println!("exit_code=signal");
+        }
+
+        println!("duration_ms={}", observation.duration_ms);
+    }
+
+    println!("event_count={}", result.event_count);
 }
