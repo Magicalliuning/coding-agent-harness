@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::{Component, Path};
-use std::process::Command;
-use std::time::Instant;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use harness_core::{HarnessError, HarnessResult};
 use harness_policy::PolicyDecision;
@@ -241,6 +242,56 @@ impl CodexWorkerLaneFixture {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexWorkerSubprocess {
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+impl CodexWorkerSubprocess {
+    #[must_use]
+    pub fn new(program: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            program: program.into(),
+            args,
+            env: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexWorkerLaneRunner {
+    Fixture(CodexWorkerLaneFixture),
+    Subprocess(CodexWorkerSubprocess),
+}
+
+impl CodexWorkerLaneRunner {
+    #[must_use]
+    pub fn fixture(fixture: CodexWorkerLaneFixture) -> Self {
+        Self::Fixture(fixture)
+    }
+
+    #[must_use]
+    pub fn subprocess(subprocess: CodexWorkerSubprocess) -> Self {
+        Self::Subprocess(subprocess)
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Fixture(_) => "fixture",
+            Self::Subprocess(_) => "subprocess",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexWorkerLaneObservation {
     pub status: WorkerLaneStatus,
     pub exit_code: Option<i32>,
@@ -248,6 +299,121 @@ pub struct CodexWorkerLaneObservation {
     pub stderr: String,
     pub duration_ms: u64,
     pub usage: CodexWorkerUsage,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OneShotWorkerRunner;
+
+impl OneShotWorkerRunner {
+    #[must_use]
+    pub fn run(
+        self,
+        intent: &CodexWorkerLaneIntent,
+        subprocess: &CodexWorkerSubprocess,
+    ) -> CodexWorkerLaneObservation {
+        if intent.cancellation_requested {
+            return cancelled_worker_observation();
+        }
+
+        let started_at = Instant::now();
+        let mut command = Command::new(&subprocess.program);
+        command
+            .args(&subprocess.args)
+            .current_dir(&intent.workspace_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("HARNESS_WORKER_TASK", &intent.task)
+            .env("HARNESS_WORKER_WORKSPACE", &intent.workspace_path)
+            .env(
+                "HARNESS_WORKER_WORKTREE",
+                intent.worktree_path.as_deref().unwrap_or(""),
+            )
+            .env("HARNESS_WORKER_TIMEOUT_MS", intent.timeout_ms.to_string())
+            .env(
+                "HARNESS_WORKER_MAX_STDOUT_BYTES",
+                intent.budget.max_stdout_bytes.to_string(),
+            );
+
+        for (key, value) in &subprocess.env {
+            command.env(key, value);
+        }
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                return failed_worker_observation(
+                    None,
+                    "",
+                    format!("worker executable unavailable: {error}"),
+                    elapsed_ms(started_at),
+                    intent.budget.max_stdout_bytes,
+                );
+            }
+        };
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(_status)) => {
+                    return match child.wait_with_output() {
+                        Ok(output) => observation_from_output(
+                            output.status.code(),
+                            output.stdout,
+                            output.stderr,
+                            elapsed_ms(started_at),
+                            intent.budget.max_stdout_bytes,
+                        ),
+                        Err(error) => failed_worker_observation(
+                            None,
+                            "",
+                            format!("worker output capture failed: {error}"),
+                            elapsed_ms(started_at),
+                            intent.budget.max_stdout_bytes,
+                        ),
+                    };
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    return failed_worker_observation(
+                        None,
+                        "",
+                        format!("worker status polling failed: {error}"),
+                        elapsed_ms(started_at),
+                        intent.budget.max_stdout_bytes,
+                    );
+                }
+            }
+
+            if elapsed_ms(started_at) >= intent.timeout_ms {
+                let _ = child.kill();
+                return match child.wait_with_output() {
+                    Ok(output) => CodexWorkerLaneObservation {
+                        status: WorkerLaneStatus::TimedOut,
+                        exit_code: None,
+                        stdout: truncate_to_bytes(
+                            &String::from_utf8_lossy(&output.stdout),
+                            intent.budget.max_stdout_bytes,
+                        ),
+                        stderr: truncate_to_bytes(
+                            &String::from_utf8_lossy(&output.stderr),
+                            intent.budget.max_stdout_bytes,
+                        ),
+                        duration_ms: elapsed_ms(started_at),
+                        usage: CodexWorkerUsage::unknown(),
+                    },
+                    Err(error) => failed_worker_observation(
+                        None,
+                        "",
+                        format!("worker timed out and output capture failed: {error}"),
+                        elapsed_ms(started_at),
+                        intent.budget.max_stdout_bytes,
+                    ),
+                };
+            }
+
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -404,6 +570,60 @@ impl CommandToolRuntime {
             new_bytes: intent.replacement_content.len(),
             duration_ms: elapsed_ms(started_at),
         })
+    }
+}
+
+fn cancelled_worker_observation() -> CodexWorkerLaneObservation {
+    CodexWorkerLaneObservation {
+        status: WorkerLaneStatus::Cancelled,
+        exit_code: None,
+        stdout: String::new(),
+        stderr: "worker lane cancelled before start".to_owned(),
+        duration_ms: 0,
+        usage: CodexWorkerUsage::unknown(),
+    }
+}
+
+fn observation_from_output(
+    exit_code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    duration_ms: u64,
+    max_stdout_bytes: usize,
+) -> CodexWorkerLaneObservation {
+    let status = if exit_code == Some(0) {
+        WorkerLaneStatus::Succeeded
+    } else {
+        WorkerLaneStatus::Failed
+    };
+
+    CodexWorkerLaneObservation {
+        status,
+        exit_code,
+        stdout: truncate_to_bytes(&String::from_utf8_lossy(&stdout), max_stdout_bytes),
+        stderr: truncate_to_bytes(&String::from_utf8_lossy(&stderr), max_stdout_bytes),
+        duration_ms,
+        usage: CodexWorkerUsage::unknown(),
+    }
+}
+
+fn failed_worker_observation(
+    exit_code: Option<i32>,
+    stdout: impl Into<String>,
+    stderr: impl Into<String>,
+    duration_ms: u64,
+    max_stdout_bytes: usize,
+) -> CodexWorkerLaneObservation {
+    let stdout = stdout.into();
+    let stderr = stderr.into();
+
+    CodexWorkerLaneObservation {
+        status: WorkerLaneStatus::Failed,
+        exit_code,
+        stdout: truncate_to_bytes(&stdout, max_stdout_bytes),
+        stderr: truncate_to_bytes(&stderr, max_stdout_bytes),
+        duration_ms,
+        usage: CodexWorkerUsage::unknown(),
     }
 }
 

@@ -11,10 +11,11 @@ use harness_events::{EventType, NewEvent, ToolCallIntentPayload};
 use harness_policy::PolicyDecision;
 use harness_runtime::{
     CodexWorkerLaneBudget, CodexWorkerLaneFixture, CodexWorkerLaneRequest,
-    CodexWorkerLaneWorkspace, CodexWorkerUsage, ContextBudget, FakeModelTurnRequest,
-    PENDING_COMMIT_APPROVAL_STATE, RECOVERY_FAILED_STATE, RecoveryStopReason, Runtime,
-    SelfRecoveryLoopRequest, SessionContextCompileRequest, SessionStatus, SmallCodingTaskRequest,
-    StartSessionRequest, UsageConfidence, VerificationCommandRequest, WorkerLaneStatus,
+    CodexWorkerLaneWorkspace, CodexWorkerSubprocess, CodexWorkerUsage, ContextBudget,
+    FakeModelTurnRequest, PENDING_COMMIT_APPROVAL_STATE, RECOVERY_FAILED_STATE, RecoveryStopReason,
+    Runtime, SelfRecoveryLoopRequest, SessionContextCompileRequest, SessionStatus,
+    SmallCodingTaskRequest, StartSessionRequest, UsageConfidence, VerificationCommandRequest,
+    WorkerLaneStatus,
 };
 use uuid::Uuid;
 
@@ -776,6 +777,203 @@ fn codex_worker_lane_uses_current_workspace_only_when_explicit()
 }
 
 #[test]
+fn codex_worker_lane_runs_fake_subprocess_and_records_diff_pending_approval()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let (script_name, script) = fake_success_runner_script();
+    let repo = git_fixture_repo_with_files(&[(script_name, script)])?;
+    let repo_path = repo.display().to_string();
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo_path.clone()))?;
+
+    let mut request = CodexWorkerLaneRequest::new_subprocess(
+        "subprocess env task",
+        fake_runner_command(script_name).with_env("HARNESS_CUSTOM_MARKER", "custom-env"),
+    );
+    request.budget = CodexWorkerLaneBudget {
+        max_prompt_tokens: 8_192,
+        max_output_tokens: 2_048,
+        max_stdout_bytes: 4,
+    };
+
+    let result = runtime.run_codex_worker_lane(started.session_id, request)?;
+    let observation = result.observation.as_ref().expect("worker observation");
+    let events = runtime.events_for_session(started.session_id)?;
+    let worktree_path = events
+        .iter()
+        .find(|event| event.event_type == EventType::WorkerLaneWorktreeAllocated)
+        .and_then(|event| event.payload["worktree_path"].as_str())
+        .expect("allocated worktree path");
+    let diff_event = events
+        .iter()
+        .find(|event| event.event_type == EventType::DiffRecorded)
+        .expect("diff event");
+
+    assert_eq!(result.final_status, WorkerLaneStatus::Succeeded);
+    assert_eq!(
+        result.pending_commit_state.as_deref(),
+        Some(PENDING_COMMIT_APPROVAL_STATE)
+    );
+    assert_eq!(
+        result.event_replay.last_event_type.as_deref(),
+        Some("commit.approval_pending")
+    );
+    assert_eq!(observation.exit_code, Some(0));
+    assert_eq!(observation.stdout, "0123");
+    assert_eq!(observation.stderr, "abcd");
+    let env_file = fs::read_to_string(Path::new(worktree_path).join("env-task.txt"))?;
+    assert!(env_file.contains("subprocess env task"));
+    assert!(env_file.contains("custom-env"));
+    assert_eq!(git_text(&repo, &["status", "--short"])?, "");
+    assert_eq!(diff_event.payload["files_changed"], 1);
+    assert_eq!(diff_event.payload["paths"][0], "README.md");
+    assert!(
+        diff_event.payload["git_status"]
+            .as_str()
+            .is_some_and(|status| status.contains("README.md"))
+    );
+    assert!(
+        diff_event.payload["git_diff"]
+            .as_str()
+            .is_some_and(|diff| diff.contains("README.md"))
+    );
+    assert_eq!(
+        events.last().expect("last event").event_type,
+        EventType::CommitApprovalPending
+    );
+
+    Ok(())
+}
+
+#[test]
+fn codex_worker_lane_fake_subprocess_reports_non_zero_exit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let (script_name, script) = fake_failure_runner_script();
+    let repo = git_fixture_repo_with_files(&[(script_name, script)])?;
+    let repo_path = repo.display().to_string();
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo_path))?;
+
+    let result = runtime.run_codex_worker_lane(
+        started.session_id,
+        CodexWorkerLaneRequest::new_subprocess(
+            "failing subprocess task",
+            fake_runner_command(script_name),
+        ),
+    )?;
+    let observation = result.observation.as_ref().expect("worker observation");
+
+    assert_eq!(result.final_status, WorkerLaneStatus::Failed);
+    assert_eq!(result.pending_commit_state, None);
+    assert_eq!(observation.exit_code, Some(7));
+    assert!(observation.stdout.contains("failure stdout"));
+    assert!(observation.stderr.contains("failure stderr"));
+
+    Ok(())
+}
+
+#[test]
+fn codex_worker_lane_fake_subprocess_reports_timeout() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let (script_name, script) = fake_timeout_runner_script();
+    let repo = git_fixture_repo_with_files(&[(script_name, script)])?;
+    let repo_path = repo.display().to_string();
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo_path))?;
+
+    let mut request = CodexWorkerLaneRequest::new_subprocess(
+        "timeout subprocess task",
+        fake_runner_command(script_name),
+    );
+    request.timeout_ms = 20;
+    let result = runtime.run_codex_worker_lane(started.session_id, request)?;
+    let observation = result.observation.as_ref().expect("worker observation");
+
+    assert_eq!(result.final_status, WorkerLaneStatus::TimedOut);
+    assert_eq!(observation.exit_code, None);
+    assert!(observation.duration_ms >= 20);
+    assert_eq!(result.pending_commit_state, None);
+
+    Ok(())
+}
+
+#[test]
+fn codex_worker_lane_fake_subprocess_honors_pre_start_cancellation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = git_fixture_repo()?;
+    let repo_path = repo.display().to_string();
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo_path))?;
+
+    let mut request = CodexWorkerLaneRequest::new_subprocess(
+        "cancelled subprocess task",
+        CodexWorkerSubprocess::new("missing-runner-should-not-start", Vec::new()),
+    );
+    request.cancellation_requested = true;
+    let result = runtime.run_codex_worker_lane(started.session_id, request)?;
+    let observation = result.observation.as_ref().expect("worker observation");
+
+    assert_eq!(result.final_status, WorkerLaneStatus::Cancelled);
+    assert_eq!(observation.exit_code, None);
+    assert!(observation.stderr.contains("cancelled before start"));
+
+    Ok(())
+}
+
+#[test]
+fn codex_worker_lane_fake_subprocess_reports_missing_executable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = git_fixture_repo()?;
+    let repo_path = repo.display().to_string();
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo_path))?;
+
+    let result = runtime.run_codex_worker_lane(
+        started.session_id,
+        CodexWorkerLaneRequest::new_subprocess(
+            "missing executable subprocess task",
+            CodexWorkerSubprocess::new("missing-coding-agent-harness-runner", Vec::new()),
+        ),
+    )?;
+    let observation = result.observation.as_ref().expect("worker observation");
+
+    assert_eq!(result.final_status, WorkerLaneStatus::Failed);
+    assert_eq!(observation.exit_code, None);
+    assert!(observation.stderr.contains("worker executable unavailable"));
+    assert_eq!(result.pending_commit_state, None);
+
+    Ok(())
+}
+
+#[test]
 fn denied_verification_command_is_not_executed() -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
         return Ok(());
@@ -849,10 +1047,19 @@ fn fixture_repo() -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 fn git_fixture_repo() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    git_fixture_repo_with_files(&[])
+}
+
+fn git_fixture_repo_with_files(
+    files: &[(&str, &str)],
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let repo = fixture_repo()?;
     write_file(&repo, "README.md", "fixture repository")?;
+    for (relative_path, content) in files {
+        write_file(&repo, relative_path, content)?;
+    }
     run_git(&repo, &["init"])?;
-    run_git(&repo, &["add", "README.md"])?;
+    run_git(&repo, &["add", "."])?;
     run_git(
         &repo,
         &[
@@ -866,6 +1073,65 @@ fn git_fixture_repo() -> Result<PathBuf, Box<dyn std::error::Error>> {
         ],
     )?;
     Ok(repo)
+}
+
+fn fake_runner_command(script_name: &str) -> CodexWorkerSubprocess {
+    #[cfg(windows)]
+    {
+        CodexWorkerSubprocess::new("cmd", vec!["/C".to_owned(), script_name.to_owned()])
+    }
+    #[cfg(not(windows))]
+    {
+        CodexWorkerSubprocess::new("sh", vec![script_name.to_owned()])
+    }
+}
+
+#[cfg(windows)]
+fn fake_success_runner_script() -> (&'static str, &'static str) {
+    (
+        "fake-success-runner.cmd",
+        "@echo off\r\necho 0123456789\r\necho abcdefghij 1>&2\r\necho env:%HARNESS_WORKER_TASK%> env-task.txt\r\necho custom:%HARNESS_CUSTOM_MARKER%>> env-task.txt\r\necho changed by fake runner>> README.md\r\nexit /B 0\r\n",
+    )
+}
+
+#[cfg(not(windows))]
+fn fake_success_runner_script() -> (&'static str, &'static str) {
+    (
+        "fake-success-runner.sh",
+        "#!/bin/sh\nprintf '0123456789\\n'\nprintf 'abcdefghij\\n' >&2\nprintf 'env:%s\\n' \"$HARNESS_WORKER_TASK\" > env-task.txt\nprintf 'custom:%s\\n' \"$HARNESS_CUSTOM_MARKER\" >> env-task.txt\nprintf 'changed by fake runner\\n' >> README.md\nexit 0\n",
+    )
+}
+
+#[cfg(windows)]
+fn fake_failure_runner_script() -> (&'static str, &'static str) {
+    (
+        "fake-failure-runner.cmd",
+        "@echo off\r\necho failure stdout\r\necho failure stderr 1>&2\r\nexit /B 7\r\n",
+    )
+}
+
+#[cfg(not(windows))]
+fn fake_failure_runner_script() -> (&'static str, &'static str) {
+    (
+        "fake-failure-runner.sh",
+        "#!/bin/sh\nprintf 'failure stdout\\n'\nprintf 'failure stderr\\n' >&2\nexit 7\n",
+    )
+}
+
+#[cfg(windows)]
+fn fake_timeout_runner_script() -> (&'static str, &'static str) {
+    (
+        "fake-timeout-runner.cmd",
+        "@echo off\r\necho starting timeout\r\nping -n 3 127.0.0.1 >NUL\r\necho should not finish\r\nexit /B 0\r\n",
+    )
+}
+
+#[cfg(not(windows))]
+fn fake_timeout_runner_script() -> (&'static str, &'static str) {
+    (
+        "fake-timeout-runner.sh",
+        "#!/bin/sh\nprintf 'starting timeout\\n'\nsleep 2\nprintf 'should not finish\\n'\nexit 0\n",
+    )
 }
 
 fn run_git(root: &Path, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
@@ -886,6 +1152,26 @@ fn run_git(root: &Path, args: &[&str]) -> Result<(), Box<dyn std::error::Error>>
     }
 
     Ok(())
+}
+
+fn git_text(root: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "git {:?} failed: {}{}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn write_file(

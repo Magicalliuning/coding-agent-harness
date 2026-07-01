@@ -21,12 +21,13 @@ use harness_policy::{
     evaluate_verification_command,
 };
 pub use harness_tools::{
-    CodexWorkerLaneBudget, CodexWorkerLaneFixture, CodexWorkerLaneObservation, CodexWorkerUsage,
-    UsageConfidence, WorkerLaneStatus,
+    CodexWorkerLaneBudget, CodexWorkerLaneFixture, CodexWorkerLaneObservation,
+    CodexWorkerLaneRunner, CodexWorkerSubprocess, CodexWorkerUsage, UsageConfidence,
+    WorkerLaneStatus,
 };
 use harness_tools::{
     CodexWorkerLaneFixtureAdapter, CodexWorkerLaneIntent, CommandObservation, CommandToolRuntime,
-    FilePatchIntent, FilePatchObservation, VerifyCommandIntent,
+    FilePatchIntent, FilePatchObservation, OneShotWorkerRunner, VerifyCommandIntent,
 };
 use uuid::Uuid;
 
@@ -171,6 +172,13 @@ pub struct DiffSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct GitDiffEvidence {
+    summary: DiffSummary,
+    git_status: String,
+    git_diff: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventReplaySummary {
     pub total_events: usize,
     pub last_event_type: Option<String>,
@@ -272,19 +280,29 @@ pub struct CodexWorkerLaneRequest {
     pub timeout_ms: u64,
     pub cancellation_requested: bool,
     pub budget: CodexWorkerLaneBudget,
-    pub fixture: CodexWorkerLaneFixture,
+    pub runner: CodexWorkerLaneRunner,
 }
 
 impl CodexWorkerLaneRequest {
     #[must_use]
     pub fn new(task: impl Into<String>, fixture: CodexWorkerLaneFixture) -> Self {
+        Self::new_runner(task, CodexWorkerLaneRunner::fixture(fixture))
+    }
+
+    #[must_use]
+    pub fn new_subprocess(task: impl Into<String>, subprocess: CodexWorkerSubprocess) -> Self {
+        Self::new_runner(task, CodexWorkerLaneRunner::subprocess(subprocess))
+    }
+
+    #[must_use]
+    pub fn new_runner(task: impl Into<String>, runner: CodexWorkerLaneRunner) -> Self {
         Self {
             task: task.into(),
             workspace: CodexWorkerLaneWorkspace::default(),
             timeout_ms: 30_000,
             cancellation_requested: false,
             budget: CodexWorkerLaneBudget::default(),
-            fixture,
+            runner,
         }
     }
 }
@@ -324,6 +342,7 @@ pub struct CodexWorkerLaneResult {
     pub reason: String,
     pub observation: Option<CodexWorkerLaneObservation>,
     pub final_status: WorkerLaneStatus,
+    pub pending_commit_state: Option<String>,
     pub event_replay: EventReplaySummary,
     pub event_count: usize,
 }
@@ -850,6 +869,7 @@ impl Runtime {
                 reason: evaluation.reason,
                 observation: None,
                 final_status: WorkerLaneStatus::Rejected,
+                pending_commit_state: None,
                 event_replay: event_replay_summary(&events),
                 event_count: events.len(),
             });
@@ -879,6 +899,7 @@ impl Runtime {
                         reason: format!("task worktree allocation failed: {error}"),
                         observation: None,
                         final_status: WorkerLaneStatus::Failed,
+                        pending_commit_state: None,
                         event_replay: event_replay_summary(&events),
                         event_count: events.len(),
                     });
@@ -917,12 +938,19 @@ impl Runtime {
                 &lane_id,
                 Some(WorkerLaneStatus::Queued),
                 WorkerLaneStatus::Running,
-                "fixture worker lane started",
+                &format!("{} worker lane started", request.runner.kind()),
             )?;
             WorkerLaneStatus::Running
         };
 
-        let observation = CodexWorkerLaneFixtureAdapter.run(&intent, &request.fixture);
+        let observation = match &request.runner {
+            CodexWorkerLaneRunner::Fixture(fixture) => {
+                CodexWorkerLaneFixtureAdapter.run(&intent, fixture)
+            }
+            CodexWorkerLaneRunner::Subprocess(subprocess) => {
+                OneShotWorkerRunner.run(&intent, subprocess)
+            }
+        };
         self.event_store
             .append_event(NewEvent::worker_lane_observation_recorded(
                 session_id,
@@ -934,8 +962,18 @@ impl Runtime {
             &lane_id,
             Some(previous_state),
             observation.status,
-            "fixture worker lane completed",
+            &format!("{} worker lane completed", request.runner.kind()),
         )?;
+
+        let pending_commit_state = if observation.status == WorkerLaneStatus::Succeeded {
+            self.record_worker_lane_diff_if_needed(
+                session_id,
+                &intent.workspace_path,
+                intent.budget.max_stdout_bytes,
+            )?
+        } else {
+            None
+        };
 
         let events = self.event_store.events_for_session(session_id)?;
         let final_status = observation.status;
@@ -947,6 +985,7 @@ impl Runtime {
             reason: evaluation.reason,
             observation: Some(observation),
             final_status,
+            pending_commit_state,
             event_replay: event_replay_summary(&events),
             event_count: events.len(),
         })
@@ -1025,6 +1064,33 @@ impl Runtime {
             )?)?;
 
         Ok(())
+    }
+
+    fn record_worker_lane_diff_if_needed(
+        &mut self,
+        session_id: Uuid,
+        repo_path: &str,
+        max_diff_bytes: usize,
+    ) -> HarnessResult<Option<String>> {
+        let Some(evidence) = capture_git_diff_evidence(repo_path, max_diff_bytes)? else {
+            return Ok(None);
+        };
+
+        self.event_store.append_event(NewEvent::diff_recorded(
+            session_id,
+            diff_summary_payload(&evidence.summary)
+                .with_git_evidence(evidence.git_status, evidence.git_diff),
+        )?)?;
+        self.event_store
+            .append_event(NewEvent::commit_approval_pending(
+                session_id,
+                CommitApprovalPendingPayload::new(
+                    PENDING_COMMIT_APPROVAL_STATE,
+                    "worker lane succeeded with reviewable diff; awaiting human commit approval",
+                ),
+            )?)?;
+
+        Ok(Some(PENDING_COMMIT_APPROVAL_STATE.to_owned()))
     }
 
     fn finish_recovery_loop(
@@ -1223,6 +1289,96 @@ fn diff_summary_from_patch(patch: &FilePatchProposal) -> DiffSummary {
     }
 }
 
+fn capture_git_diff_evidence(
+    repo_path: &str,
+    max_diff_bytes: usize,
+) -> HarnessResult<Option<GitDiffEvidence>> {
+    let git_status = run_git_text(repo_path, &["status", "--short"])?;
+    if git_status.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let numstat = run_git_text(repo_path, &["diff", "--numstat"])?;
+    let git_diff = truncate_to_bytes(&run_git_text(repo_path, &["diff", "--"])?, max_diff_bytes);
+    let summary = diff_summary_from_git(&numstat, &git_status);
+
+    Ok(Some(GitDiffEvidence {
+        summary,
+        git_status,
+        git_diff,
+    }))
+}
+
+fn run_git_text(repo_path: &str, args: &[&str]) -> HarnessResult<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(args)
+        .output()
+        .map_err(|error| HarnessError::new(format!("could not start git {:?}: {error}", args)))?;
+
+    if !output.status.success() {
+        return Err(HarnessError::new(format!(
+            "git {:?} failed with status {}: {}{}",
+            args,
+            output
+                .status
+                .code()
+                .map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn diff_summary_from_git(numstat: &str, git_status: &str) -> DiffSummary {
+    let mut insertions = 0;
+    let mut deletions = 0;
+    let mut paths = Vec::new();
+
+    for line in numstat.lines() {
+        let mut parts = line.split('\t');
+        let added = parts.next();
+        let removed = parts.next();
+        let path = parts.next();
+
+        let Some(path) = path else {
+            continue;
+        };
+
+        insertions += added.and_then(parse_numstat_count).unwrap_or(0);
+        deletions += removed.and_then(parse_numstat_count).unwrap_or(0);
+        paths.push(path.to_owned());
+    }
+
+    if paths.is_empty() {
+        paths.extend(git_status.lines().filter_map(status_path));
+    }
+
+    paths.sort();
+    paths.dedup();
+
+    DiffSummary {
+        files_changed: paths.len(),
+        insertions,
+        deletions,
+        paths,
+    }
+}
+
+fn parse_numstat_count(value: &str) -> Option<usize> {
+    value.parse::<usize>().ok()
+}
+
+fn status_path(line: &str) -> Option<String> {
+    line.get(3..)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn diff_summary_payload(diff: &DiffSummary) -> DiffSummaryPayload {
     DiffSummaryPayload::new(
         diff.files_changed,
@@ -1318,6 +1474,19 @@ fn canonicalize_if_possible(path: &Path) -> String {
     let path = path.canonicalize().unwrap_or_else(|_| PathBuf::from(path));
 
     path.display().to_string()
+}
+
+fn truncate_to_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    value[..end].to_owned()
 }
 
 fn worker_lane_request_payload(
