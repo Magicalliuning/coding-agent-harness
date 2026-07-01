@@ -5,13 +5,13 @@ This file is the first domain entry point for agents working in this repository.
 ## Runtime Core
 
 - Crates: `crates/harness-runtime`, `crates/harness-events`, `crates/harness-db`
-- Governing ADRs: `docs/adr/0001-eventlog-is-source-of-truth.md`, `docs/adr/0003-self-recovery-loop-bounded-autonomy.md`, `docs/adr/0004-postgresql-primary-runtime-source-of-truth.md`
+- Governing ADRs: `docs/adr/0001-eventlog-as-source-of-truth.md`, `docs/adr/0003-self-recovery-loop-boundaries.md`, `docs/adr/0004-postgresql-first-runtime-sot.md`
 - Acceptance: `docs/development/v0-acceptance.md`, `fixtures/v0-acceptance`
 
 ## Policy and Tool Runtime
 
 - Crates: `crates/harness-policy`, `crates/harness-tools`
-- Governing ADR: `docs/adr/0002-policy-gate-authorizes-tool-runtime-executes.md`
+- Governing ADR: `docs/adr/0002-policy-gate-and-tool-runtime-boundary.md`
 - Core invariant: models, skills, MCP servers, hooks, recovery loops, and external worker lanes may propose tool intents, but only Tool Runtime executes approved actions.
 
 ## Context and Skills
@@ -19,13 +19,13 @@ This file is the first domain entry point for agents working in this repository.
 - Crate: `crates/harness-context`
 - Entry files: `AGENTS.md`, `CONTEXT-MAP.md`
 - Skill metadata roots: `.codex/skills`, `.agents/skills`, `skills`
-- Governing ADRs: `docs/adr/0005-v0-rust-workspace-crate-boundaries.md`, `docs/adr/0008-v0-acceptance-end-to-end-self-recovering-task.md`
+- Governing ADRs: `docs/adr/0005-v0-rust-workspace-crate-boundaries.md`, `docs/adr/0008-v0-end-to-end-acceptance.md`
 
 ## Models and Worker Lanes
 
 - Crate: `crates/harness-models`
 - Runtime integration: `crates/harness-runtime`
-- Governing ADRs: `docs/adr/0006-hybrid-model-and-governed-agent-cli-strategy.md`, `docs/adr/0007-codex-cli-first-governed-external-lane.md`
+- Governing ADRs: `docs/adr/0006-hybrid-model-and-agent-cli-strategy.md`, `docs/adr/0007-codex-cli-first-external-agent-lane.md`
 - Current V0 lane: deterministic fake model plus Codex CLI fixture-adapter boundary.
 
 ## CLI Surface
