@@ -35,7 +35,19 @@ impl PostgresEventStore {
 
     pub fn append_event(&self, event: NewEvent) -> HarnessResult<EventEnvelope> {
         let mut client = self.client()?;
-        let row = client
+        let session_lock_key = event.session_id.to_string();
+        let mut transaction = client
+            .transaction()
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+
+        transaction
+            .execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1::text)::bigint)",
+                &[&session_lock_key],
+            )
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+
+        let row = transaction
             .query_one(
                 "
                 INSERT INTO harness_runtime.event_log (
@@ -68,6 +80,10 @@ impl PostgresEventStore {
                     &event.payload,
                 ],
             )
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+
+        transaction
+            .commit()
             .map_err(|error| HarnessError::new(error.to_string()))?;
 
         event_from_row(row)

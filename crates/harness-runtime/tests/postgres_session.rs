@@ -1,9 +1,12 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use harness_events::EventType;
+use harness_db::PostgresEventStore;
+use harness_events::{EventType, NewEvent, ToolCallIntentPayload};
 use harness_policy::PolicyDecision;
 use harness_runtime::{
     CodexWorkerLaneBudget, CodexWorkerLaneFixture, CodexWorkerLaneRequest, CodexWorkerUsage,
@@ -59,6 +62,70 @@ fn verification_command_records_allowed_observation() -> Result<(), Box<dyn std:
     assert!(result.observation.is_some());
     assert_eq!(result.event_count, 4);
     assert_eq!(replayed.event_count, 4);
+
+    Ok(())
+}
+
+#[test]
+fn concurrent_event_appends_keep_session_sequence_contiguous()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new("concurrent-eventlog-fixture"))?;
+    let worker_count = 12;
+    let barrier = Arc::new(Barrier::new(worker_count));
+    let mut handles = Vec::new();
+
+    for index in 0..worker_count {
+        let barrier = Arc::clone(&barrier);
+        let database_url = database_url.clone();
+        let session_id = started.session_id;
+
+        handles.push(thread::spawn(move || -> Result<(), String> {
+            let store =
+                PostgresEventStore::connect(&database_url).map_err(|error| error.to_string())?;
+            let event = NewEvent::tool_call_intended(
+                session_id,
+                ToolCallIntentPayload::new(
+                    "verify_command",
+                    "cargo",
+                    vec![format!("--worker={index}")],
+                    "concurrent-eventlog-fixture",
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+
+            barrier.wait();
+            store
+                .append_event(event)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }));
+    }
+
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| std::io::Error::other("append thread panicked"))?
+            .map_err(std::io::Error::other)?;
+    }
+
+    let events = runtime.events_for_session(started.session_id)?;
+    let sequences = events
+        .iter()
+        .map(|event| event.sequence)
+        .collect::<Vec<_>>();
+    let expected = (1..=worker_count + 1)
+        .map(|sequence| sequence as i64)
+        .collect::<Vec<_>>();
+
+    assert_eq!(events.len(), worker_count + 1);
+    assert_eq!(sequences, expected);
 
     Ok(())
 }
