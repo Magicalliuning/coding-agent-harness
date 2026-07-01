@@ -3,10 +3,12 @@ use std::path::PathBuf;
 
 use harness_core::{HarnessError, HarnessResult};
 use harness_runtime::{
-    ContextBudget, FakeModelTurnRequest, FakeModelTurnResult, Runtime, SelfRecoveryLoopRequest,
-    SelfRecoveryLoopResult, SessionContextCompileRequest, SessionContextCompileResult,
-    SessionProjection, SmallCodingTaskRequest, SmallCodingTaskResult, StartSessionRequest,
-    VerificationCommandRequest, VerificationCommandResult,
+    CodexCliAcceptanceRequest, CodexCliAcceptanceResult, CodexCliAvailabilityRequest,
+    ContextBudget, DEFAULT_CODEX_CLI_ACCEPTANCE_TASK, DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS,
+    DEFAULT_CODEX_CLI_PROGRAM, FakeModelTurnRequest, FakeModelTurnResult, Runtime,
+    SelfRecoveryLoopRequest, SelfRecoveryLoopResult, SessionContextCompileRequest,
+    SessionContextCompileResult, SessionProjection, SmallCodingTaskRequest, SmallCodingTaskResult,
+    StartSessionRequest, VerificationCommandRequest, VerificationCommandResult,
 };
 use uuid::Uuid;
 
@@ -231,6 +233,44 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
             print_self_recovery_loop_result(&result);
             Ok(())
         }
+        "codex-acceptance" => {
+            let session_id = args
+                .get(1)
+                .ok_or_else(|| HarnessError::new("session id is required"))?;
+            let session_id = Uuid::parse_str(session_id)
+                .map_err(|error| HarnessError::new(error.to_string()))?;
+            let before_separator = args_before_separator(&args);
+            let database_url = database_url_from_args(before_separator.to_vec())?;
+            let task = optional_arg_value(before_separator, "--task")
+                .unwrap_or(DEFAULT_CODEX_CLI_ACCEPTANCE_TASK);
+            let codex_program = optional_arg_value(before_separator, "--codex-program")
+                .unwrap_or(DEFAULT_CODEX_CLI_PROGRAM);
+            let timeout_ms = optional_arg_value(before_separator, "--timeout-ms")
+                .map(|value| parse_u64_arg("--timeout-ms", value))
+                .transpose()?
+                .unwrap_or(DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS);
+            let max_stdout_bytes = optional_arg_value(before_separator, "--max-stdout-bytes")
+                .map(|value| parse_usize_arg("--max-stdout-bytes", value))
+                .transpose()?
+                .unwrap_or(128 * 1024);
+            let codex_home =
+                optional_arg_value(before_separator, "--codex-home").map(PathBuf::from);
+            let mut request =
+                CodexCliAcceptanceRequest::from_env(task.to_owned(), codex_program.to_owned());
+            request.timeout_ms = timeout_ms;
+            request.max_stdout_bytes = max_stdout_bytes;
+            request.availability = CodexCliAvailabilityRequest {
+                program: codex_program.to_owned(),
+                codex_home: codex_home.or(request.availability.codex_home),
+                codex_api_key_present: request.availability.codex_api_key_present,
+            };
+
+            let mut runtime = Runtime::connect_postgres(&database_url)?;
+            let result = runtime.run_codex_cli_manual_acceptance(session_id, request)?;
+
+            print_codex_cli_acceptance_result(&result);
+            Ok(())
+        }
         other => Err(HarnessError::new(format!(
             "unknown session command: {other}"
         ))),
@@ -278,6 +318,12 @@ fn context_budget_from_args(args: &[String]) -> HarnessResult<ContextBudget> {
 }
 
 fn parse_usize_arg(name: &str, value: &str) -> HarnessResult<usize> {
+    value
+        .parse()
+        .map_err(|error| HarnessError::new(format!("{name} must be a positive integer: {error}")))
+}
+
+fn parse_u64_arg(name: &str, value: &str) -> HarnessResult<u64> {
     value
         .parse()
         .map_err(|error| HarnessError::new(format!("{name} must be a positive integer: {error}")))
@@ -465,4 +511,46 @@ fn print_self_recovery_loop_result(result: &SelfRecoveryLoopResult) {
     println!("token_max_output={}", result.token_ledger.max_output_tokens);
     println!("final_state={}", result.final_state);
     println!("event_count={}", result.event_count);
+}
+
+fn print_codex_cli_acceptance_result(result: &CodexCliAcceptanceResult) {
+    println!("session_id={}", result.session_id);
+    println!("codex_acceptance_status={}", result.status.as_str());
+    println!("codex_program={}", result.availability.program);
+    println!("codex_available={}", result.availability.available);
+    println!("codex_authenticated={}", result.availability.authenticated);
+    println!(
+        "codex_version={}",
+        result.availability.version.as_deref().unwrap_or("")
+    );
+    println!(
+        "codex_skipped_reason={}",
+        result.availability.skipped_reason.as_deref().unwrap_or("")
+    );
+
+    if let Some(worker) = &result.worker {
+        println!("worker_lane_id={}", worker.lane_id);
+        println!("worker_final_status={}", worker.final_status.as_str());
+        println!(
+            "worker_pending_commit_state={}",
+            worker.pending_commit_state.as_deref().unwrap_or("")
+        );
+
+        if let Some(observation) = &worker.observation {
+            if let Some(exit_code) = observation.exit_code {
+                println!("worker_exit_code={exit_code}");
+            } else {
+                println!("worker_exit_code=signal");
+            }
+
+            println!("worker_duration_ms={}", observation.duration_ms);
+        }
+
+        println!("event_replay_total={}", worker.event_replay.total_events);
+        println!(
+            "event_replay_last={}",
+            worker.event_replay.last_event_type.as_deref().unwrap_or("")
+        );
+        println!("event_count={}", worker.event_count);
+    }
 }

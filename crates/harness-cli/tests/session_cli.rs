@@ -74,6 +74,59 @@ fn cli_starts_and_shows_session_from_postgres_eventlog() -> Result<(), Box<dyn s
 }
 
 #[test]
+fn cli_codex_acceptance_reports_explicit_skip_when_unavailable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+
+    let migrate = Command::new(bin)
+        .args(["migrate", "--database-url", &database_url])
+        .output()?;
+    assert!(migrate.status.success());
+
+    let repo_path = std::env::current_dir()?.display().to_string();
+    let start = Command::new(bin)
+        .args([
+            "session",
+            "start",
+            "--repo",
+            &repo_path,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(start.status.success());
+
+    let start_stdout = String::from_utf8(start.stdout)?;
+    let session_id = value_for_key(&start_stdout, "session_id").expect("session_id output");
+
+    let acceptance = Command::new(bin)
+        .args([
+            "session",
+            "codex-acceptance",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--codex-program",
+            "missing-codex-cli-for-harness-test",
+        ])
+        .output()?;
+    assert!(acceptance.status.success());
+
+    let stdout = String::from_utf8(acceptance.stdout)?;
+    assert!(stdout.contains("codex_acceptance_status=skipped"));
+    assert!(stdout.contains("codex_available=false"));
+    assert!(stdout.contains("codex_authenticated=false"));
+    assert!(stdout.contains("codex_skipped_reason=Codex CLI executable could not be started"));
+    assert!(!stdout.contains("worker_lane_id="));
+
+    Ok(())
+}
+
+#[test]
 fn cli_compiles_session_context() -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
         return Ok(());
