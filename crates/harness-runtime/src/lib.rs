@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 pub use harness_context::ContextBudget;
 use harness_context::{CompiledContextBundle, ContextCompileRequest, compile_repository_context};
@@ -12,7 +13,7 @@ use harness_events::{
     RecoveryFailurePayload, RecoveryPlanPayload, RecoveryRepairAttemptPayload,
     RecoveryStoppedPayload, SessionStartedPayload, SkillMetadataPayload, ToolCallIntentPayload,
     ToolObservationPayload, WorkerLaneBudgetPayload, WorkerLaneObservationPayload,
-    WorkerLaneRequestPayload, WorkerLaneStatePayload,
+    WorkerLaneRequestPayload, WorkerLaneStatePayload, WorkerLaneWorktreeAllocatedPayload,
 };
 use harness_models::{DeterministicFakeModelProvider, FakeModelRequest, FilePatchProposal};
 use harness_policy::{
@@ -267,12 +268,52 @@ pub struct SelfRecoveryLoopResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexWorkerLaneRequest {
     pub task: String,
-    pub workspace_path: String,
-    pub worktree_path: Option<String>,
+    pub workspace: CodexWorkerLaneWorkspace,
     pub timeout_ms: u64,
     pub cancellation_requested: bool,
     pub budget: CodexWorkerLaneBudget,
     pub fixture: CodexWorkerLaneFixture,
+}
+
+impl CodexWorkerLaneRequest {
+    #[must_use]
+    pub fn new(task: impl Into<String>, fixture: CodexWorkerLaneFixture) -> Self {
+        Self {
+            task: task.into(),
+            workspace: CodexWorkerLaneWorkspace::default(),
+            timeout_ms: 30_000,
+            cancellation_requested: false,
+            budget: CodexWorkerLaneBudget::default(),
+            fixture,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CodexWorkerLaneWorkspace {
+    #[default]
+    AllocateTaskWorktree,
+    DangerousCurrentWorkspace,
+    ExistingWorktree {
+        path: String,
+    },
+}
+
+impl CodexWorkerLaneWorkspace {
+    #[must_use]
+    pub const fn allocate_task_worktree() -> Self {
+        Self::AllocateTaskWorktree
+    }
+
+    #[must_use]
+    pub const fn dangerous_current_workspace() -> Self {
+        Self::DangerousCurrentWorkspace
+    }
+
+    #[must_use]
+    pub fn existing_worktree(path: impl Into<String>) -> Self {
+        Self::ExistingWorktree { path: path.into() }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -756,10 +797,11 @@ impl Runtime {
         let lane_id = Uuid::new_v4().to_string();
         let lane_kind = "codex_cli";
         let tool_name = harness_tools::CODEX_WORKER_LANE_TOOL.name;
+        let workspace = requested_codex_worker_workspace(&request.workspace, &session.repo_path);
         let intent = CodexWorkerLaneIntent {
             task: request.task,
-            workspace_path: request.workspace_path,
-            worktree_path: request.worktree_path,
+            workspace_path: workspace.workspace_path,
+            worktree_path: workspace.worktree_path,
             timeout_ms: request.timeout_ms,
             cancellation_requested: request.cancellation_requested,
             budget: request.budget,
@@ -811,6 +853,52 @@ impl Runtime {
                 event_replay: event_replay_summary(&events),
                 event_count: events.len(),
             });
+        }
+
+        let mut intent = intent;
+        if matches!(
+            request.workspace,
+            CodexWorkerLaneWorkspace::AllocateTaskWorktree
+        ) {
+            let allocation = match allocate_task_worktree(&session.repo_path, &lane_id) {
+                Ok(allocation) => allocation,
+                Err(error) => {
+                    self.append_worker_lane_state(
+                        session_id,
+                        &lane_id,
+                        None,
+                        WorkerLaneStatus::Failed,
+                        &format!("task worktree allocation failed: {error}"),
+                    )?;
+
+                    let events = self.event_store.events_for_session(session_id)?;
+                    return Ok(CodexWorkerLaneResult {
+                        session_id,
+                        lane_id,
+                        decision: evaluation.decision,
+                        reason: format!("task worktree allocation failed: {error}"),
+                        observation: None,
+                        final_status: WorkerLaneStatus::Failed,
+                        event_replay: event_replay_summary(&events),
+                        event_count: events.len(),
+                    });
+                }
+            };
+
+            self.event_store
+                .append_event(NewEvent::worker_lane_worktree_allocated(
+                    session_id,
+                    WorkerLaneWorktreeAllocatedPayload::new(
+                        &lane_id,
+                        lane_kind,
+                        &session.repo_path,
+                        &allocation.worktree_path,
+                        &allocation.base_ref,
+                    ),
+                )?)?;
+
+            intent.workspace_path = allocation.worktree_path.clone();
+            intent.worktree_path = Some(allocation.worktree_path);
         }
 
         self.append_worker_lane_state(
@@ -1142,6 +1230,94 @@ fn diff_summary_payload(diff: &DiffSummary) -> DiffSummaryPayload {
         diff.deletions,
         diff.paths.clone(),
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedWorkerWorkspace {
+    workspace_path: String,
+    worktree_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskWorktreeAllocation {
+    worktree_path: String,
+    base_ref: String,
+}
+
+fn requested_codex_worker_workspace(
+    workspace: &CodexWorkerLaneWorkspace,
+    session_repo_path: &str,
+) -> ResolvedWorkerWorkspace {
+    match workspace {
+        CodexWorkerLaneWorkspace::AllocateTaskWorktree
+        | CodexWorkerLaneWorkspace::DangerousCurrentWorkspace => ResolvedWorkerWorkspace {
+            workspace_path: session_repo_path.to_owned(),
+            worktree_path: None,
+        },
+        CodexWorkerLaneWorkspace::ExistingWorktree { path } => ResolvedWorkerWorkspace {
+            workspace_path: path.clone(),
+            worktree_path: Some(path.clone()),
+        },
+    }
+}
+
+fn allocate_task_worktree(
+    session_repo_path: &str,
+    lane_id: &str,
+) -> HarnessResult<TaskWorktreeAllocation> {
+    let repo_path = Path::new(session_repo_path);
+    let repo_name = repo_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("repo");
+    let parent = repo_path.parent().unwrap_or_else(|| Path::new("."));
+    let worktree_path = parent
+        .join(".harness-worktrees")
+        .join(format!("{repo_name}-{lane_id}"));
+
+    if let Some(parent) = worktree_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            HarnessError::new(format!(
+                "could not create task worktree parent {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("worktree")
+        .arg("add")
+        .arg("--detach")
+        .arg(&worktree_path)
+        .arg("HEAD")
+        .output()
+        .map_err(|error| HarnessError::new(format!("could not start git worktree add: {error}")))?;
+
+    if !output.status.success() {
+        return Err(HarnessError::new(format!(
+            "git worktree add failed with status {}: {}{}",
+            output
+                .status
+                .code()
+                .map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    Ok(TaskWorktreeAllocation {
+        worktree_path: canonicalize_if_possible(&worktree_path),
+        base_ref: "HEAD".to_owned(),
+    })
+}
+
+fn canonicalize_if_possible(path: &Path) -> String {
+    let path = path.canonicalize().unwrap_or_else(|_| PathBuf::from(path));
+
+    path.display().to_string()
 }
 
 fn worker_lane_request_payload(

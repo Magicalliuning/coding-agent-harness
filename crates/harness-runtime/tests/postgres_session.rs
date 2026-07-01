@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,11 +10,11 @@ use harness_db::PostgresEventStore;
 use harness_events::{EventType, NewEvent, ToolCallIntentPayload};
 use harness_policy::PolicyDecision;
 use harness_runtime::{
-    CodexWorkerLaneBudget, CodexWorkerLaneFixture, CodexWorkerLaneRequest, CodexWorkerUsage,
-    ContextBudget, FakeModelTurnRequest, PENDING_COMMIT_APPROVAL_STATE, RECOVERY_FAILED_STATE,
-    RecoveryStopReason, Runtime, SelfRecoveryLoopRequest, SessionContextCompileRequest,
-    SessionStatus, SmallCodingTaskRequest, StartSessionRequest, UsageConfidence,
-    VerificationCommandRequest, WorkerLaneStatus,
+    CodexWorkerLaneBudget, CodexWorkerLaneFixture, CodexWorkerLaneRequest,
+    CodexWorkerLaneWorkspace, CodexWorkerUsage, ContextBudget, FakeModelTurnRequest,
+    PENDING_COMMIT_APPROVAL_STATE, RECOVERY_FAILED_STATE, RecoveryStopReason, Runtime,
+    SelfRecoveryLoopRequest, SessionContextCompileRequest, SessionStatus, SmallCodingTaskRequest,
+    StartSessionRequest, UsageConfidence, VerificationCommandRequest, WorkerLaneStatus,
 };
 use uuid::Uuid;
 
@@ -510,38 +511,32 @@ fn codex_worker_lane_records_output_usage_and_state_events()
 
     harness_runtime::apply_database_migrations(&database_url)?;
 
-    let repo = fixture_repo()?;
+    let repo = git_fixture_repo()?;
     let repo_path = repo.display().to_string();
     let mut runtime = Runtime::connect_postgres(&database_url)?;
     let started = runtime.start_session(StartSessionRequest::new(repo_path.clone()))?;
 
-    let result = runtime.run_codex_worker_lane(
-        started.session_id,
-        CodexWorkerLaneRequest {
-            task: "draft the next harness patch".to_owned(),
-            workspace_path: repo_path,
-            worktree_path: None,
-            timeout_ms: 30_000,
-            cancellation_requested: false,
-            budget: CodexWorkerLaneBudget {
-                max_prompt_tokens: 8_192,
-                max_output_tokens: 2_048,
-                max_stdout_bytes: 64 * 1024,
-            },
-            fixture: CodexWorkerLaneFixture {
-                status: WorkerLaneStatus::Succeeded,
-                exit_code: Some(0),
-                stdout: "codex proposed a patch".to_owned(),
-                stderr: String::new(),
-                duration_ms: 42,
-                usage: CodexWorkerUsage {
-                    prompt_tokens: Some(120),
-                    completion_tokens: Some(40),
-                    confidence: UsageConfidence::LocalEstimate,
-                },
+    let mut request = CodexWorkerLaneRequest::new(
+        "draft the next harness patch",
+        CodexWorkerLaneFixture {
+            status: WorkerLaneStatus::Succeeded,
+            exit_code: Some(0),
+            stdout: "codex proposed a patch".to_owned(),
+            stderr: String::new(),
+            duration_ms: 42,
+            usage: CodexWorkerUsage {
+                prompt_tokens: Some(120),
+                completion_tokens: Some(40),
+                confidence: UsageConfidence::LocalEstimate,
             },
         },
-    )?;
+    );
+    request.budget = CodexWorkerLaneBudget {
+        max_prompt_tokens: 8_192,
+        max_output_tokens: 2_048,
+        max_stdout_bytes: 64 * 1024,
+    };
+    let result = runtime.run_codex_worker_lane(started.session_id, request)?;
     let observation = result.observation.as_ref().expect("worker observation");
     let events = runtime.events_for_session(started.session_id)?;
     let event_types = events
@@ -563,6 +558,7 @@ fn codex_worker_lane_records_output_usage_and_state_events()
             EventType::SessionStarted,
             EventType::WorkerLaneRequested,
             EventType::PolicyDecided,
+            EventType::WorkerLaneWorktreeAllocated,
             EventType::WorkerLaneStateChanged,
             EventType::WorkerLaneStateChanged,
             EventType::WorkerLaneObservationRecorded,
@@ -570,9 +566,22 @@ fn codex_worker_lane_records_output_usage_and_state_events()
         ]
     );
     assert_eq!(events[1].payload["lane_kind"], "codex_cli");
+    assert_eq!(events[1].payload["workspace_path"], repo_path);
+    assert_eq!(events[1].payload["worktree_path"], serde_json::Value::Null);
+    assert_ne!(events[3].payload["worktree_path"], repo_path);
+    assert_eq!(
+        events[3].payload["session_repo_path"],
+        events[1].payload["workspace_path"]
+    );
+    assert_eq!(events[3].payload["base_ref"], "HEAD");
+    assert!(
+        events[3].payload["worktree_path"]
+            .as_str()
+            .is_some_and(|path| Path::new(path).exists())
+    );
     assert_eq!(events[1].payload["budget"]["max_output_tokens"], 2_048);
-    assert_eq!(events[5].payload["usage_confidence"], "local_estimate");
-    assert_eq!(events[6].payload["to_state"], "succeeded");
+    assert_eq!(events[6].payload["usage_confidence"], "local_estimate");
+    assert_eq!(events[7].payload["to_state"], "succeeded");
 
     Ok(())
 }
@@ -591,22 +600,16 @@ fn codex_worker_lane_policy_rejection_skips_worker_observation()
     let mut runtime = Runtime::connect_postgres(&database_url)?;
     let started = runtime.start_session(StartSessionRequest::new(repo_path.clone()))?;
 
-    let result = runtime.run_codex_worker_lane(
-        started.session_id,
-        CodexWorkerLaneRequest {
-            task: String::new(),
-            workspace_path: repo_path,
-            worktree_path: None,
-            timeout_ms: 30_000,
-            cancellation_requested: false,
-            budget: CodexWorkerLaneBudget {
-                max_prompt_tokens: 8_192,
-                max_output_tokens: 2_048,
-                max_stdout_bytes: 64 * 1024,
-            },
-            fixture: CodexWorkerLaneFixture::succeeded("should not run"),
-        },
-    )?;
+    let mut request = CodexWorkerLaneRequest::new(
+        String::new(),
+        CodexWorkerLaneFixture::succeeded("should not run"),
+    );
+    request.budget = CodexWorkerLaneBudget {
+        max_prompt_tokens: 8_192,
+        max_output_tokens: 2_048,
+        max_stdout_bytes: 64 * 1024,
+    };
+    let result = runtime.run_codex_worker_lane(started.session_id, request)?;
     let events = runtime.events_for_session(started.session_id)?;
 
     assert_eq!(result.decision, PolicyDecision::Deny);
@@ -630,34 +633,29 @@ fn codex_worker_lane_marks_timeout_after_captured_fixture_output()
 
     harness_runtime::apply_database_migrations(&database_url)?;
 
-    let repo = fixture_repo()?;
+    let repo = git_fixture_repo()?;
     let repo_path = repo.display().to_string();
     let mut runtime = Runtime::connect_postgres(&database_url)?;
     let started = runtime.start_session(StartSessionRequest::new(repo_path.clone()))?;
 
-    let result = runtime.run_codex_worker_lane(
-        started.session_id,
-        CodexWorkerLaneRequest {
-            task: "draft the next harness patch".to_owned(),
-            workspace_path: repo_path,
-            worktree_path: None,
-            timeout_ms: 10,
-            cancellation_requested: false,
-            budget: CodexWorkerLaneBudget {
-                max_prompt_tokens: 8_192,
-                max_output_tokens: 2_048,
-                max_stdout_bytes: 64 * 1024,
-            },
-            fixture: CodexWorkerLaneFixture {
-                status: WorkerLaneStatus::Succeeded,
-                exit_code: Some(0),
-                stdout: "late output".to_owned(),
-                stderr: String::new(),
-                duration_ms: 11,
-                usage: CodexWorkerUsage::unknown(),
-            },
+    let mut request = CodexWorkerLaneRequest::new(
+        "draft the next harness patch",
+        CodexWorkerLaneFixture {
+            status: WorkerLaneStatus::Succeeded,
+            exit_code: Some(0),
+            stdout: "late output".to_owned(),
+            stderr: String::new(),
+            duration_ms: 11,
+            usage: CodexWorkerUsage::unknown(),
         },
-    )?;
+    );
+    request.timeout_ms = 10;
+    request.budget = CodexWorkerLaneBudget {
+        max_prompt_tokens: 8_192,
+        max_output_tokens: 2_048,
+        max_stdout_bytes: 64 * 1024,
+    };
+    let result = runtime.run_codex_worker_lane(started.session_id, request)?;
 
     assert_eq!(result.final_status, WorkerLaneStatus::TimedOut);
     assert_eq!(
@@ -680,27 +678,22 @@ fn codex_worker_lane_honors_pre_start_cancellation() -> Result<(), Box<dyn std::
 
     harness_runtime::apply_database_migrations(&database_url)?;
 
-    let repo = fixture_repo()?;
+    let repo = git_fixture_repo()?;
     let repo_path = repo.display().to_string();
     let mut runtime = Runtime::connect_postgres(&database_url)?;
     let started = runtime.start_session(StartSessionRequest::new(repo_path.clone()))?;
 
-    let result = runtime.run_codex_worker_lane(
-        started.session_id,
-        CodexWorkerLaneRequest {
-            task: "draft the next harness patch".to_owned(),
-            workspace_path: repo_path,
-            worktree_path: None,
-            timeout_ms: 30_000,
-            cancellation_requested: true,
-            budget: CodexWorkerLaneBudget {
-                max_prompt_tokens: 8_192,
-                max_output_tokens: 2_048,
-                max_stdout_bytes: 64 * 1024,
-            },
-            fixture: CodexWorkerLaneFixture::succeeded("should not run"),
-        },
-    )?;
+    let mut request = CodexWorkerLaneRequest::new(
+        "draft the next harness patch",
+        CodexWorkerLaneFixture::succeeded("should not run"),
+    );
+    request.cancellation_requested = true;
+    request.budget = CodexWorkerLaneBudget {
+        max_prompt_tokens: 8_192,
+        max_output_tokens: 2_048,
+        max_stdout_bytes: 64 * 1024,
+    };
+    let result = runtime.run_codex_worker_lane(started.session_id, request)?;
     let events = runtime.events_for_session(started.session_id)?;
 
     assert_eq!(result.final_status, WorkerLaneStatus::Cancelled);
@@ -712,6 +705,72 @@ fn codex_worker_lane_honors_pre_start_cancellation() -> Result<(), Box<dyn std::
         events.last().expect("last event").payload["to_state"],
         "cancelled"
     );
+
+    Ok(())
+}
+
+#[test]
+fn codex_worker_lane_records_task_worktree_allocation_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = fixture_repo()?;
+    let repo_path = repo.display().to_string();
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo_path.clone()))?;
+
+    let result = runtime.run_codex_worker_lane(
+        started.session_id,
+        CodexWorkerLaneRequest::new(
+            "draft the next harness patch",
+            CodexWorkerLaneFixture::succeeded("should not run"),
+        ),
+    )?;
+    let events = runtime.events_for_session(started.session_id)?;
+
+    assert_eq!(result.final_status, WorkerLaneStatus::Failed);
+    assert_eq!(result.observation, None);
+    assert!(result.reason.contains("task worktree allocation failed"));
+    assert_eq!(events[1].payload["workspace_path"], repo_path);
+    assert_eq!(events[1].payload["worktree_path"], serde_json::Value::Null);
+    assert_eq!(
+        events.last().expect("last event").payload["to_state"],
+        "failed"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn codex_worker_lane_uses_current_workspace_only_when_explicit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = fixture_repo()?;
+    let repo_path = repo.display().to_string();
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo_path.clone()))?;
+
+    let mut request = CodexWorkerLaneRequest::new(
+        "draft directly in the current workspace",
+        CodexWorkerLaneFixture::succeeded("current workspace run"),
+    );
+    request.workspace = CodexWorkerLaneWorkspace::dangerous_current_workspace();
+    let result = runtime.run_codex_worker_lane(started.session_id, request)?;
+    let events = runtime.events_for_session(started.session_id)?;
+
+    assert_eq!(result.decision, PolicyDecision::Allow);
+    assert_eq!(result.final_status, WorkerLaneStatus::Succeeded);
+    assert_eq!(events[1].payload["workspace_path"], repo_path);
+    assert_eq!(events[1].payload["worktree_path"], serde_json::Value::Null);
 
     Ok(())
 }
@@ -787,6 +846,46 @@ fn fixture_repo() -> Result<PathBuf, Box<dyn std::error::Error>> {
     ));
     fs::create_dir_all(&path)?;
     Ok(path)
+}
+
+fn git_fixture_repo() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let repo = fixture_repo()?;
+    write_file(&repo, "README.md", "fixture repository")?;
+    run_git(&repo, &["init"])?;
+    run_git(&repo, &["add", "README.md"])?;
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Coding Agent Harness Test",
+            "-c",
+            "user.email=harness-test@example.invalid",
+            "commit",
+            "-m",
+            "initial fixture",
+        ],
+    )?;
+    Ok(repo)
+}
+
+fn run_git(root: &Path, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "git {:?} failed: {}{}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+
+    Ok(())
 }
 
 fn write_file(
