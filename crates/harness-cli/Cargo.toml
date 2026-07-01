@@ -9,6 +9,8 @@ repository.workspace = true
 [dependencies]
 harness-runtime = { path = "../harness-runtime" }
 harness-core = { path = "../harness-core" }
+harness-db = { path = "../harness-db" }
+uuid.workspace = true
 
 [lints]
 workspace = true

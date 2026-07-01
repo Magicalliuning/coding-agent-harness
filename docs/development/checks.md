@@ -16,4 +16,11 @@ cargo run -p harness-cli -- --version
 cargo run -p harness-cli -- doctor
 ```
 
-These commands intentionally cover only the bootstrap baseline. Later issues will add runtime-specific manual QA gates.
+With `HARNESS_TEST_DATABASE_URL` set to a reachable PostgreSQL database, run:
+
+```powershell
+cargo test -p harness-runtime --test postgres_session
+cargo test -p harness-cli --test session_cli
+```
+
+These integration tests verify session creation, EventLog append, EventLog replay, and derived CLI session state through PostgreSQL.

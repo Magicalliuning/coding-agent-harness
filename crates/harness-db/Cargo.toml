@@ -9,6 +9,9 @@ repository.workspace = true
 [dependencies]
 harness-events = { path = "../harness-events" }
 harness-core = { path = "../harness-core" }
+postgres.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

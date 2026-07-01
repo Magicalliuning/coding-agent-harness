@@ -18,6 +18,13 @@ cargo run -p harness-cli -- --version
 cargo run -p harness-cli -- doctor
 ```
 
+With PostgreSQL available:
+
+```powershell
+cargo run -p harness-cli -- migrate --database-url $env:HARNESS_DATABASE_URL
+cargo run -p harness-cli -- session start --repo . --database-url $env:HARNESS_DATABASE_URL
+```
+
 ## PostgreSQL Development Baseline
 
 Copy `.env.example` to `.env` and start a local PostgreSQL instance. If Docker Compose is available:
@@ -25,9 +32,11 @@ Copy `.env.example` to `.env` and start a local PostgreSQL instance. If Docker C
 ```powershell
 docker compose up -d postgres
 $env:HARNESS_DATABASE_URL = "postgres://harness:harness@127.0.0.1:5432/harness"
-.\scripts\apply-migrations.ps1
+cargo run -p harness-cli -- migrate
 ```
 
 If PostgreSQL is installed another way, set `HARNESS_DATABASE_URL` to that database and run the same migration script.
+
+For WSL/k3s development, use `k8s/dev/postgres.yaml` and port-forward the service as documented in `docs/development/postgresql.md`.
 
 More detail is in `docs/development/postgresql.md` and `docs/development/checks.md`.

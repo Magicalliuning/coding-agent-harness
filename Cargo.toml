@@ -26,3 +26,9 @@ unsafe_code = "forbid"
 dbg_macro = "deny"
 todo = "deny"
 unwrap_used = "deny"
+
+[workspace.dependencies]
+postgres = { version = "0.19.12", features = ["with-serde_json-1", "with-uuid-1"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+uuid = { version = "1.19.0", features = ["serde", "v4"] }
