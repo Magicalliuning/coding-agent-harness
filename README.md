@@ -2,6 +2,13 @@
 
 Rust-first coding-agent harness runtime. The V0 goal is a PostgreSQL-backed runtime that records EventLog entries, policy decisions, tool observations, token usage, and recovery attempts while driving a CLI-started self-recovering coding task.
 
+## Current Baseline
+
+The V0.0.1 runtime baseline is documented in
+`docs/releases/v0.0.1.md`. It captures the accepted scope, verification gate,
+known limits, and next tranche boundary for work after the first vertical
+self-recovery proof.
+
 ## Development Checks
 
 ```powershell
