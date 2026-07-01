@@ -3,10 +3,10 @@ use std::path::PathBuf;
 
 use harness_core::{HarnessError, HarnessResult};
 use harness_runtime::{
-    ContextBudget, FakeModelTurnRequest, FakeModelTurnResult, Runtime,
-    SessionContextCompileRequest, SessionContextCompileResult, SessionProjection,
-    SmallCodingTaskRequest, SmallCodingTaskResult, StartSessionRequest, VerificationCommandRequest,
-    VerificationCommandResult,
+    ContextBudget, FakeModelTurnRequest, FakeModelTurnResult, Runtime, SelfRecoveryLoopRequest,
+    SelfRecoveryLoopResult, SessionContextCompileRequest, SessionContextCompileResult,
+    SessionProjection, SmallCodingTaskRequest, SmallCodingTaskResult, StartSessionRequest,
+    VerificationCommandRequest, VerificationCommandResult,
 };
 use uuid::Uuid;
 
@@ -179,6 +179,58 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
             print_small_coding_task_result(&result);
             Ok(())
         }
+        "recover-fixture" => {
+            let session_id = args
+                .get(1)
+                .ok_or_else(|| HarnessError::new("session id is required"))?;
+            let session_id = Uuid::parse_str(session_id)
+                .map_err(|error| HarnessError::new(error.to_string()))?;
+            let before_separator = args_before_separator(&args);
+            let database_url = database_url_from_args(before_separator.to_vec())?;
+            let task = required_arg_value(before_separator, "--task")?;
+            let budget = context_budget_from_args(before_separator)?;
+            let focus_terms = repeated_arg_values(before_separator, "--focus");
+            let max_output_tokens = optional_arg_value(before_separator, "--max-output-tokens")
+                .map(|value| parse_usize_arg("--max-output-tokens", value))
+                .transpose()?
+                .unwrap_or(256);
+            let max_recovery_rounds = optional_arg_value(before_separator, "--max-recovery-rounds")
+                .map(|value| parse_usize_arg("--max-recovery-rounds", value))
+                .transpose()?
+                .unwrap_or(harness_runtime::SELF_RECOVERY_MAX_ROUNDS);
+            let max_repair_bytes = optional_arg_value(before_separator, "--max-repair-bytes")
+                .map(|value| parse_usize_arg("--max-repair-bytes", value))
+                .transpose()?
+                .unwrap_or(16 * 1024);
+            let verification = optional_command_after_separator(&args)
+                .map(|command| {
+                    VerificationCommandRequest::new(command[0].clone(), command[1..].to_vec())
+                })
+                .unwrap_or_else(|| {
+                    VerificationCommandRequest::new(
+                        "cargo",
+                        vec!["test".to_owned(), "--quiet".to_owned()],
+                    )
+                });
+            let mut runtime = Runtime::connect_postgres(&database_url)?;
+            let result = runtime.run_self_recovery_fixture_task(
+                session_id,
+                SelfRecoveryLoopRequest {
+                    task: task.to_owned(),
+                    context: SessionContextCompileRequest {
+                        budget,
+                        focus_terms,
+                    },
+                    max_output_tokens,
+                    verification,
+                    max_recovery_rounds,
+                    max_repair_bytes,
+                },
+            )?;
+
+            print_self_recovery_loop_result(&result);
+            Ok(())
+        }
         other => Err(HarnessError::new(format!(
             "unknown session command: {other}"
         ))),
@@ -254,6 +306,13 @@ fn command_after_separator(args: &[String]) -> HarnessResult<&[String]> {
     }
 
     Ok(command)
+}
+
+fn optional_command_after_separator(args: &[String]) -> Option<&[String]> {
+    let index = args.iter().position(|arg| arg == "--")?;
+    let command = &args[index + 1..];
+
+    (!command.is_empty()).then_some(command)
 }
 
 fn canonical_repo_path(repo_path: &str) -> HarnessResult<String> {
@@ -345,6 +404,64 @@ fn print_small_coding_task_result(result: &SmallCodingTaskResult) {
     println!("token_completion={}", result.token_ledger.completion_tokens);
     println!("token_total={}", result.token_ledger.total_tokens);
     println!("token_max_output={}", result.token_ledger.max_output_tokens);
+    println!("final_state={}", result.final_state);
+    println!("event_count={}", result.event_count);
+}
+
+fn print_self_recovery_loop_result(result: &SelfRecoveryLoopResult) {
+    println!("session_id={}", result.session_id);
+    println!(
+        "recovery_classification={}",
+        result
+            .report
+            .failure_classification
+            .as_deref()
+            .unwrap_or("")
+    );
+    println!(
+        "recovery_plan={}",
+        result.report.recovery_plan.as_deref().unwrap_or("")
+    );
+    println!("recovery_attempts={}", result.report.repair_attempts);
+    println!("recovery_retries={}", result.report.retry_count);
+    println!(
+        "recovery_stop_reason={}",
+        result.report.stop_reason.as_str()
+    );
+    println!("recovery_max_rounds={}", result.report.max_recovery_rounds);
+    println!(
+        "recovery_used_repair_bytes={}",
+        result.report.used_repair_bytes
+    );
+    println!(
+        "verification_decision={}",
+        result.final_verification.decision.as_str()
+    );
+    println!(
+        "verification_executed={}",
+        result.final_verification.observation.is_some()
+    );
+
+    if let Some(observation) = &result.final_verification.observation {
+        if let Some(exit_code) = observation.exit_code {
+            println!("verification_exit_code={exit_code}");
+        } else {
+            println!("verification_exit_code=signal");
+        }
+    }
+
+    println!("diff_files_changed={}", result.diff.files_changed);
+    println!("diff_insertions={}", result.diff.insertions);
+    println!("diff_deletions={}", result.diff.deletions);
+    println!("diff_paths={}", result.diff.paths.join(","));
+    println!("event_replay_total={}", result.event_replay.total_events);
+    println!(
+        "event_replay_last={}",
+        result.event_replay.last_event_type.as_deref().unwrap_or("")
+    );
+    println!("token_prompt={}", result.token_ledger.prompt_tokens);
+    println!("token_completion={}", result.token_ledger.completion_tokens);
+    println!("token_total={}", result.token_ledger.total_tokens);
     println!("final_state={}", result.final_state);
     println!("event_count={}", result.event_count);
 }

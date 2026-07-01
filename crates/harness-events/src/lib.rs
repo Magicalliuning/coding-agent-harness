@@ -14,6 +14,10 @@ pub const MODEL_REQUEST_RECORDED_EVENT: &str = "model.request_recorded";
 pub const MODEL_DECISION_RECORDED_EVENT: &str = "model.decision_recorded";
 pub const DIFF_RECORDED_EVENT: &str = "diff.recorded";
 pub const COMMIT_APPROVAL_PENDING_EVENT: &str = "commit.approval_pending";
+pub const RECOVERY_FAILURE_CLASSIFIED_EVENT: &str = "recovery.failure_classified";
+pub const RECOVERY_PLAN_RECORDED_EVENT: &str = "recovery.plan_recorded";
+pub const RECOVERY_REPAIR_ATTEMPTED_EVENT: &str = "recovery.repair_attempted";
+pub const RECOVERY_STOPPED_EVENT: &str = "recovery.stopped";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventType {
@@ -26,6 +30,10 @@ pub enum EventType {
     ModelDecisionRecorded,
     DiffRecorded,
     CommitApprovalPending,
+    RecoveryFailureClassified,
+    RecoveryPlanRecorded,
+    RecoveryRepairAttempted,
+    RecoveryStopped,
 }
 
 impl EventType {
@@ -41,6 +49,10 @@ impl EventType {
             Self::ModelDecisionRecorded => MODEL_DECISION_RECORDED_EVENT,
             Self::DiffRecorded => DIFF_RECORDED_EVENT,
             Self::CommitApprovalPending => COMMIT_APPROVAL_PENDING_EVENT,
+            Self::RecoveryFailureClassified => RECOVERY_FAILURE_CLASSIFIED_EVENT,
+            Self::RecoveryPlanRecorded => RECOVERY_PLAN_RECORDED_EVENT,
+            Self::RecoveryRepairAttempted => RECOVERY_REPAIR_ATTEMPTED_EVENT,
+            Self::RecoveryStopped => RECOVERY_STOPPED_EVENT,
         }
     }
 
@@ -55,6 +67,10 @@ impl EventType {
             MODEL_DECISION_RECORDED_EVENT => Ok(Self::ModelDecisionRecorded),
             DIFF_RECORDED_EVENT => Ok(Self::DiffRecorded),
             COMMIT_APPROVAL_PENDING_EVENT => Ok(Self::CommitApprovalPending),
+            RECOVERY_FAILURE_CLASSIFIED_EVENT => Ok(Self::RecoveryFailureClassified),
+            RECOVERY_PLAN_RECORDED_EVENT => Ok(Self::RecoveryPlanRecorded),
+            RECOVERY_REPAIR_ATTEMPTED_EVENT => Ok(Self::RecoveryRepairAttempted),
+            RECOVERY_STOPPED_EVENT => Ok(Self::RecoveryStopped),
             other => Err(HarnessError::new(format!("unknown event type: {other}"))),
         }
     }
@@ -385,6 +401,98 @@ impl CommitApprovalPendingPayload {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryFailurePayload {
+    pub round: usize,
+    pub classification: String,
+    pub exit_code: Option<i32>,
+    pub summary: String,
+}
+
+impl RecoveryFailurePayload {
+    #[must_use]
+    pub fn new(
+        round: usize,
+        classification: impl Into<String>,
+        exit_code: Option<i32>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            round,
+            classification: classification.into(),
+            exit_code,
+            summary: summary.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryPlanPayload {
+    pub round: usize,
+    pub plan: String,
+    pub max_recovery_rounds: usize,
+    pub remaining_repair_bytes: usize,
+}
+
+impl RecoveryPlanPayload {
+    #[must_use]
+    pub fn new(
+        round: usize,
+        plan: impl Into<String>,
+        max_recovery_rounds: usize,
+        remaining_repair_bytes: usize,
+    ) -> Self {
+        Self {
+            round,
+            plan: plan.into(),
+            max_recovery_rounds,
+            remaining_repair_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryRepairAttemptPayload {
+    pub round: usize,
+    pub patch: FilePatchPayload,
+    pub applied: bool,
+    pub repair_bytes: usize,
+}
+
+impl RecoveryRepairAttemptPayload {
+    #[must_use]
+    pub fn new(round: usize, patch: FilePatchPayload, applied: bool, repair_bytes: usize) -> Self {
+        Self {
+            round,
+            patch,
+            applied,
+            repair_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryStoppedPayload {
+    pub stop_reason: String,
+    pub retry_count: usize,
+    pub final_state: String,
+}
+
+impl RecoveryStoppedPayload {
+    #[must_use]
+    pub fn new(
+        stop_reason: impl Into<String>,
+        retry_count: usize,
+        final_state: impl Into<String>,
+    ) -> Self {
+        Self {
+            stop_reason: stop_reason.into(),
+            retry_count,
+            final_state: final_state.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewEvent {
     pub event_id: Uuid,
@@ -471,6 +579,34 @@ impl NewEvent {
         payload: CommitApprovalPendingPayload,
     ) -> HarnessResult<Self> {
         Self::new(session_id, EventType::CommitApprovalPending, payload)
+    }
+
+    pub fn recovery_failure_classified(
+        session_id: Uuid,
+        payload: RecoveryFailurePayload,
+    ) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::RecoveryFailureClassified, payload)
+    }
+
+    pub fn recovery_plan_recorded(
+        session_id: Uuid,
+        payload: RecoveryPlanPayload,
+    ) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::RecoveryPlanRecorded, payload)
+    }
+
+    pub fn recovery_repair_attempted(
+        session_id: Uuid,
+        payload: RecoveryRepairAttemptPayload,
+    ) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::RecoveryRepairAttempted, payload)
+    }
+
+    pub fn recovery_stopped(
+        session_id: Uuid,
+        payload: RecoveryStoppedPayload,
+    ) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::RecoveryStopped, payload)
     }
 
     fn new(
@@ -656,5 +792,49 @@ mod tests {
         assert_eq!(diff.payload["paths"][0], ".harness/fake-agent-turn.md");
         assert_eq!(pending.event_type.as_str(), "commit.approval_pending");
         assert_eq!(pending.payload["state"], "pending_commit_approval");
+    }
+
+    #[test]
+    fn recovery_events_serialize_loop_report() {
+        let session_id = Uuid::new_v4();
+        let patch = FilePatchPayload::new(
+            ".harness/fake-agent-turn.md",
+            Some("before".to_owned()),
+            "before\nrecovered=true\n",
+        );
+        let failure = NewEvent::recovery_failure_classified(
+            session_id,
+            RecoveryFailurePayload::new(
+                0,
+                "fixture_missing_recovery_marker",
+                Some(101),
+                "first verification failed",
+            ),
+        )
+        .expect("failure event");
+        let plan = NewEvent::recovery_plan_recorded(
+            session_id,
+            RecoveryPlanPayload::new(1, "append recovered=true", 2, 4096),
+        )
+        .expect("plan event");
+        let attempt = NewEvent::recovery_repair_attempted(
+            session_id,
+            RecoveryRepairAttemptPayload::new(1, patch, true, 22),
+        )
+        .expect("attempt event");
+        let stopped = NewEvent::recovery_stopped(
+            session_id,
+            RecoveryStoppedPayload::new("recovered", 1, "pending_commit_approval"),
+        )
+        .expect("stopped event");
+
+        assert_eq!(failure.event_type.as_str(), "recovery.failure_classified");
+        assert_eq!(
+            failure.payload["classification"],
+            "fixture_missing_recovery_marker"
+        );
+        assert_eq!(plan.payload["max_recovery_rounds"], 2);
+        assert_eq!(attempt.payload["applied"], true);
+        assert_eq!(stopped.payload["retry_count"], 1);
     }
 }

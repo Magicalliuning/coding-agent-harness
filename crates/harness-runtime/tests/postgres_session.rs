@@ -6,9 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use harness_events::EventType;
 use harness_policy::PolicyDecision;
 use harness_runtime::{
-    ContextBudget, FakeModelTurnRequest, PENDING_COMMIT_APPROVAL_STATE, Runtime,
-    SessionContextCompileRequest, SessionStatus, SmallCodingTaskRequest, StartSessionRequest,
-    VerificationCommandRequest,
+    ContextBudget, FakeModelTurnRequest, PENDING_COMMIT_APPROVAL_STATE, RECOVERY_FAILED_STATE,
+    RecoveryStopReason, Runtime, SelfRecoveryLoopRequest, SessionContextCompileRequest,
+    SessionStatus, SmallCodingTaskRequest, StartSessionRequest, VerificationCommandRequest,
 };
 use uuid::Uuid;
 
@@ -243,6 +243,196 @@ fn small_coding_task_stops_at_pending_commit_approval() -> Result<(), Box<dyn st
 }
 
 #[test]
+fn self_recovery_fixture_records_initial_failure() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = fixture_repo()?;
+    write_recovery_fixture_project(&repo)?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo.display().to_string()))?;
+
+    let result = runtime.run_self_recovery_fixture_task(
+        started.session_id,
+        SelfRecoveryLoopRequest {
+            task: "write the failing recovery fixture patch".to_owned(),
+            context: SessionContextCompileRequest {
+                budget: ContextBudget {
+                    max_bytes: 4096,
+                    max_files: 8,
+                    max_skill_files: 8,
+                },
+                focus_terms: vec!["agent".to_owned()],
+            },
+            max_output_tokens: 256,
+            verification: recovery_fixture_verification(),
+            max_recovery_rounds: 0,
+            max_repair_bytes: 4096,
+        },
+    )?;
+    let events = runtime.events_for_session(started.session_id)?;
+
+    assert_eq!(
+        result.report.stop_reason,
+        RecoveryStopReason::MaxRoundsReached
+    );
+    assert_eq!(result.final_state, RECOVERY_FAILED_STATE);
+    assert_eq!(result.report.retry_count, 0);
+    assert_eq!(result.report.repair_attempts, 0);
+    assert_eq!(
+        result.report.failure_classification.as_deref(),
+        Some("fixture_missing_recovery_marker")
+    );
+    assert_ne!(
+        result
+            .initial_verification
+            .observation
+            .as_ref()
+            .and_then(|item| item.exit_code),
+        Some(0)
+    );
+    assert!(events.iter().any(|event| {
+        event.event_type == EventType::RecoveryFailureClassified
+            && event.payload["classification"] == "fixture_missing_recovery_marker"
+    }));
+    assert!(events.iter().any(|event| {
+        event.event_type == EventType::RecoveryStopped
+            && event.payload["stop_reason"] == "max_rounds_reached"
+    }));
+
+    Ok(())
+}
+
+#[test]
+fn self_recovery_fixture_repairs_and_passes() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = fixture_repo()?;
+    write_recovery_fixture_project(&repo)?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo.display().to_string()))?;
+
+    let result = runtime.run_self_recovery_fixture_task(
+        started.session_id,
+        SelfRecoveryLoopRequest {
+            task: "write the recoverable fixture patch".to_owned(),
+            context: SessionContextCompileRequest {
+                budget: ContextBudget {
+                    max_bytes: 4096,
+                    max_files: 8,
+                    max_skill_files: 8,
+                },
+                focus_terms: vec!["agent".to_owned()],
+            },
+            max_output_tokens: 256,
+            verification: recovery_fixture_verification(),
+            max_recovery_rounds: 2,
+            max_repair_bytes: 4096,
+        },
+    )?;
+    let written = fs::read_to_string(repo.join(".harness/fake-agent-turn.md"))?;
+    let events = runtime.events_for_session(started.session_id)?;
+
+    assert_eq!(result.report.stop_reason, RecoveryStopReason::Recovered);
+    assert_eq!(result.final_state, PENDING_COMMIT_APPROVAL_STATE);
+    assert_eq!(result.report.retry_count, 1);
+    assert_eq!(result.report.repair_attempts, 1);
+    assert_eq!(result.report.max_recovery_rounds, 2);
+    assert!(written.contains("recovered=true"));
+    assert_eq!(
+        result
+            .final_verification
+            .observation
+            .as_ref()
+            .and_then(|item| item.exit_code),
+        Some(0)
+    );
+    assert!(result.diff.insertions > 0);
+    assert_eq!(result.diff.paths, vec![".harness/fake-agent-turn.md"]);
+    assert_eq!(
+        result.event_replay.last_event_type.as_deref(),
+        Some("recovery.stopped")
+    );
+    assert!(events.iter().any(|event| {
+        event.event_type == EventType::RecoveryPlanRecorded
+            && event.payload["round"] == 1
+            && event.payload["plan"]
+                .as_str()
+                .is_some_and(|item| item.contains("recovered=true"))
+    }));
+    assert!(events.iter().any(|event| {
+        event.event_type == EventType::RecoveryRepairAttempted
+            && event.payload["round"] == 1
+            && event.payload["applied"] == true
+    }));
+    assert!(events.iter().any(|event| {
+        event.event_type == EventType::CommitApprovalPending
+            && event.payload["state"] == PENDING_COMMIT_APPROVAL_STATE
+    }));
+
+    Ok(())
+}
+
+#[test]
+fn self_recovery_fixture_stops_when_repair_budget_exceeded()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = fixture_repo()?;
+    write_recovery_fixture_project(&repo)?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo.display().to_string()))?;
+
+    let result = runtime.run_self_recovery_fixture_task(
+        started.session_id,
+        SelfRecoveryLoopRequest {
+            task: "write the budget-limited recovery fixture patch".to_owned(),
+            context: SessionContextCompileRequest {
+                budget: ContextBudget {
+                    max_bytes: 4096,
+                    max_files: 8,
+                    max_skill_files: 8,
+                },
+                focus_terms: vec!["agent".to_owned()],
+            },
+            max_output_tokens: 256,
+            verification: recovery_fixture_verification(),
+            max_recovery_rounds: 2,
+            max_repair_bytes: 1,
+        },
+    )?;
+    let written = fs::read_to_string(repo.join(".harness/fake-agent-turn.md"))?;
+    let events = runtime.events_for_session(started.session_id)?;
+
+    assert_eq!(
+        result.report.stop_reason,
+        RecoveryStopReason::RepairBudgetExceeded
+    );
+    assert_eq!(result.final_state, RECOVERY_FAILED_STATE);
+    assert_eq!(result.report.retry_count, 0);
+    assert_eq!(result.report.repair_attempts, 0);
+    assert_eq!(result.report.used_repair_bytes, 0);
+    assert!(!written.contains("recovered=true"));
+    assert!(events.iter().any(|event| {
+        event.event_type == EventType::RecoveryStopped
+            && event.payload["stop_reason"] == "repair_budget_exceeded"
+    }));
+
+    Ok(())
+}
+
+#[test]
 fn denied_verification_command_is_not_executed() -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
         return Ok(());
@@ -329,4 +519,23 @@ fn write_file(
     let mut file = fs::File::create(path)?;
     file.write_all(content.as_bytes())?;
     Ok(())
+}
+
+fn write_recovery_fixture_project(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    write_file(root, "AGENTS.md", "Use deterministic recovery fixtures.")?;
+    write_file(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"recovery-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )?;
+    write_file(
+        root,
+        "src/lib.rs",
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn fake_patch_contains_recovery_marker() {\n        let content = std::fs::read_to_string(\".harness/fake-agent-turn.md\")\n            .expect(\"fake model patch should exist\");\n        assert!(content.contains(\"recovered=true\"), \"missing recovery marker\");\n    }\n}\n",
+    )?;
+    Ok(())
+}
+
+fn recovery_fixture_verification() -> VerificationCommandRequest {
+    VerificationCommandRequest::new("cargo", vec!["test".to_owned(), "--quiet".to_owned()])
 }

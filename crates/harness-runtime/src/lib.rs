@@ -1,3 +1,6 @@
+use std::fs;
+use std::path::Path;
+
 pub use harness_context::ContextBudget;
 use harness_context::{CompiledContextBundle, ContextCompileRequest, compile_repository_context};
 use harness_core::{HarnessError, HarnessResult};
@@ -6,7 +9,9 @@ use harness_events::{
     CommitApprovalPendingPayload, ContextCompiledPayload, ContextSourcePayload, DiffSummaryPayload,
     EventEnvelope, EventType, FilePatchIntentPayload, FilePatchObservationPayload,
     FilePatchPayload, ModelDecisionPayload, ModelRequestPayload, NewEvent, PolicyDecisionPayload,
-    SessionStartedPayload, SkillMetadataPayload, ToolCallIntentPayload, ToolObservationPayload,
+    RecoveryFailurePayload, RecoveryPlanPayload, RecoveryRepairAttemptPayload,
+    RecoveryStoppedPayload, SessionStartedPayload, SkillMetadataPayload, ToolCallIntentPayload,
+    ToolObservationPayload,
 };
 use harness_models::{DeterministicFakeModelProvider, FakeModelRequest, FilePatchProposal};
 use harness_policy::{PolicyDecision, evaluate_file_patch, evaluate_verification_command};
@@ -17,6 +22,8 @@ use harness_tools::{
 use uuid::Uuid;
 
 pub const PENDING_COMMIT_APPROVAL_STATE: &str = "pending_commit_approval";
+pub const RECOVERY_FAILED_STATE: &str = "recovery_failed";
+pub const SELF_RECOVERY_MAX_ROUNDS: usize = 2;
 
 pub struct Runtime {
     event_store: PostgresEventStore,
@@ -175,6 +182,73 @@ pub struct SmallCodingTaskResult {
     pub patch: FilePatchProposal,
     pub patch_applied: bool,
     pub verification: VerificationCommandResult,
+    pub diff: DiffSummary,
+    pub event_replay: EventReplaySummary,
+    pub token_ledger: TokenLedgerSummary,
+    pub final_state: String,
+    pub event_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfRecoveryLoopRequest {
+    pub task: String,
+    pub context: SessionContextCompileRequest,
+    pub max_output_tokens: usize,
+    pub verification: VerificationCommandRequest,
+    pub max_recovery_rounds: usize,
+    pub max_repair_bytes: usize,
+}
+
+impl SelfRecoveryLoopRequest {
+    #[must_use]
+    pub fn new(task: impl Into<String>, verification: VerificationCommandRequest) -> Self {
+        Self {
+            task: task.into(),
+            context: SessionContextCompileRequest::default(),
+            max_output_tokens: 256,
+            verification,
+            max_recovery_rounds: SELF_RECOVERY_MAX_ROUNDS,
+            max_repair_bytes: 16 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryStopReason {
+    Recovered,
+    MaxRoundsReached,
+    RepairBudgetExceeded,
+}
+
+impl RecoveryStopReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recovered => "recovered",
+            Self::MaxRoundsReached => "max_rounds_reached",
+            Self::RepairBudgetExceeded => "repair_budget_exceeded",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfRecoveryReport {
+    pub failure_classification: Option<String>,
+    pub recovery_plan: Option<String>,
+    pub repair_attempts: usize,
+    pub retry_count: usize,
+    pub stop_reason: RecoveryStopReason,
+    pub max_recovery_rounds: usize,
+    pub max_repair_bytes: usize,
+    pub used_repair_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfRecoveryLoopResult {
+    pub session_id: Uuid,
+    pub initial_verification: VerificationCommandResult,
+    pub final_verification: VerificationCommandResult,
+    pub report: SelfRecoveryReport,
     pub diff: DiffSummary,
     pub event_replay: EventReplaySummary,
     pub token_ledger: TokenLedgerSummary,
@@ -469,6 +543,307 @@ impl Runtime {
             event_count: events.len(),
         })
     }
+
+    pub fn run_self_recovery_fixture_task(
+        &mut self,
+        session_id: Uuid,
+        request: SelfRecoveryLoopRequest,
+    ) -> HarnessResult<SelfRecoveryLoopResult> {
+        let max_recovery_rounds = request.max_recovery_rounds.min(SELF_RECOVERY_MAX_ROUNDS);
+        let session = self.show_session(session_id)?;
+        let fake_turn = self.run_fake_model_turn(
+            session_id,
+            FakeModelTurnRequest {
+                task: request.task,
+                context: request.context,
+                max_output_tokens: request.max_output_tokens,
+            },
+        )?;
+
+        if fake_turn.observation.is_none() {
+            return Err(HarnessError::new("recovery fixture patch was not applied"));
+        }
+
+        let initial_verification =
+            self.run_verification_command(session_id, request.verification.clone())?;
+        let Some(initial_observation) = &initial_verification.observation else {
+            return Err(HarnessError::new(
+                "initial verification command was not executed",
+            ));
+        };
+
+        if initial_observation.exit_code == Some(0) {
+            let diff = diff_summary_from_patch(&fake_turn.patch);
+            return self.finish_recovery_loop(RecoveryFinish {
+                session_id,
+                initial_verification: initial_verification.clone(),
+                final_verification: initial_verification,
+                fake_turn,
+                diff,
+                failure_classification: None,
+                recovery_plan: None,
+                repair_attempts: 0,
+                retry_count: 0,
+                stop_reason: RecoveryStopReason::Recovered,
+                max_recovery_rounds,
+                max_repair_bytes: request.max_repair_bytes,
+                used_repair_bytes: 0,
+                max_output_tokens: request.max_output_tokens,
+                final_state: PENDING_COMMIT_APPROVAL_STATE,
+            });
+        }
+
+        let classification = classify_recovery_failure(initial_observation);
+        self.event_store
+            .append_event(NewEvent::recovery_failure_classified(
+                session_id,
+                RecoveryFailurePayload::new(
+                    0,
+                    classification.clone(),
+                    initial_observation.exit_code,
+                    "fixture verification failed before recovery",
+                ),
+            )?)?;
+
+        let mut final_verification = initial_verification.clone();
+        let mut last_repair_patch = fake_turn.patch.clone();
+        let mut recovery_plan = None;
+        let mut repair_attempts = 0;
+        let mut retry_count = 0;
+        let mut used_repair_bytes = 0;
+
+        for round in 1..=max_recovery_rounds {
+            let repair_patch = recovery_repair_patch(&session.repo_path, &fake_turn.patch)?;
+            let repair_bytes = repair_patch.replacement_content.len();
+            let remaining_repair_bytes = request.max_repair_bytes.saturating_sub(used_repair_bytes);
+            let plan = "append recovered=true marker to the fake model patch".to_owned();
+            recovery_plan = Some(plan.clone());
+            self.event_store
+                .append_event(NewEvent::recovery_plan_recorded(
+                    session_id,
+                    RecoveryPlanPayload::new(
+                        round,
+                        plan,
+                        max_recovery_rounds,
+                        remaining_repair_bytes,
+                    ),
+                )?)?;
+
+            if repair_bytes > remaining_repair_bytes {
+                return self.finish_recovery_loop(RecoveryFinish {
+                    session_id,
+                    initial_verification: initial_verification.clone(),
+                    final_verification,
+                    fake_turn,
+                    diff: diff_summary_from_patch(&repair_patch),
+                    failure_classification: Some(classification),
+                    recovery_plan,
+                    repair_attempts,
+                    retry_count,
+                    stop_reason: RecoveryStopReason::RepairBudgetExceeded,
+                    max_recovery_rounds,
+                    max_repair_bytes: request.max_repair_bytes,
+                    used_repair_bytes,
+                    max_output_tokens: request.max_output_tokens,
+                    final_state: RECOVERY_FAILED_STATE,
+                });
+            }
+
+            let repair_observation =
+                self.apply_file_patch_with_events(session_id, &session.repo_path, &repair_patch)?;
+            let repair_applied = repair_observation.is_some();
+            repair_attempts += usize::from(repair_applied);
+            used_repair_bytes += repair_bytes;
+            self.event_store
+                .append_event(NewEvent::recovery_repair_attempted(
+                    session_id,
+                    RecoveryRepairAttemptPayload::new(
+                        round,
+                        file_patch_payload(&repair_patch),
+                        repair_applied,
+                        repair_bytes,
+                    ),
+                )?)?;
+
+            final_verification =
+                self.run_verification_command(session_id, request.verification.clone())?;
+            retry_count += 1;
+            let final_success = final_verification
+                .observation
+                .as_ref()
+                .and_then(|observation| observation.exit_code)
+                == Some(0);
+            last_repair_patch = repair_patch;
+
+            if final_success {
+                return self.finish_recovery_loop(RecoveryFinish {
+                    session_id,
+                    initial_verification,
+                    final_verification,
+                    fake_turn,
+                    diff: diff_summary_from_patch(&last_repair_patch),
+                    failure_classification: Some(classification),
+                    recovery_plan,
+                    repair_attempts,
+                    retry_count,
+                    stop_reason: RecoveryStopReason::Recovered,
+                    max_recovery_rounds,
+                    max_repair_bytes: request.max_repair_bytes,
+                    used_repair_bytes,
+                    max_output_tokens: request.max_output_tokens,
+                    final_state: PENDING_COMMIT_APPROVAL_STATE,
+                });
+            }
+        }
+
+        self.finish_recovery_loop(RecoveryFinish {
+            session_id,
+            initial_verification,
+            final_verification,
+            fake_turn,
+            diff: diff_summary_from_patch(&last_repair_patch),
+            failure_classification: Some(classification),
+            recovery_plan,
+            repair_attempts,
+            retry_count,
+            stop_reason: RecoveryStopReason::MaxRoundsReached,
+            max_recovery_rounds,
+            max_repair_bytes: request.max_repair_bytes,
+            used_repair_bytes,
+            max_output_tokens: request.max_output_tokens,
+            final_state: RECOVERY_FAILED_STATE,
+        })
+    }
+
+    fn apply_file_patch_with_events(
+        &mut self,
+        session_id: Uuid,
+        repo_path: &str,
+        patch: &FilePatchProposal,
+    ) -> HarnessResult<Option<FilePatchObservation>> {
+        let tool_name = harness_tools::APPLY_FILE_PATCH_TOOL.name;
+        let patch_payload = file_patch_payload(patch);
+        let intent = FilePatchIntent::new(
+            repo_path.to_owned(),
+            patch.path.clone(),
+            patch.expected_content.clone(),
+            patch.replacement_content.clone(),
+        )?;
+
+        self.event_store
+            .append_event(NewEvent::file_patch_intended(
+                session_id,
+                FilePatchIntentPayload::new(tool_name, repo_path.to_owned(), patch_payload),
+            )?)?;
+
+        let evaluation = evaluate_file_patch(&patch.path, patch.replacement_content.len());
+        self.event_store.append_event(NewEvent::policy_decided(
+            session_id,
+            PolicyDecisionPayload::new(
+                tool_name,
+                evaluation.decision.as_str(),
+                evaluation.reason.clone(),
+            ),
+        )?)?;
+
+        if evaluation.decision != PolicyDecision::Allow {
+            return Ok(None);
+        }
+
+        let observation = CommandToolRuntime.run_file_patch(&intent)?;
+        self.event_store
+            .append_event(NewEvent::file_patch_observation_recorded(
+                session_id,
+                FilePatchObservationPayload::new(
+                    tool_name,
+                    observation.path.clone(),
+                    observation.applied,
+                    observation.previous_bytes,
+                    observation.new_bytes,
+                    observation.duration_ms,
+                ),
+            )?)?;
+
+        Ok(Some(observation))
+    }
+
+    fn finish_recovery_loop(
+        &mut self,
+        finish: RecoveryFinish,
+    ) -> HarnessResult<SelfRecoveryLoopResult> {
+        if finish.stop_reason == RecoveryStopReason::Recovered {
+            self.event_store.append_event(NewEvent::diff_recorded(
+                finish.session_id,
+                diff_summary_payload(&finish.diff),
+            )?)?;
+            self.event_store
+                .append_event(NewEvent::commit_approval_pending(
+                    finish.session_id,
+                    CommitApprovalPendingPayload::new(
+                        PENDING_COMMIT_APPROVAL_STATE,
+                        "verification passed after self-recovery; awaiting human commit approval",
+                    ),
+                )?)?;
+        }
+
+        self.event_store.append_event(NewEvent::recovery_stopped(
+            finish.session_id,
+            RecoveryStoppedPayload::new(
+                finish.stop_reason.as_str(),
+                finish.retry_count,
+                finish.final_state,
+            ),
+        )?)?;
+
+        let events = self.event_store.events_for_session(finish.session_id)?;
+        let event_replay = event_replay_summary(&events);
+        let prompt_tokens = finish.fake_turn.prompt_tokens;
+        let completion_tokens = finish.fake_turn.completion_tokens;
+
+        Ok(SelfRecoveryLoopResult {
+            session_id: finish.session_id,
+            initial_verification: finish.initial_verification,
+            final_verification: finish.final_verification,
+            report: SelfRecoveryReport {
+                failure_classification: finish.failure_classification,
+                recovery_plan: finish.recovery_plan,
+                repair_attempts: finish.repair_attempts,
+                retry_count: finish.retry_count,
+                stop_reason: finish.stop_reason,
+                max_recovery_rounds: finish.max_recovery_rounds,
+                max_repair_bytes: finish.max_repair_bytes,
+                used_repair_bytes: finish.used_repair_bytes,
+            },
+            diff: finish.diff,
+            event_replay,
+            token_ledger: TokenLedgerSummary {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+                max_output_tokens: finish.max_output_tokens,
+            },
+            final_state: finish.final_state.to_owned(),
+            event_count: events.len(),
+        })
+    }
+}
+
+struct RecoveryFinish {
+    session_id: Uuid,
+    initial_verification: VerificationCommandResult,
+    final_verification: VerificationCommandResult,
+    fake_turn: FakeModelTurnResult,
+    diff: DiffSummary,
+    failure_classification: Option<String>,
+    recovery_plan: Option<String>,
+    repair_attempts: usize,
+    retry_count: usize,
+    stop_reason: RecoveryStopReason,
+    max_recovery_rounds: usize,
+    max_repair_bytes: usize,
+    used_repair_bytes: usize,
+    max_output_tokens: usize,
+    final_state: &'static str,
 }
 
 pub fn apply_database_migrations(database_url: &str) -> HarnessResult<()> {
@@ -545,6 +920,38 @@ fn file_patch_payload(patch: &FilePatchProposal) -> FilePatchPayload {
         patch.expected_content.clone(),
         patch.replacement_content.clone(),
     )
+}
+
+fn classify_recovery_failure(observation: &CommandObservation) -> String {
+    let output = format!("{}\n{}", observation.stdout, observation.stderr);
+
+    if output.contains("missing recovery marker")
+        || output.contains("fake_patch_contains_recovery_marker")
+    {
+        "fixture_missing_recovery_marker".to_owned()
+    } else {
+        "verification_failed".to_owned()
+    }
+}
+
+fn recovery_repair_patch(
+    repo_path: &str,
+    patch: &FilePatchProposal,
+) -> HarnessResult<FilePatchProposal> {
+    let path = Path::new(repo_path).join(&patch.path);
+    let current_content =
+        fs::read_to_string(path).map_err(|error| HarnessError::new(error.to_string()))?;
+    let replacement_content = if current_content.contains("recovered=true") {
+        current_content.clone()
+    } else {
+        format!("{current_content}recovered=true\n")
+    };
+
+    Ok(FilePatchProposal {
+        path: patch.path.clone(),
+        expected_content: Some(current_content),
+        replacement_content,
+    })
 }
 
 fn diff_summary_from_patch(patch: &FilePatchProposal) -> DiffSummary {

@@ -262,6 +262,80 @@ fn cli_coding_task_stops_pending_commit_approval() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+#[test]
+fn cli_recovers_fixture_task_with_bounded_loop() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+    let repo = fixture_repo()?;
+    write_recovery_fixture_project(&repo)?;
+    init_git_repo(&repo)?;
+    let commit_count_before = git_commit_count(&repo)?;
+
+    let migrate = Command::new(bin)
+        .args(["migrate", "--database-url", &database_url])
+        .output()?;
+    assert!(migrate.status.success());
+
+    let repo_path = repo.display().to_string();
+    let start = Command::new(bin)
+        .args([
+            "session",
+            "start",
+            "--repo",
+            &repo_path,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(start.status.success());
+
+    let start_stdout = String::from_utf8(start.stdout)?;
+    let session_id = value_for_key(&start_stdout, "session_id").expect("session_id output");
+
+    let recover = Command::new(bin)
+        .args([
+            "session",
+            "recover-fixture",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task",
+            "write the CLI recovery fixture patch",
+            "--max-bytes",
+            "4096",
+            "--focus",
+            "agent",
+            "--max-recovery-rounds",
+            "2",
+            "--max-repair-bytes",
+            "4096",
+        ])
+        .output()?;
+    assert!(recover.status.success());
+
+    let recover_stdout = String::from_utf8(recover.stdout)?;
+    let written = fs::read_to_string(repo.join(".harness/fake-agent-turn.md"))?;
+    let commit_count_after = git_commit_count(&repo)?;
+    assert!(recover_stdout.contains("recovery_classification=fixture_missing_recovery_marker"));
+    assert!(recover_stdout.contains("recovery_plan="));
+    assert!(recover_stdout.contains("recovery_attempts=1"));
+    assert!(recover_stdout.contains("recovery_retries=1"));
+    assert!(recover_stdout.contains("recovery_stop_reason=recovered"));
+    assert!(recover_stdout.contains("verification_decision=allow"));
+    assert!(recover_stdout.contains("verification_executed=true"));
+    assert!(recover_stdout.contains("verification_exit_code=0"));
+    assert!(recover_stdout.contains("diff_files_changed=1"));
+    assert!(recover_stdout.contains("diff_paths=.harness/fake-agent-turn.md"));
+    assert!(recover_stdout.contains("final_state=pending_commit_approval"));
+    assert!(written.contains("recovered=true"));
+    assert_eq!(commit_count_before, commit_count_after);
+
+    Ok(())
+}
+
 fn database_url() -> Option<String> {
     std::env::var("HARNESS_TEST_DATABASE_URL")
         .or_else(|_| std::env::var("HARNESS_DATABASE_URL"))
@@ -297,6 +371,21 @@ fn write_file(
 
     let mut file = fs::File::create(path)?;
     file.write_all(content.as_bytes())?;
+    Ok(())
+}
+
+fn write_recovery_fixture_project(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    write_file(root, "AGENTS.md", "Use deterministic recovery fixtures.")?;
+    write_file(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"recovery-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )?;
+    write_file(
+        root,
+        "src/lib.rs",
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn fake_patch_contains_recovery_marker() {\n        let content = std::fs::read_to_string(\".harness/fake-agent-turn.md\")\n            .expect(\"fake model patch should exist\");\n        assert!(content.contains(\"recovered=true\"), \"missing recovery marker\");\n    }\n}\n",
+    )?;
     Ok(())
 }
 
