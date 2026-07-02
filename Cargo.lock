@@ -186,6 +186,7 @@ dependencies = [
  "harness-core",
  "harness-db",
  "harness-runtime",
+ "serde_json",
  "uuid",
 ]
 
@@ -249,6 +250,7 @@ dependencies = [
  "harness-models",
  "harness-policy",
  "harness-tools",
+ "serde",
  "serde_json",
  "uuid",
 ]

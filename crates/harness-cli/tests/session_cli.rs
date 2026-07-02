@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde_json::Value;
+
 #[test]
 fn cli_starts_and_shows_session_from_postgres_eventlog() -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
@@ -199,6 +201,242 @@ fn cli_creates_lists_and_shows_session_tasks() -> Result<(), Box<dyn std::error:
     assert!(show_stdout.contains("task_status=created"));
     assert!(show_stdout.contains("task_input=write the first CLI task"));
     assert!(show_stdout.contains("event_count=3"));
+
+    Ok(())
+}
+
+#[test]
+fn cli_inspects_session_text_and_json_without_mutating_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+
+    let migrate = Command::new(bin)
+        .args(["migrate", "--database-url", &database_url])
+        .output()?;
+    assert!(migrate.status.success());
+
+    let repo_path = std::env::current_dir()?.display().to_string();
+    let start = Command::new(bin)
+        .args([
+            "session",
+            "start",
+            "--repo",
+            &repo_path,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(start.status.success());
+
+    let start_stdout = String::from_utf8(start.stdout)?;
+    let session_id = value_for_key(&start_stdout, "session_id").expect("session_id output");
+
+    let first = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "create",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task",
+            "write the first inspect CLI task",
+        ])
+        .output()?;
+    assert!(first.status.success());
+
+    let first_stdout = String::from_utf8(first.stdout)?;
+    let first_task_id = value_for_key(&first_stdout, "task_id").expect("task_id output");
+
+    let second = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "create",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task",
+            "write the second inspect CLI task",
+        ])
+        .output()?;
+    assert!(second.status.success());
+
+    let enqueue = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "enqueue",
+            session_id,
+            first_task_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(enqueue.status.success());
+
+    let before_show = Command::new(bin)
+        .args([
+            "session",
+            "show",
+            session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(before_show.status.success());
+    let before_show_stdout = String::from_utf8(before_show.stdout)?;
+    assert!(before_show_stdout.contains("event_count=4"));
+
+    let before_task = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "show",
+            session_id,
+            first_task_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(before_task.status.success());
+    let before_task_stdout = String::from_utf8(before_task.stdout)?;
+    assert!(before_task_stdout.contains("task_queue_status=queued"));
+
+    let inspect_text = Command::new(bin)
+        .args([
+            "session",
+            "inspect",
+            session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(inspect_text.status.success());
+    let inspect_text_stdout = String::from_utf8(inspect_text.stdout)?;
+    assert!(inspect_text_stdout.contains(&format!("session_id={session_id}")));
+    assert!(inspect_text_stdout.contains("session_status=started"));
+    assert!(inspect_text_stdout.contains(&format!("session_repo_path={repo_path}")));
+    assert!(inspect_text_stdout.contains("event_count=4"));
+    assert!(inspect_text_stdout.contains("latest_event_sequence=4"));
+    assert!(inspect_text_stdout.contains("latest_event_type=task.enqueued"));
+    assert!(inspect_text_stdout.contains("task_count=2"));
+    assert!(inspect_text_stdout.contains("created:1"));
+    assert!(inspect_text_stdout.contains("queued:1"));
+    assert!(inspect_text_stdout.contains("source_of_truth=EventLog"));
+    assert!(inspect_text_stdout.contains("projection_kind=derived_from_eventlog"));
+
+    let inspect_json = Command::new(bin)
+        .args([
+            "session",
+            "inspect",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--json",
+        ])
+        .output()?;
+    assert!(inspect_json.status.success());
+    let inspect_json_stdout = String::from_utf8(inspect_json.stdout)?;
+    let json: Value = serde_json::from_str(&inspect_json_stdout)?;
+    assert_eq!(json["session_id"], session_id);
+    assert_eq!(json["repo_path"], repo_path);
+    assert_eq!(json["status"], "started");
+    assert_eq!(json["event_count"], 4);
+    assert_eq!(json["latest_event_sequence"], 4);
+    assert_eq!(json["latest_event_type"], "task.enqueued");
+    assert_eq!(json["task_count"], 2);
+    assert_eq!(json["source_of_truth"], "EventLog");
+    assert_eq!(json["projection_kind"], "derived_from_eventlog");
+    let counts = json["task_status_counts"]
+        .as_array()
+        .expect("status counts array");
+    assert!(
+        counts
+            .iter()
+            .any(|count| count["status"] == "created" && count["count"] == 1)
+    );
+    assert!(
+        counts
+            .iter()
+            .any(|count| count["status"] == "queued" && count["count"] == 1)
+    );
+
+    let after_show = Command::new(bin)
+        .args([
+            "session",
+            "show",
+            session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(after_show.status.success());
+    let after_show_stdout = String::from_utf8(after_show.stdout)?;
+    assert!(after_show_stdout.contains("event_count=4"));
+
+    let after_task = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "show",
+            session_id,
+            first_task_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(after_task.status.success());
+    let after_task_stdout = String::from_utf8(after_task.stdout)?;
+    assert!(after_task_stdout.contains("task_queue_status=queued"));
+
+    Ok(())
+}
+
+#[test]
+fn cli_session_inspect_reports_missing_and_malformed_session_ids()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+
+    let migrate = Command::new(bin)
+        .args(["migrate", "--database-url", &database_url])
+        .output()?;
+    assert!(migrate.status.success());
+
+    let missing_session_id = uuid::Uuid::new_v4().to_string();
+    let missing = Command::new(bin)
+        .args([
+            "session",
+            "inspect",
+            &missing_session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(!missing.status.success());
+    let missing_stderr = String::from_utf8(missing.stderr)?;
+    assert!(missing_stderr.contains(&format!("session not found: {missing_session_id}")));
+
+    let malformed = Command::new(bin)
+        .args([
+            "session",
+            "inspect",
+            "not-a-session-id",
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(!malformed.status.success());
+    let malformed_stderr = String::from_utf8(malformed.stderr)?;
+    assert!(malformed_stderr.contains("session id must be a UUID"));
 
     Ok(())
 }

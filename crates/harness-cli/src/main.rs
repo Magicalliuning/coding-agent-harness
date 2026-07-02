@@ -11,9 +11,9 @@ use harness_runtime::{
     DEFAULT_TASK_WORKER_LANE_KIND, FakeModelTurnRequest, FakeModelTurnResult,
     HeartbeatTaskLeaseRequest, LeaseNextTaskRequest, LeasedCodexWorkerTaskRequest,
     LeasedCodexWorkerTaskResult, Runtime, SelfRecoveryLoopRequest, SelfRecoveryLoopResult,
-    SessionContextCompileRequest, SessionContextCompileResult, SessionProjection,
-    SmallCodingTaskRequest, SmallCodingTaskResult, StartSessionRequest, TaskProjection,
-    VerificationCommandRequest, VerificationCommandResult,
+    SessionContextCompileRequest, SessionContextCompileResult, SessionInspectReport,
+    SessionProjection, SmallCodingTaskRequest, SmallCodingTaskResult, StartSessionRequest,
+    TaskProjection, VerificationCommandRequest, VerificationCommandResult,
 };
 use uuid::Uuid;
 
@@ -80,6 +80,20 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
             let projection = runtime.show_session(session_id)?;
 
             print_projection(&projection);
+            Ok(())
+        }
+        "inspect" => {
+            let session_id = session_id_arg(&args, 1)?;
+            let database_url = database_url_from_args(args.clone())?;
+            let runtime = Runtime::connect_postgres(&database_url)?;
+            let report = runtime.inspect_session(session_id)?;
+
+            if has_flag(&args, "--json") {
+                print_session_inspect_json(&report)?;
+            } else {
+                print_session_inspect_report(&report);
+            }
+
             Ok(())
         }
         "task" => {
@@ -560,6 +574,10 @@ fn repeated_arg_values(args: &[String], name: &str) -> Vec<String> {
         .collect()
 }
 
+fn has_flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|arg| arg == name)
+}
+
 fn context_budget_from_args(args: &[String]) -> HarnessResult<ContextBudget> {
     let mut budget = ContextBudget::default();
 
@@ -661,7 +679,8 @@ fn session_id_arg(args: &[String], index: usize) -> HarnessResult<Uuid> {
     let session_id = args
         .get(index)
         .ok_or_else(|| HarnessError::new("session id is required"))?;
-    Uuid::parse_str(session_id).map_err(|error| HarnessError::new(error.to_string()))
+    Uuid::parse_str(session_id)
+        .map_err(|error| HarnessError::new(format!("session id must be a UUID: {error}")))
 }
 
 fn task_id_arg(args: &[String], index: usize) -> HarnessResult<Uuid> {
@@ -681,6 +700,42 @@ fn print_projection(projection: &SessionProjection) {
     println!("status={}", projection.status.as_str());
     println!("repo_path={}", projection.repo_path);
     println!("event_count={}", projection.event_count);
+}
+
+fn print_session_inspect_report(report: &SessionInspectReport) {
+    println!("session_id={}", report.session_id);
+    println!("session_status={}", report.status);
+    println!("session_repo_path={}", report.repo_path);
+    println!("event_count={}", report.event_count);
+    println!(
+        "latest_event_sequence={}",
+        report
+            .latest_event_sequence
+            .map_or_else(String::new, |sequence| sequence.to_string())
+    );
+    println!(
+        "latest_event_type={}",
+        report.latest_event_type.as_deref().unwrap_or_default()
+    );
+    println!("task_count={}", report.task_count);
+    println!(
+        "task_status_counts={}",
+        report
+            .task_status_counts
+            .iter()
+            .map(|count| format!("{}:{}", count.status, count.count))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    println!("source_of_truth={}", report.source_of_truth);
+    println!("projection_kind={}", report.projection_kind);
+}
+
+fn print_session_inspect_json(report: &SessionInspectReport) -> HarnessResult<()> {
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|error| HarnessError::new(error.to_string()))?;
+    println!("{json}");
+    Ok(())
 }
 
 fn print_task_list(tasks: &[TaskProjection]) {

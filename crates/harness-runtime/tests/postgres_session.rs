@@ -115,6 +115,75 @@ fn task_create_list_show_projects_first_class_tasks() -> Result<(), Box<dyn std:
 }
 
 #[test]
+fn session_inspect_report_summarizes_session_without_mutating_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo_path = format!("inspect-fixture-repo-{}", Uuid::new_v4());
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo_path.clone()))?;
+    let first = runtime.create_task(
+        started.session_id,
+        CreateTaskRequest::new("write the first inspect task"),
+    )?;
+    let second = runtime.create_task(
+        started.session_id,
+        CreateTaskRequest::new("write the second inspect task"),
+    )?;
+    runtime.enqueue_task(started.session_id, first.task_id)?;
+
+    let events_before = runtime.events_for_session(started.session_id)?;
+    let queue_before = PostgresEventStore::connect(&database_url)?
+        .task_queue_record(first.task_id)?
+        .expect("task queue record");
+    let report = runtime.inspect_session(started.session_id)?;
+    let events_after = runtime.events_for_session(started.session_id)?;
+    let queue_after = PostgresEventStore::connect(&database_url)?
+        .task_queue_record(first.task_id)?
+        .expect("task queue record after inspect");
+
+    assert_eq!(report.session_id, started.session_id);
+    assert_eq!(report.repo_path, repo_path);
+    assert_eq!(report.status, "started");
+    assert_eq!(report.event_count, events_before.len());
+    assert_eq!(report.latest_event_sequence, Some(4));
+    assert_eq!(report.latest_event_type.as_deref(), Some("task.enqueued"));
+    assert_eq!(report.task_count, 2);
+    assert_eq!(
+        report
+            .task_status_counts
+            .iter()
+            .find(|count| count.status == "created")
+            .map(|count| count.count),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .task_status_counts
+            .iter()
+            .find(|count| count.status == TASK_QUEUED_STATE)
+            .map(|count| count.count),
+        Some(1)
+    );
+    assert_eq!(report.source_of_truth, "EventLog");
+    assert_eq!(report.projection_kind, "derived_from_eventlog");
+    assert_eq!(events_after.len(), events_before.len());
+    assert_eq!(queue_after, queue_before);
+    assert_eq!(
+        runtime
+            .show_task(started.session_id, second.task_id)?
+            .status,
+        "created"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn task_queue_lease_and_terminal_transitions_are_projected()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
