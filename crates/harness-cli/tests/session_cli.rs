@@ -1880,6 +1880,374 @@ fn cli_approves_and_commits_queued_task_scope() -> Result<(), Box<dyn std::error
 }
 
 #[test]
+fn cli_v04_observability_acceptance_commands_are_read_only()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+    let repo = fixture_repo()?;
+    let (script_name, script) = fake_success_runner_script();
+    write_file(&repo, "AGENTS.md", "Use deterministic agent fixtures.")?;
+    write_file(&repo, "README.md", "fixture repository\n")?;
+    write_file(&repo, script_name, script)?;
+    init_git_repo(&repo)?;
+
+    let migrate = Command::new(bin)
+        .args(["migrate", "--database-url", &database_url])
+        .output()?;
+    assert!(migrate.status.success());
+
+    let repo_path = repo.display().to_string();
+    let start = Command::new(bin)
+        .args([
+            "session",
+            "start",
+            "--repo",
+            &repo_path,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(start.status.success());
+
+    let start_stdout = String::from_utf8(start.stdout)?;
+    let session_id = value_for_key(&start_stdout, "session_id").expect("session_id output");
+
+    let create = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "create",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task",
+            "write the V0.4 observability acceptance task",
+        ])
+        .output()?;
+    assert!(create.status.success());
+
+    let create_stdout = String::from_utf8(create.stdout)?;
+    let task_id = value_for_key(&create_stdout, "task_id").expect("task id output");
+
+    let enqueue = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "enqueue",
+            session_id,
+            task_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(enqueue.status.success());
+
+    let mut run_args = vec![
+        "session".to_owned(),
+        "task".to_owned(),
+        "run-next-codex-worker".to_owned(),
+        "--database-url".to_owned(),
+        database_url.clone(),
+        "--worker-id".to_owned(),
+        "cli-v04-observability-worker".to_owned(),
+        "--".to_owned(),
+    ];
+    run_args.extend(fake_runner_cli_command(script_name));
+    let run = Command::new(bin).args(run_args).output()?;
+    assert!(run.status.success());
+
+    let approve = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "approve",
+            session_id,
+            task_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(approve.status.success());
+
+    let commit = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "commit",
+            session_id,
+            task_id,
+            "--database-url",
+            &database_url,
+            "--message",
+            "Commit V0.4 observability acceptance task",
+        ])
+        .output()?;
+    assert!(commit.status.success());
+
+    let run_cli = |args: &[&str]| -> Result<String, Box<dyn std::error::Error>> {
+        let output = Command::new(bin).args(args).output()?;
+        assert!(
+            output.status.success(),
+            "command {:?} failed: {}{}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?)
+    };
+
+    let before_session = run_cli(&[
+        "session",
+        "show",
+        session_id,
+        "--database-url",
+        &database_url,
+    ])?;
+    let before_task = run_cli(&[
+        "session",
+        "task",
+        "show",
+        session_id,
+        task_id,
+        "--database-url",
+        &database_url,
+    ])?;
+    let before_queue = run_cli(&[
+        "session",
+        "task",
+        "queue-inspect",
+        "--session-id",
+        session_id,
+        "--database-url",
+        &database_url,
+        "--now-ms",
+        "123456",
+        "--json",
+    ])?;
+    let before_queue_json: Value = serde_json::from_str(&before_queue)?;
+    let task_state_keys = [
+        "task_status",
+        "task_queue_status",
+        "task_queue_retry_count",
+        "task_queue_max_retries",
+        "task_lease_id",
+        "task_lease_worker_id",
+        "task_lease_status",
+        "task_approval_state",
+        "task_approval_rejection_reason",
+        "task_commit_state",
+        "task_commit_sha",
+        "task_commit_failure_reason",
+    ];
+    let before_task_snapshot = snapshot_values(&before_task, &task_state_keys);
+    assert_eq!(
+        value_for_key(&before_task, "task_status"),
+        Some("committed")
+    );
+    assert_eq!(
+        value_for_key(&before_task, "task_queue_status"),
+        Some("completed")
+    );
+    assert_eq!(
+        value_for_key(&before_task, "task_lease_status"),
+        Some("completed")
+    );
+    assert_eq!(
+        value_for_key(&before_task, "task_approval_state"),
+        Some("approved")
+    );
+    assert_eq!(
+        value_for_key(&before_task, "task_commit_state"),
+        Some("committed")
+    );
+
+    let session_text = run_cli(&[
+        "session",
+        "inspect",
+        session_id,
+        "--database-url",
+        &database_url,
+    ])?;
+    assert!(session_text.contains("projection_kind=session_inspect_report"));
+    let session_json = run_cli(&[
+        "session",
+        "inspect",
+        session_id,
+        "--database-url",
+        &database_url,
+        "--json",
+    ])?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&session_json)?["projection_kind"],
+        "session_inspect_report"
+    );
+
+    let task_json = run_cli(&[
+        "session",
+        "task",
+        "inspect",
+        session_id,
+        task_id,
+        "--database-url",
+        &database_url,
+        "--json",
+    ])?;
+    let task_json: Value = serde_json::from_str(&task_json)?;
+    assert_eq!(task_json["projection_kind"], "task_inspect_report");
+    assert_eq!(task_json["approval"]["state"], "approved");
+    assert_eq!(task_json["commit"]["state"], "committed");
+
+    let queue_json = run_cli(&[
+        "session",
+        "task",
+        "queue-inspect",
+        "--session-id",
+        session_id,
+        "--database-url",
+        &database_url,
+        "--now-ms",
+        "123456",
+        "--json",
+    ])?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&queue_json)?["projection_kind"],
+        "task_queue_inspect_report"
+    );
+
+    let timeline_json = run_cli(&[
+        "session",
+        "timeline",
+        session_id,
+        "--database-url",
+        &database_url,
+        "--task-id",
+        task_id,
+        "--payload-bytes",
+        "256",
+        "--json",
+    ])?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&timeline_json)?["projection_kind"],
+        "bounded_eventlog_timeline"
+    );
+
+    let approval_json = run_cli(&[
+        "session",
+        "approval",
+        "inspect",
+        session_id,
+        "--database-url",
+        &database_url,
+        "--task-id",
+        task_id,
+        "--json",
+    ])?;
+    let approval_json: Value = serde_json::from_str(&approval_json)?;
+    assert_eq!(
+        approval_json["projection_kind"],
+        "approval_commit_inspect_report"
+    );
+    assert_eq!(approval_json["decision_count"], 1);
+    assert_eq!(approval_json["commit_count"], 2);
+
+    let worker_text = run_cli(&[
+        "session",
+        "worker",
+        "inspect",
+        session_id,
+        "--database-url",
+        &database_url,
+        "--task-id",
+        task_id,
+        "--payload-bytes",
+        "256",
+    ])?;
+    assert!(worker_text.contains("projection_kind=worker_lane_diff_inspect_report"));
+    let worker_json = run_cli(&[
+        "session",
+        "worker",
+        "inspect",
+        session_id,
+        "--database-url",
+        &database_url,
+        "--task-id",
+        task_id,
+        "--payload-bytes",
+        "256",
+        "--json",
+    ])?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&worker_json)?["projection_kind"],
+        "worker_lane_diff_inspect_report"
+    );
+
+    let architecture_text = run_cli(&["report", "architecture"])?;
+    assert!(architecture_text.contains("report_id=runtime_architecture"));
+    let architecture_json = run_cli(&["report", "architecture", "--json"])?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&architecture_json)?["report_id"],
+        "runtime_architecture"
+    );
+    let data_flow_json = run_cli(&["report", "data-flow", "--json"])?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&data_flow_json)?["report_id"],
+        "runtime_data_flow"
+    );
+    let storage_json = run_cli(&["report", "storage", "--json"])?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&storage_json)?["report_id"],
+        "runtime_storage"
+    );
+
+    let after_session = run_cli(&[
+        "session",
+        "show",
+        session_id,
+        "--database-url",
+        &database_url,
+    ])?;
+    let after_task = run_cli(&[
+        "session",
+        "task",
+        "show",
+        session_id,
+        task_id,
+        "--database-url",
+        &database_url,
+    ])?;
+    let after_queue = run_cli(&[
+        "session",
+        "task",
+        "queue-inspect",
+        "--session-id",
+        session_id,
+        "--database-url",
+        &database_url,
+        "--now-ms",
+        "123456",
+        "--json",
+    ])?;
+
+    assert_eq!(
+        value_for_key(&after_session, "event_count"),
+        value_for_key(&before_session, "event_count")
+    );
+    assert_eq!(
+        snapshot_values(&after_task, &task_state_keys),
+        before_task_snapshot
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&after_queue)?,
+        before_queue_json
+    );
+
+    Ok(())
+}
+
+#[test]
 fn cli_codex_acceptance_reports_explicit_skip_when_unavailable()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
@@ -2544,6 +2912,17 @@ fn value_for_key<'a>(output: &'a str, key: &str) -> Option<&'a str> {
     output
         .lines()
         .find_map(|line| line.strip_prefix(&format!("{key}=")))
+}
+
+fn snapshot_values(output: &str, keys: &[&str]) -> Vec<(String, String)> {
+    keys.iter()
+        .map(|key| {
+            (
+                (*key).to_owned(),
+                value_for_key(output, key).unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
 }
 
 fn current_time_ms_for_test() -> Result<i64, Box<dyn std::error::Error>> {

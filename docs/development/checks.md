@@ -29,3 +29,8 @@ Before declaring V0 accepted, also run the manual QA gate in `docs/development/v
 It exercises the CLI-started self-recovery path against `fixtures/v0-acceptance`
 and checks the recovery report, event replay summary, diff summary, token ledger,
 and pending commit approval state.
+
+Before declaring V0.4 observability accepted, review
+`docs/development/v0.4-observability-acceptance.md`. It documents the
+read-only inspect/report command surface, PostgreSQL requirements, manual
+acceptance path, known limits, and the expected no-mutation behavior.
