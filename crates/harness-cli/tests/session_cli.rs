@@ -499,6 +499,102 @@ fn cli_renews_expires_retries_and_stops_task_leases() -> Result<(), Box<dyn std:
 }
 
 #[test]
+fn cli_runs_next_queued_task_through_codex_worker() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+    let repo = fixture_repo()?;
+    let (script_name, script) = fake_success_runner_script();
+    write_file(&repo, "AGENTS.md", "Use deterministic agent fixtures.")?;
+    write_file(&repo, "README.md", "fixture repository\n")?;
+    write_file(&repo, script_name, script)?;
+    init_git_repo(&repo)?;
+
+    let migrate = Command::new(bin)
+        .args(["migrate", "--database-url", &database_url])
+        .output()?;
+    assert!(migrate.status.success());
+
+    let repo_path = repo.display().to_string();
+    let start = Command::new(bin)
+        .args([
+            "session",
+            "start",
+            "--repo",
+            &repo_path,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(start.status.success());
+
+    let start_stdout = String::from_utf8(start.stdout)?;
+    let session_id = value_for_key(&start_stdout, "session_id").expect("session_id output");
+
+    let create = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "create",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task",
+            "write the queued CLI worker task",
+        ])
+        .output()?;
+    assert!(create.status.success());
+
+    let create_stdout = String::from_utf8(create.stdout)?;
+    let task_id = value_for_key(&create_stdout, "task_id").expect("task id output");
+
+    let enqueue = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "enqueue",
+            session_id,
+            task_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(enqueue.status.success());
+
+    let mut args = vec![
+        "session".to_owned(),
+        "task".to_owned(),
+        "run-next-codex-worker".to_owned(),
+        "--database-url".to_owned(),
+        database_url.clone(),
+        "--worker-id".to_owned(),
+        "cli-queue-worker".to_owned(),
+        "--max-stdout-bytes".to_owned(),
+        "4".to_owned(),
+        "--".to_owned(),
+    ];
+    args.extend(fake_runner_cli_command(script_name));
+    let run = Command::new(bin).args(args).output()?;
+    assert!(run.status.success());
+
+    let run_stdout = String::from_utf8(run.stdout)?;
+    assert!(run_stdout.contains("task_leased=true"));
+    assert!(run_stdout.contains("worker_final_status=succeeded"));
+    assert!(run_stdout.contains("worker_pending_commit_state=pending_commit_approval"));
+    assert!(run_stdout.contains("task_status=pending_commit_approval"));
+    assert!(run_stdout.contains("task_queue_status=completed"));
+    assert!(run_stdout.contains("task_lease_status=completed"));
+    assert!(run_stdout.contains("task_worker_status=succeeded"));
+    assert!(run_stdout.contains("task_diff_paths=README.md"));
+    assert!(run_stdout.contains("task_approval_state=pending_commit_approval"));
+    assert_eq!(git_status(&repo)?, "");
+
+    Ok(())
+}
+
+#[test]
 fn cli_codex_acceptance_reports_explicit_skip_when_unavailable()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
@@ -1154,12 +1250,39 @@ fn copy_dir(source: &Path, target: &Path) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+fn fake_runner_cli_command(script_name: &str) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        vec!["cmd".to_owned(), "/C".to_owned(), script_name.to_owned()]
+    }
+    #[cfg(not(windows))]
+    {
+        vec!["sh".to_owned(), script_name.to_owned()]
+    }
+}
+
+#[cfg(windows)]
+fn fake_success_runner_script() -> (&'static str, &'static str) {
+    (
+        "fake-success-runner.cmd",
+        "@echo off\r\necho 0123456789\r\necho changed by CLI fake runner>> README.md\r\nexit /B 0\r\n",
+    )
+}
+
+#[cfg(not(windows))]
+fn fake_success_runner_script() -> (&'static str, &'static str) {
+    (
+        "fake-success-runner.sh",
+        "#!/bin/sh\nprintf '0123456789\\n'\nprintf 'changed by CLI fake runner\\n' >> README.md\nexit 0\n",
+    )
+}
+
 fn init_git_repo(repo: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let init = Command::new("git").arg("init").current_dir(repo).output()?;
     assert!(init.status.success());
 
     let add = Command::new("git")
-        .args(["add", "AGENTS.md"])
+        .args(["add", "."])
         .current_dir(repo)
         .output()?;
     assert!(add.status.success());

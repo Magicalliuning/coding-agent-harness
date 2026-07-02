@@ -5,13 +5,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use harness_core::{HarnessError, HarnessResult};
 use harness_runtime::{
     ApprovalProjection, CodexCliAcceptanceRequest, CodexCliAcceptanceResult,
-    CodexCliAvailabilityRequest, CommitHandoffProjection, ContextBudget, CreateTaskRequest,
-    DEFAULT_CODEX_CLI_ACCEPTANCE_TASK, DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS,
-    DEFAULT_CODEX_CLI_PROGRAM, DEFAULT_TASK_WORKER_LANE_KIND, FakeModelTurnRequest,
-    FakeModelTurnResult, HeartbeatTaskLeaseRequest, LeaseNextTaskRequest, Runtime,
-    SelfRecoveryLoopRequest, SelfRecoveryLoopResult, SessionContextCompileRequest,
-    SessionContextCompileResult, SessionProjection, SmallCodingTaskRequest, SmallCodingTaskResult,
-    StartSessionRequest, TaskProjection, VerificationCommandRequest, VerificationCommandResult,
+    CodexCliAvailabilityRequest, CodexWorkerLaneRequest, CodexWorkerSubprocess,
+    CommitHandoffProjection, ContextBudget, CreateTaskRequest, DEFAULT_CODEX_CLI_ACCEPTANCE_TASK,
+    DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS, DEFAULT_CODEX_CLI_PROGRAM,
+    DEFAULT_TASK_WORKER_LANE_KIND, FakeModelTurnRequest, FakeModelTurnResult,
+    HeartbeatTaskLeaseRequest, LeaseNextTaskRequest, LeasedCodexWorkerTaskRequest,
+    LeasedCodexWorkerTaskResult, Runtime, SelfRecoveryLoopRequest, SelfRecoveryLoopResult,
+    SessionContextCompileRequest, SessionContextCompileResult, SessionProjection,
+    SmallCodingTaskRequest, SmallCodingTaskResult, StartSessionRequest, TaskProjection,
+    VerificationCommandRequest, VerificationCommandResult,
 };
 use uuid::Uuid;
 
@@ -196,6 +198,47 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
                     if tasks.len() == 1 {
                         print_task_projection(&tasks[0]);
                     }
+                    Ok(())
+                }
+                "run-next-codex-worker" => {
+                    let before_separator = args_before_separator(&args);
+                    let worker_id = required_arg_value(before_separator, "--worker-id")?;
+                    let lease_duration_ms = optional_arg_value(before_separator, "--lease-ms")
+                        .map(|value| parse_u64_arg("--lease-ms", value))
+                        .transpose()?
+                        .unwrap_or(60_000);
+                    let timeout_ms = optional_arg_value(before_separator, "--timeout-ms")
+                        .map(|value| parse_u64_arg("--timeout-ms", value))
+                        .transpose()?
+                        .unwrap_or(30_000);
+                    let max_stdout_bytes =
+                        optional_arg_value(before_separator, "--max-stdout-bytes")
+                            .map(|value| parse_usize_arg("--max-stdout-bytes", value))
+                            .transpose()?
+                            .unwrap_or(64 * 1024);
+                    let command = command_after_separator(&args)?;
+                    let mut worker = CodexWorkerLaneRequest::new_subprocess(
+                        "queued task",
+                        CodexWorkerSubprocess::new(command[0].clone(), command[1..].to_vec()),
+                    );
+                    worker.timeout_ms = timeout_ms;
+                    worker.budget.max_stdout_bytes = max_stdout_bytes;
+
+                    let result = runtime.run_next_leased_codex_worker_task(
+                        LeasedCodexWorkerTaskRequest {
+                            worker_id: worker_id.to_owned(),
+                            lease_duration_ms,
+                            worker,
+                        },
+                    )?;
+
+                    if let Some(result) = result {
+                        println!("task_leased=true");
+                        print_leased_codex_worker_task_result(&result);
+                    } else {
+                        println!("task_leased=false");
+                    }
+
                     Ok(())
                 }
                 "complete" => {
@@ -943,6 +986,43 @@ fn print_commit_handoff_projection(commit: &CommitHandoffProjection) {
         commit.failure_reason.as_deref().unwrap_or("")
     );
     println!("event_count={}", commit.event_count);
+}
+
+fn print_leased_codex_worker_task_result(result: &LeasedCodexWorkerTaskResult) {
+    println!("lease_id={}", result.lease_id);
+    println!("worker_lane_id={}", result.worker.lane_id);
+    println!(
+        "worker_final_status={}",
+        result.worker.final_status.as_str()
+    );
+    println!(
+        "worker_pending_commit_state={}",
+        result.worker.pending_commit_state.as_deref().unwrap_or("")
+    );
+
+    if let Some(observation) = &result.worker.observation {
+        if let Some(exit_code) = observation.exit_code {
+            println!("worker_exit_code={exit_code}");
+        } else {
+            println!("worker_exit_code=signal");
+        }
+        println!("worker_duration_ms={}", observation.duration_ms);
+    }
+
+    println!(
+        "event_replay_total={}",
+        result.worker.event_replay.total_events
+    );
+    println!(
+        "event_replay_last={}",
+        result
+            .worker
+            .event_replay
+            .last_event_type
+            .as_deref()
+            .unwrap_or("")
+    );
+    print_task_projection(&result.task);
 }
 
 fn print_codex_cli_acceptance_result(result: &CodexCliAcceptanceResult) {
