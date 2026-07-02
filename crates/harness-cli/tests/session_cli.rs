@@ -2036,6 +2036,135 @@ fn cli_approval_show_approve_rejects_pending_diff() -> Result<(), Box<dyn std::e
 }
 
 #[test]
+fn cli_inspects_approval_commit_text_and_json_without_mutating_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+
+    let migrate = Command::new(bin)
+        .args(["migrate", "--database-url", &database_url])
+        .output()?;
+    assert!(migrate.status.success());
+
+    let (_repo, session_id) =
+        start_cli_pending_approval(bin, &database_url, "write the inspectable approval patch")?;
+
+    let before_show = Command::new(bin)
+        .args([
+            "session",
+            "show",
+            &session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(before_show.status.success());
+    let before_show_stdout = String::from_utf8(before_show.stdout)?;
+    assert!(before_show_stdout.contains("event_count=12"));
+
+    let before_approval = Command::new(bin)
+        .args([
+            "session",
+            "approval",
+            "show",
+            &session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(before_approval.status.success());
+    let before_approval_stdout = String::from_utf8(before_approval.stdout)?;
+    assert!(before_approval_stdout.contains("approval_state=pending_commit_approval"));
+
+    let inspect_text = Command::new(bin)
+        .args([
+            "session",
+            "approval",
+            "inspect",
+            &session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(inspect_text.status.success());
+    let inspect_text_stdout = String::from_utf8(inspect_text.stdout)?;
+    assert!(inspect_text_stdout.contains(&format!("session_id={session_id}")));
+    assert!(inspect_text_stdout.contains("task_id="));
+    assert!(inspect_text_stdout.contains("approval_commit_scope=session"));
+    assert!(inspect_text_stdout.contains("pending_approval_count=1"));
+    assert!(inspect_text_stdout.contains("approval_decision_count=0"));
+    assert!(inspect_text_stdout.contains("commit_handoff_count=0"));
+    assert!(
+        inspect_text_stdout
+            .contains("pending_0_summary=verification passed; awaiting human commit approval")
+    );
+    assert!(inspect_text_stdout.contains("pending_0_diff_paths=.harness/fake-agent-turn.md"));
+    assert!(inspect_text_stdout.contains("source_of_truth=EventLog"));
+    assert!(inspect_text_stdout.contains("projection_kind=approval_commit_inspect_report"));
+
+    let inspect_json = Command::new(bin)
+        .args([
+            "session",
+            "approval",
+            "inspect",
+            &session_id,
+            "--database-url",
+            &database_url,
+            "--json",
+        ])
+        .output()?;
+    assert!(inspect_json.status.success());
+    let inspect_json_stdout = String::from_utf8(inspect_json.stdout)?;
+    let json: Value = serde_json::from_str(&inspect_json_stdout)?;
+    assert_eq!(json["session_id"], session_id);
+    assert_eq!(json["scope"], "session");
+    assert_eq!(json["pending_count"], 1);
+    assert_eq!(json["decision_count"], 0);
+    assert_eq!(json["commit_count"], 0);
+    assert_eq!(
+        json["pending_approvals"][0]["summary"],
+        "verification passed; awaiting human commit approval"
+    );
+    assert_eq!(
+        json["pending_approvals"][0]["diff"]["paths"][0],
+        ".harness/fake-agent-turn.md"
+    );
+    assert_eq!(json["source_of_truth"], "EventLog");
+
+    let after_show = Command::new(bin)
+        .args([
+            "session",
+            "show",
+            &session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(after_show.status.success());
+    let after_show_stdout = String::from_utf8(after_show.stdout)?;
+    assert!(after_show_stdout.contains("event_count=12"));
+
+    let after_approval = Command::new(bin)
+        .args([
+            "session",
+            "approval",
+            "show",
+            &session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(after_approval.status.success());
+    let after_approval_stdout = String::from_utf8(after_approval.stdout)?;
+    assert_eq!(after_approval_stdout, before_approval_stdout);
+
+    Ok(())
+}
+
+#[test]
 fn cli_commit_handoff_requires_approval_and_commits_approved_diff()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {

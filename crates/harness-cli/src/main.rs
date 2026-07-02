@@ -4,11 +4,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use harness_core::{HarnessError, HarnessResult};
 use harness_runtime::{
-    ApprovalProjection, CodexCliAcceptanceRequest, CodexCliAcceptanceResult,
-    CodexCliAvailabilityRequest, CodexWorkerLaneRequest, CodexWorkerSubprocess,
-    CommitHandoffProjection, ContextBudget, CreateTaskRequest, DEFAULT_CODEX_CLI_ACCEPTANCE_TASK,
-    DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS, DEFAULT_CODEX_CLI_PROGRAM,
-    DEFAULT_TASK_WORKER_LANE_KIND, DEFAULT_TIMELINE_PAYLOAD_LIMIT_BYTES,
+    ApprovalCommitInspectReport, ApprovalCommitInspectRequest, ApprovalProjection,
+    CodexCliAcceptanceRequest, CodexCliAcceptanceResult, CodexCliAvailabilityRequest,
+    CodexWorkerLaneRequest, CodexWorkerSubprocess, CommitHandoffProjection, ContextBudget,
+    CreateTaskRequest, DEFAULT_CODEX_CLI_ACCEPTANCE_TASK, DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS,
+    DEFAULT_CODEX_CLI_PROGRAM, DEFAULT_TASK_WORKER_LANE_KIND, DEFAULT_TIMELINE_PAYLOAD_LIMIT_BYTES,
     EventTimelineInspectRequest, EventTimelineReport, FakeModelTurnRequest, FakeModelTurnResult,
     HeartbeatTaskLeaseRequest, LeaseNextTaskRequest, LeasedCodexWorkerTaskRequest,
     LeasedCodexWorkerTaskResult, Runtime, RuntimeArchitectureReport, RuntimeDataFlowReport,
@@ -593,6 +593,29 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
                 .map_err(|error| HarnessError::new(error.to_string()))?;
             let database_url = database_url_from_args(args.clone())?;
             let mut runtime = Runtime::connect_postgres(&database_url)?;
+            if action == "inspect" {
+                let task_id = optional_arg_value(&args, "--task-id")
+                    .map(|task_id| {
+                        Uuid::parse_str(task_id).map_err(|error| {
+                            HarnessError::new(format!("task id must be a UUID: {error}"))
+                        })
+                    })
+                    .transpose()?;
+                let mut request = ApprovalCommitInspectRequest::new(session_id);
+                if let Some(task_id) = task_id {
+                    request = request.with_task_id(task_id);
+                }
+                let report = runtime.inspect_approval_commit(request)?;
+
+                if has_flag(&args, "--json") {
+                    print_approval_commit_inspect_json(&report)?;
+                } else {
+                    print_approval_commit_inspect_report(&report);
+                }
+
+                return Ok(());
+            }
+
             let approval = match action.as_str() {
                 "show" => runtime.show_approval(session_id)?,
                 "approve" => runtime.approve_pending_diff(session_id)?,
@@ -984,6 +1007,145 @@ fn print_storage_projection(index: usize, projection: &RuntimeStorageProjectionR
     println!("projection_{index}_name={}", projection.name);
     println!("projection_{index}_source={}", projection.source);
     println!("projection_{index}_summary={}", projection.summary);
+}
+
+fn print_approval_commit_inspect_report(report: &ApprovalCommitInspectReport) {
+    println!("session_id={}", report.session_id);
+    println!(
+        "task_id={}",
+        report
+            .task_id
+            .map_or_else(String::new, |task_id| task_id.to_string())
+    );
+    println!("approval_commit_scope={}", report.scope);
+    println!("pending_approval_count={}", report.pending_count);
+    println!("approval_decision_count={}", report.decision_count);
+    println!("commit_handoff_count={}", report.commit_count);
+    println!("event_count={}", report.event_count);
+    println!("source_of_truth={}", report.source_of_truth);
+    println!("projection_kind={}", report.projection_kind);
+
+    for (index, pending) in report.pending_approvals.iter().enumerate() {
+        println!(
+            "pending_{index}_task_id={}",
+            pending
+                .task_id
+                .map_or_else(String::new, |task_id| task_id.to_string())
+        );
+        println!("pending_{index}_summary={}", pending.summary);
+        println!("pending_{index}_event_sequence={}", pending.event_sequence);
+        if let Some(diff) = &pending.diff {
+            println!(
+                "pending_{index}_diff_repo_path={}",
+                diff.repo_path.as_deref().unwrap_or_default()
+            );
+            println!("pending_{index}_diff_files_changed={}", diff.files_changed);
+            println!("pending_{index}_diff_insertions={}", diff.insertions);
+            println!("pending_{index}_diff_deletions={}", diff.deletions);
+            println!("pending_{index}_diff_paths={}", diff.paths.join(","));
+        } else {
+            println!("pending_{index}_diff_repo_path=");
+            println!("pending_{index}_diff_files_changed=");
+            println!("pending_{index}_diff_insertions=");
+            println!("pending_{index}_diff_deletions=");
+            println!("pending_{index}_diff_paths=");
+        }
+        println!(
+            "pending_{index}_worker_workspace_path={}",
+            pending
+                .workspace
+                .worker_workspace_path
+                .as_deref()
+                .unwrap_or_default()
+        );
+        println!(
+            "pending_{index}_worker_worktree_path={}",
+            pending
+                .workspace
+                .worker_worktree_path
+                .as_deref()
+                .unwrap_or_default()
+        );
+        println!(
+            "pending_{index}_allocated_worktree_path={}",
+            pending
+                .workspace
+                .allocated_worktree_path
+                .as_deref()
+                .unwrap_or_default()
+        );
+        println!(
+            "pending_{index}_session_repo_path={}",
+            pending
+                .workspace
+                .session_repo_path
+                .as_deref()
+                .unwrap_or_default()
+        );
+        println!(
+            "pending_{index}_workspace_diff_repo_path={}",
+            pending
+                .workspace
+                .diff_repo_path
+                .as_deref()
+                .unwrap_or_default()
+        );
+    }
+
+    for (index, decision) in report.decisions.iter().enumerate() {
+        println!(
+            "decision_{index}_task_id={}",
+            decision
+                .task_id
+                .map_or_else(String::new, |task_id| task_id.to_string())
+        );
+        println!("decision_{index}_state={}", decision.state);
+        println!(
+            "decision_{index}_actor={}",
+            decision.actor.as_deref().unwrap_or_default()
+        );
+        println!("decision_{index}_reason={}", decision.reason);
+        println!(
+            "decision_{index}_rejection_reason={}",
+            decision.rejection_reason.as_deref().unwrap_or_default()
+        );
+        println!(
+            "decision_{index}_event_sequence={}",
+            decision.event_sequence
+        );
+    }
+
+    for (index, commit) in report.commits.iter().enumerate() {
+        println!(
+            "commit_{index}_task_id={}",
+            commit
+                .task_id
+                .map_or_else(String::new, |task_id| task_id.to_string())
+        );
+        println!("commit_{index}_state={}", commit.state);
+        println!(
+            "commit_{index}_actor={}",
+            commit.actor.as_deref().unwrap_or_default()
+        );
+        println!("commit_{index}_repo_path={}", commit.repo_path);
+        println!("commit_{index}_message={}", commit.message);
+        println!(
+            "commit_{index}_sha={}",
+            commit.commit_sha.as_deref().unwrap_or_default()
+        );
+        println!(
+            "commit_{index}_failure_reason={}",
+            commit.failure_reason.as_deref().unwrap_or_default()
+        );
+        println!("commit_{index}_event_sequence={}", commit.event_sequence);
+    }
+}
+
+fn print_approval_commit_inspect_json(report: &ApprovalCommitInspectReport) -> HarnessResult<()> {
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|error| HarnessError::new(error.to_string()))?;
+    println!("{json}");
+    Ok(())
 }
 
 fn print_session_inspect_report(report: &SessionInspectReport) {
