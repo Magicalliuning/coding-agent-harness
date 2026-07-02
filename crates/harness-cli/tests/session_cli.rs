@@ -1575,6 +1575,177 @@ fn cli_runs_next_queued_task_through_codex_worker() -> Result<(), Box<dyn std::e
 }
 
 #[test]
+fn cli_inspects_worker_lane_diff_text_and_json() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+    let repo = fixture_repo()?;
+    let (script_name, script) = fake_success_runner_script();
+    write_file(&repo, "AGENTS.md", "Use deterministic agent fixtures.")?;
+    write_file(&repo, "README.md", "fixture repository\n")?;
+    write_file(&repo, script_name, script)?;
+    init_git_repo(&repo)?;
+
+    let migrate = Command::new(bin)
+        .args(["migrate", "--database-url", &database_url])
+        .output()?;
+    assert!(migrate.status.success());
+
+    let repo_path = repo.display().to_string();
+    let start = Command::new(bin)
+        .args([
+            "session",
+            "start",
+            "--repo",
+            &repo_path,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(start.status.success());
+
+    let start_stdout = String::from_utf8(start.stdout)?;
+    let session_id = value_for_key(&start_stdout, "session_id").expect("session_id output");
+
+    let create = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "create",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task",
+            "write the worker inspect CLI task",
+        ])
+        .output()?;
+    assert!(create.status.success());
+
+    let create_stdout = String::from_utf8(create.stdout)?;
+    let task_id = value_for_key(&create_stdout, "task_id").expect("task id output");
+
+    let enqueue = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "enqueue",
+            session_id,
+            task_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(enqueue.status.success());
+
+    let mut run_args = vec![
+        "session".to_owned(),
+        "task".to_owned(),
+        "run-next-codex-worker".to_owned(),
+        "--database-url".to_owned(),
+        database_url.clone(),
+        "--worker-id".to_owned(),
+        "cli-worker-inspect-worker".to_owned(),
+        "--".to_owned(),
+    ];
+    run_args.extend(fake_runner_cli_command(script_name));
+    let run = Command::new(bin).args(run_args).output()?;
+    assert!(run.status.success());
+
+    let before_show = Command::new(bin)
+        .args([
+            "session",
+            "show",
+            session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(before_show.status.success());
+    let before_show_stdout = String::from_utf8(before_show.stdout)?;
+    let before_event_count =
+        value_for_key(&before_show_stdout, "event_count").expect("event_count output");
+
+    let inspect_text = Command::new(bin)
+        .args([
+            "session",
+            "worker",
+            "inspect",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--payload-bytes",
+            "4",
+        ])
+        .output()?;
+    assert!(inspect_text.status.success());
+    let inspect_text_stdout = String::from_utf8(inspect_text.stdout)?;
+    assert!(inspect_text_stdout.contains(&format!("session_id={session_id}")));
+    assert!(inspect_text_stdout.contains("worker_lane_scope=session"));
+    assert!(inspect_text_stdout.contains("lane_count=1"));
+    assert!(inspect_text_stdout.contains("diff_count=1"));
+    assert!(inspect_text_stdout.contains("lane_0_kind=codex_cli"));
+    assert!(inspect_text_stdout.contains("lane_0_policy_decision=allow"));
+    assert!(inspect_text_stdout.contains("lane_0_terminal_state=succeeded"));
+    assert!(inspect_text_stdout.contains("lane_0_stdout_truncated=true"));
+    assert!(inspect_text_stdout.contains("lane_0_stdout_summary=0123"));
+    assert!(inspect_text_stdout.contains("diff_0_paths=README.md"));
+    assert!(inspect_text_stdout.contains("diff_0_git_diff_truncated=true"));
+    assert!(inspect_text_stdout.contains("projection_kind=worker_lane_diff_inspect_report"));
+
+    let inspect_json = Command::new(bin)
+        .args([
+            "session",
+            "worker",
+            "inspect",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task-id",
+            task_id,
+            "--payload-bytes",
+            "4",
+            "--json",
+        ])
+        .output()?;
+    assert!(inspect_json.status.success());
+    let inspect_json_stdout = String::from_utf8(inspect_json.stdout)?;
+    let json: Value = serde_json::from_str(&inspect_json_stdout)?;
+    assert_eq!(json["session_id"], session_id);
+    assert_eq!(json["task_id"], task_id);
+    assert_eq!(json["scope"], "task");
+    assert_eq!(json["lane_count"], 1);
+    assert_eq!(json["diff_count"], 1);
+    assert_eq!(json["projection_kind"], "worker_lane_diff_inspect_report");
+    assert_eq!(json["lanes"][0]["task_id"], task_id);
+    assert_eq!(json["lanes"][0]["policy"]["decision"], "allow");
+    assert_eq!(json["lanes"][0]["terminal_state"], "succeeded");
+    assert_eq!(json["lanes"][0]["observation"]["stdout"]["text"], "0123");
+    assert_eq!(json["lanes"][0]["observation"]["stdout"]["truncated"], true);
+    assert_eq!(json["diffs"][0]["paths"][0], "README.md");
+    assert_eq!(json["diffs"][0]["git_diff"]["truncated"], true);
+
+    let after_show = Command::new(bin)
+        .args([
+            "session",
+            "show",
+            session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(after_show.status.success());
+    let after_show_stdout = String::from_utf8(after_show.stdout)?;
+    assert_eq!(
+        value_for_key(&after_show_stdout, "event_count").expect("event_count output"),
+        before_event_count
+    );
+
+    Ok(())
+}
+
+#[test]
 fn cli_approves_and_commits_queued_task_scope() -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
         return Ok(());
