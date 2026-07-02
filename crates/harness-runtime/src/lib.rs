@@ -747,25 +747,25 @@ impl Runtime {
         }
 
         self.show_task(session_id, task_id)?;
-        let record = self
-            .event_store
-            .enqueue_task(session_id, task_id, max_retries)?;
-        self.event_store.append_event(NewEvent::task_enqueued(
-            session_id,
-            TaskQueuePayload::new(
-                task_id,
-                TASK_QUEUED_STATE,
-                record
-                    .last_reason
-                    .as_deref()
-                    .unwrap_or("task enqueued for worker execution"),
-            )
-            .with_retry_state(
-                record.retry_count,
-                record.max_retries,
-                record.stop_reason,
-            ),
-        )?)?;
+        self.event_store
+            .enqueue_task(session_id, task_id, max_retries, |record| {
+                NewEvent::task_enqueued(
+                    session_id,
+                    TaskQueuePayload::new(
+                        task_id,
+                        TASK_QUEUED_STATE,
+                        record
+                            .last_reason
+                            .as_deref()
+                            .unwrap_or("task enqueued for worker execution"),
+                    )
+                    .with_retry_state(
+                        record.retry_count,
+                        record.max_retries,
+                        record.stop_reason.clone(),
+                    ),
+                )
+            })?;
 
         self.show_task(session_id, task_id)
     }
@@ -813,23 +813,29 @@ impl Runtime {
                 lease_id,
                 lease_deadline_ms,
                 worker_lane_kind,
+                |record| {
+                    NewEvent::task_lease_acquired(
+                        record.session_id,
+                        task_lease_payload_from_record(record)?,
+                    )
+                },
             )?
         } else {
             self.event_store.lease_next_queued_task(
                 request.worker_id.trim(),
                 lease_id,
                 lease_deadline_ms,
+                |record| {
+                    NewEvent::task_lease_acquired(
+                        record.session_id,
+                        task_lease_payload_from_record(record)?,
+                    )
+                },
             )?
         };
         let Some(record) = record else {
             return Ok(None);
         };
-
-        self.event_store
-            .append_event(NewEvent::task_lease_acquired(
-                record.session_id,
-                task_lease_payload_from_record(&record)?,
-            )?)?;
 
         self.show_task(record.session_id, record.task_id).map(Some)
     }
@@ -859,26 +865,19 @@ impl Runtime {
             request.worker_id.trim(),
             now_ms,
             lease_deadline_ms,
+            |record| {
+                NewEvent::task_lease_renewed(
+                    record.session_id,
+                    task_lease_payload_from_record(record)?,
+                )
+            },
         )?;
-
-        self.event_store.append_event(NewEvent::task_lease_renewed(
-            record.session_id,
-            task_lease_payload_from_record(&record)?,
-        )?)?;
 
         self.show_task(record.session_id, task_id)
     }
 
     pub fn expire_task_leases(&mut self, now_ms: i64) -> HarnessResult<Vec<TaskProjection>> {
-        let expired = self.event_store.expire_due_task_leases(now_ms)?;
-        let mut projections = Vec::new();
-
-        for record in expired {
-            self.event_store.append_event(NewEvent::task_lease_expired(
-                record.queue.session_id,
-                expired_lease_payload_from_record(&record)?,
-            )?)?;
-
+        let expired = self.event_store.expire_due_task_leases(now_ms, |record| {
             let queue_event = if record.queue.status == TASK_RETRY_QUEUED_STATE {
                 NewEvent::task_retry_queued(
                     record.queue.session_id,
@@ -890,8 +889,18 @@ impl Runtime {
                     task_queue_payload_from_record(&record.queue)?,
                 )?
             };
-            self.event_store.append_event(queue_event)?;
 
+            Ok(vec![
+                NewEvent::task_lease_expired(
+                    record.queue.session_id,
+                    expired_lease_payload_from_record(record)?,
+                )?,
+                queue_event,
+            ])
+        })?;
+        let mut projections = Vec::new();
+
+        for record in expired {
             projections.push(self.show_task(record.queue.session_id, record.queue.task_id)?);
         }
 
@@ -939,21 +948,27 @@ impl Runtime {
             ));
         }
 
-        let record =
-            self.event_store
-                .transition_leased_task(task_id, lease_id, status, reason.trim())?;
-        let payload = task_lease_payload_from_record(&record)?;
-        let event = match status {
-            TASK_COMPLETED_STATE => NewEvent::task_lease_completed(record.session_id, payload)?,
-            TASK_FAILED_STATE => NewEvent::task_lease_failed(record.session_id, payload)?,
-            TASK_CANCELLED_STATE => NewEvent::task_lease_cancelled(record.session_id, payload)?,
-            other => {
-                return Err(HarnessError::new(format!(
-                    "unsupported task status: {other}"
-                )));
-            }
-        };
-        self.event_store.append_event(event)?;
+        let record = self.event_store.transition_leased_task(
+            task_id,
+            lease_id,
+            status,
+            reason.trim(),
+            |record| {
+                let payload = task_lease_payload_from_record(record)?;
+                match status {
+                    TASK_COMPLETED_STATE => {
+                        NewEvent::task_lease_completed(record.session_id, payload)
+                    }
+                    TASK_FAILED_STATE => NewEvent::task_lease_failed(record.session_id, payload),
+                    TASK_CANCELLED_STATE => {
+                        NewEvent::task_lease_cancelled(record.session_id, payload)
+                    }
+                    other => Err(HarnessError::new(format!(
+                        "unsupported task status: {other}"
+                    ))),
+                }
+            },
+        )?;
 
         self.show_task(record.session_id, task_id)
     }

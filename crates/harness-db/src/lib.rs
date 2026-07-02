@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use harness_core::{HarnessError, HarnessResult};
 use harness_events::{EventEnvelope, EventType, NewEvent};
-use postgres::{Client, NoTls};
+use postgres::{Client, NoTls, Transaction};
 use uuid::Uuid;
 
 pub const DATABASE_URL_ENV: &str = "HARNESS_DATABASE_URL";
@@ -62,58 +62,17 @@ impl PostgresEventStore {
 
     pub fn append_event(&self, event: NewEvent) -> HarnessResult<EventEnvelope> {
         let mut client = self.client()?;
-        let session_lock_key = event.session_id.to_string();
         let mut transaction = client
             .transaction()
             .map_err(|error| HarnessError::new(error.to_string()))?;
 
-        transaction
-            .execute(
-                "SELECT pg_advisory_xact_lock(hashtext($1::text)::bigint)",
-                &[&session_lock_key],
-            )
-            .map_err(|error| HarnessError::new(error.to_string()))?;
-
-        let row = transaction
-            .query_one(
-                "
-                INSERT INTO harness_runtime.event_log (
-                    event_id,
-                    session_id,
-                    sequence,
-                    event_type,
-                    schema_version,
-                    payload
-                )
-                VALUES (
-                    $1,
-                    $2,
-                    (
-                        SELECT COALESCE(MAX(sequence), 0) + 1
-                        FROM harness_runtime.event_log
-                        WHERE session_id = $2
-                    ),
-                    $3,
-                    $4,
-                    $5
-                )
-                RETURNING event_id, session_id, sequence, event_type, schema_version, payload
-                ",
-                &[
-                    &event.event_id,
-                    &event.session_id,
-                    &event.event_type.as_str(),
-                    &i32::from(event.schema_version),
-                    &event.payload,
-                ],
-            )
-            .map_err(|error| HarnessError::new(error.to_string()))?;
+        let event = append_event_in_transaction(&mut transaction, event)?;
 
         transaction
             .commit()
             .map_err(|error| HarnessError::new(error.to_string()))?;
 
-        event_from_row(row)
+        Ok(event)
     }
 
     pub fn events_for_session(&self, session_id: Uuid) -> HarnessResult<Vec<EventEnvelope>> {
@@ -133,14 +92,35 @@ impl PostgresEventStore {
         rows.into_iter().map(event_from_row).collect()
     }
 
+    pub fn task_queue_record(&self, task_id: Uuid) -> HarnessResult<Option<TaskQueueRecord>> {
+        let mut client = self.client()?;
+        let row = client
+            .query_opt(
+                "
+                SELECT session_id, task_id, status, worker_id, lease_id, lease_deadline_ms,
+                    last_reason, retry_count, max_retries, stop_reason
+                FROM harness_runtime.task_queue
+                WHERE task_id = $1
+                ",
+                &[&task_id],
+            )
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+
+        Ok(row.map(task_queue_record_from_row))
+    }
+
     pub fn enqueue_task(
         &self,
         session_id: Uuid,
         task_id: Uuid,
         max_retries: i32,
+        make_event: impl FnOnce(&TaskQueueRecord) -> HarnessResult<NewEvent>,
     ) -> HarnessResult<TaskQueueRecord> {
         let mut client = self.client()?;
-        let row = client
+        let mut transaction = client
+            .transaction()
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+        let row = transaction
             .query_one(
                 "
                 INSERT INTO harness_runtime.task_queue (
@@ -158,7 +138,14 @@ impl PostgresEventStore {
             )
             .map_err(|error| HarnessError::new(error.to_string()))?;
 
-        Ok(task_queue_record_from_row(row))
+        let record = task_queue_record_from_row(row);
+        append_event_in_transaction(&mut transaction, make_event(&record)?)?;
+
+        transaction
+            .commit()
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+
+        Ok(record)
     }
 
     pub fn lease_next_queued_task(
@@ -166,8 +153,15 @@ impl PostgresEventStore {
         worker_id: &str,
         lease_id: Uuid,
         lease_deadline_ms: i64,
+        make_event: impl FnOnce(&TaskQueueRecord) -> HarnessResult<NewEvent>,
     ) -> HarnessResult<Option<TaskQueueRecord>> {
-        self.lease_next_queued_task_matching(worker_id, lease_id, lease_deadline_ms, None)
+        self.lease_next_queued_task_matching(
+            worker_id,
+            lease_id,
+            lease_deadline_ms,
+            None,
+            make_event,
+        )
     }
 
     pub fn lease_next_queued_task_for_worker_lane(
@@ -176,12 +170,14 @@ impl PostgresEventStore {
         lease_id: Uuid,
         lease_deadline_ms: i64,
         worker_lane_kind: &str,
+        make_event: impl FnOnce(&TaskQueueRecord) -> HarnessResult<NewEvent>,
     ) -> HarnessResult<Option<TaskQueueRecord>> {
         self.lease_next_queued_task_matching(
             worker_id,
             lease_id,
             lease_deadline_ms,
             Some(worker_lane_kind),
+            make_event,
         )
     }
 
@@ -191,6 +187,7 @@ impl PostgresEventStore {
         lease_id: Uuid,
         lease_deadline_ms: i64,
         worker_lane_kind: Option<&str>,
+        make_event: impl FnOnce(&TaskQueueRecord) -> HarnessResult<NewEvent>,
     ) -> HarnessResult<Option<TaskQueueRecord>> {
         let mut client = self.client()?;
         let mut transaction = client
@@ -238,11 +235,16 @@ impl PostgresEventStore {
             )
             .map_err(|error| HarnessError::new(error.to_string()))?;
 
+        let record = row.map(task_queue_record_from_row);
+        if let Some(record) = &record {
+            append_event_in_transaction(&mut transaction, make_event(record)?)?;
+        }
+
         transaction
             .commit()
             .map_err(|error| HarnessError::new(error.to_string()))?;
 
-        Ok(row.map(task_queue_record_from_row))
+        Ok(record)
     }
 
     pub fn renew_task_lease(
@@ -252,9 +254,13 @@ impl PostgresEventStore {
         worker_id: &str,
         now_ms: i64,
         lease_deadline_ms: i64,
+        make_event: impl FnOnce(&TaskQueueRecord) -> HarnessResult<NewEvent>,
     ) -> HarnessResult<TaskQueueRecord> {
         let mut client = self.client()?;
-        let row = client
+        let mut transaction = client
+            .transaction()
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+        let row = transaction
             .query_opt(
                 "
                 UPDATE harness_runtime.task_queue
@@ -274,13 +280,22 @@ impl PostgresEventStore {
             )
             .map_err(|error| HarnessError::new(error.to_string()))?;
 
-        row.map(task_queue_record_from_row)
-            .ok_or_else(|| HarnessError::new("active task lease was not found"))
+        let record = row
+            .map(task_queue_record_from_row)
+            .ok_or_else(|| HarnessError::new("active task lease was not found"))?;
+        append_event_in_transaction(&mut transaction, make_event(&record)?)?;
+
+        transaction
+            .commit()
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+
+        Ok(record)
     }
 
     pub fn expire_due_task_leases(
         &self,
         now_ms: i64,
+        mut make_events: impl FnMut(&TaskLeaseExpirationRecord) -> HarnessResult<Vec<NewEvent>>,
     ) -> HarnessResult<Vec<TaskLeaseExpirationRecord>> {
         let mut client = self.client()?;
         let mut transaction = client
@@ -360,6 +375,12 @@ impl PostgresEventStore {
                 expired_worker_id,
                 expired_deadline_ms,
             });
+            let record = expired
+                .last()
+                .ok_or_else(|| HarnessError::new("expired task record was not recorded"))?;
+            for event in make_events(record)? {
+                append_event_in_transaction(&mut transaction, event)?;
+            }
         }
 
         transaction
@@ -375,9 +396,13 @@ impl PostgresEventStore {
         lease_id: Uuid,
         status: &str,
         reason: &str,
+        make_event: impl FnOnce(&TaskQueueRecord) -> HarnessResult<NewEvent>,
     ) -> HarnessResult<TaskQueueRecord> {
         let mut client = self.client()?;
-        let row = client
+        let mut transaction = client
+            .transaction()
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+        let row = transaction
             .query_opt(
                 "
                 UPDATE harness_runtime.task_queue
@@ -395,8 +420,16 @@ impl PostgresEventStore {
             )
             .map_err(|error| HarnessError::new(error.to_string()))?;
 
-        row.map(task_queue_record_from_row)
-            .ok_or_else(|| HarnessError::new("active task lease was not found"))
+        let record = row
+            .map(task_queue_record_from_row)
+            .ok_or_else(|| HarnessError::new("active task lease was not found"))?;
+        append_event_in_transaction(&mut transaction, make_event(&record)?)?;
+
+        transaction
+            .commit()
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+
+        Ok(record)
     }
 
     fn client(&self) -> HarnessResult<std::sync::MutexGuard<'_, Client>> {
@@ -413,6 +446,56 @@ pub fn baseline_summary() -> String {
         harness_core::PRODUCT_NAME,
         harness_events::eventlog_schema_version()
     )
+}
+
+fn append_event_in_transaction(
+    transaction: &mut Transaction<'_>,
+    event: NewEvent,
+) -> HarnessResult<EventEnvelope> {
+    let session_lock_key = event.session_id.to_string();
+    transaction
+        .execute(
+            "SELECT pg_advisory_xact_lock(hashtext($1::text)::bigint)",
+            &[&session_lock_key],
+        )
+        .map_err(|error| HarnessError::new(error.to_string()))?;
+
+    let row = transaction
+        .query_one(
+            "
+            INSERT INTO harness_runtime.event_log (
+                event_id,
+                session_id,
+                sequence,
+                event_type,
+                schema_version,
+                payload
+            )
+            VALUES (
+                $1,
+                $2,
+                (
+                    SELECT COALESCE(MAX(sequence), 0) + 1
+                    FROM harness_runtime.event_log
+                    WHERE session_id = $2
+                ),
+                $3,
+                $4,
+                $5
+            )
+            RETURNING event_id, session_id, sequence, event_type, schema_version, payload
+            ",
+            &[
+                &event.event_id,
+                &event.session_id,
+                &event.event_type.as_str(),
+                &i32::from(event.schema_version),
+                &event.payload,
+            ],
+        )
+        .map_err(|error| HarnessError::new(error.to_string()))?;
+
+    event_from_row(row)
 }
 
 fn event_from_row(row: postgres::Row) -> HarnessResult<EventEnvelope> {
