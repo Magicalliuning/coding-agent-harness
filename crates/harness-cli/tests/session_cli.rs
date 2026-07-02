@@ -595,6 +595,140 @@ fn cli_runs_next_queued_task_through_codex_worker() -> Result<(), Box<dyn std::e
 }
 
 #[test]
+fn cli_approves_and_commits_queued_task_scope() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+    let repo = fixture_repo()?;
+    let (script_name, script) = fake_success_runner_script();
+    write_file(&repo, "AGENTS.md", "Use deterministic agent fixtures.")?;
+    write_file(&repo, "README.md", "fixture repository\n")?;
+    write_file(&repo, script_name, script)?;
+    init_git_repo(&repo)?;
+
+    let migrate = Command::new(bin)
+        .args(["migrate", "--database-url", &database_url])
+        .output()?;
+    assert!(migrate.status.success());
+
+    let repo_path = repo.display().to_string();
+    let start = Command::new(bin)
+        .args([
+            "session",
+            "start",
+            "--repo",
+            &repo_path,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(start.status.success());
+
+    let start_stdout = String::from_utf8(start.stdout)?;
+    let session_id = value_for_key(&start_stdout, "session_id").expect("session_id output");
+
+    let create = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "create",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task",
+            "write the queued approval CLI worker task",
+        ])
+        .output()?;
+    assert!(create.status.success());
+
+    let create_stdout = String::from_utf8(create.stdout)?;
+    let task_id = value_for_key(&create_stdout, "task_id").expect("task id output");
+
+    let enqueue = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "enqueue",
+            session_id,
+            task_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(enqueue.status.success());
+
+    let mut run_args = vec![
+        "session".to_owned(),
+        "task".to_owned(),
+        "run-next-codex-worker".to_owned(),
+        "--database-url".to_owned(),
+        database_url.clone(),
+        "--worker-id".to_owned(),
+        "cli-task-approval-worker".to_owned(),
+        "--max-stdout-bytes".to_owned(),
+        "4".to_owned(),
+        "--".to_owned(),
+    ];
+    run_args.extend(fake_runner_cli_command(script_name));
+    let run = Command::new(bin).args(run_args).output()?;
+    assert!(run.status.success());
+    let run_stdout = String::from_utf8(run.stdout)?;
+    assert!(run_stdout.contains("task_status=pending_commit_approval"));
+
+    let session_approve = Command::new(bin)
+        .args([
+            "session",
+            "approval",
+            "approve",
+            session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(!session_approve.status.success());
+    assert!(String::from_utf8(session_approve.stderr)?.contains("pending diff was not recorded"));
+
+    let approve = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "approve",
+            session_id,
+            task_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(approve.status.success());
+    let approve_stdout = String::from_utf8(approve.stdout)?;
+    assert!(approve_stdout.contains("task_status=approved"));
+    assert!(approve_stdout.contains("task_approval_state=approved"));
+
+    let commit = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "commit",
+            session_id,
+            task_id,
+            "--database-url",
+            &database_url,
+            "--message",
+            "Commit queued task from CLI",
+        ])
+        .output()?;
+    assert!(commit.status.success());
+    let commit_stdout = String::from_utf8(commit.stdout)?;
+    assert!(commit_stdout.contains("task_status=committed"));
+    assert!(commit_stdout.contains("task_commit_state=committed"));
+    assert!(commit_stdout.contains("task_commit_sha="));
+
+    Ok(())
+}
+
+#[test]
 fn cli_codex_acceptance_reports_explicit_skip_when_unavailable()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {

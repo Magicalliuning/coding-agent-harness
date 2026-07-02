@@ -14,15 +14,15 @@ use harness_events::{
 };
 use harness_policy::PolicyDecision;
 use harness_runtime::{
-    COMMIT_APPROVED_STATE, COMMITTED_STATE, CodexCliAvailabilityRequest, CodexWorkerLaneBudget,
-    CodexWorkerLaneFixture, CodexWorkerLaneRequest, CodexWorkerLaneWorkspace,
-    CodexWorkerSubprocess, CodexWorkerUsage, ContextBudget, CreateTaskRequest,
-    DEFAULT_TASK_WORKER_LANE_KIND, FakeModelTurnRequest, HeartbeatTaskLeaseRequest,
-    LeaseNextTaskRequest, LeasedCodexWorkerTaskRequest, PENDING_COMMIT_APPROVAL_STATE,
-    RECOVERY_FAILED_STATE, RecoveryStopReason, Runtime, SelfRecoveryLoopRequest,
-    SessionContextCompileRequest, SessionStatus, SmallCodingTaskRequest, StartSessionRequest,
-    TASK_CANCELLED_STATE, TASK_COMPLETED_STATE, TASK_FAILED_STATE, TASK_LEASED_STATE,
-    TASK_QUEUED_STATE, TASK_RETRY_QUEUED_STATE, TASK_STOP_REASON_LEASE_EXPIRED,
+    COMMIT_APPROVED_STATE, COMMIT_FAILED_STATE, COMMIT_REJECTED_STATE, COMMITTED_STATE,
+    CodexCliAvailabilityRequest, CodexWorkerLaneBudget, CodexWorkerLaneFixture,
+    CodexWorkerLaneRequest, CodexWorkerLaneWorkspace, CodexWorkerSubprocess, CodexWorkerUsage,
+    ContextBudget, CreateTaskRequest, DEFAULT_TASK_WORKER_LANE_KIND, FakeModelTurnRequest,
+    HeartbeatTaskLeaseRequest, LeaseNextTaskRequest, LeasedCodexWorkerTaskRequest,
+    PENDING_COMMIT_APPROVAL_STATE, RECOVERY_FAILED_STATE, RecoveryStopReason, Runtime,
+    SelfRecoveryLoopRequest, SessionContextCompileRequest, SessionStatus, SmallCodingTaskRequest,
+    StartSessionRequest, TASK_CANCELLED_STATE, TASK_COMPLETED_STATE, TASK_FAILED_STATE,
+    TASK_LEASED_STATE, TASK_QUEUED_STATE, TASK_RETRY_QUEUED_STATE, TASK_STOP_REASON_LEASE_EXPIRED,
     TASK_STOP_REASON_MAX_RETRIES_EXCEEDED, TASK_STOPPED_STATE, UsageConfidence,
     VerificationCommandRequest, WorkerLaneStatus, detect_codex_cli_availability,
 };
@@ -1394,6 +1394,209 @@ fn leased_codex_worker_uses_task_repo_lane_and_budget() -> Result<(), Box<dyn st
             .paths
             .contains(&"README.md".to_owned())
     );
+
+    Ok(())
+}
+
+#[test]
+fn task_scoped_approval_and_commit_handoff_replay() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let (script_name, script) = fake_success_runner_script();
+    let repo = git_fixture_repo_with_files(&[(script_name, script)])?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo.display().to_string()))?;
+    let task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "write the task-scoped approval commit task",
+    )?;
+    let result = runtime
+        .run_next_leased_codex_worker_task(LeasedCodexWorkerTaskRequest::new(
+            "task-approval-worker",
+            CodexWorkerLaneRequest::new_subprocess("placeholder", fake_runner_command(script_name)),
+        ))?
+        .expect("queued task should run");
+    let worktree = result
+        .task
+        .worktree
+        .as_ref()
+        .expect("task worktree")
+        .worktree_path
+        .clone();
+    let worktree = PathBuf::from(worktree);
+    let commit_count_before = git_commit_count(&worktree)?;
+
+    let session_approval_error = runtime
+        .approve_pending_diff(started.session_id)
+        .expect_err("session approval should ignore task-scoped pending approvals");
+    assert!(
+        session_approval_error
+            .to_string()
+            .contains("pending diff was not recorded")
+    );
+    assert_eq!(
+        runtime.show_task(started.session_id, task_id)?.status,
+        PENDING_COMMIT_APPROVAL_STATE
+    );
+
+    let approved = runtime.approve_task_pending_diff(started.session_id, task_id)?;
+    assert_eq!(approved.status, COMMIT_APPROVED_STATE);
+    assert_eq!(
+        approved.approval.as_ref().expect("approval slot").state,
+        COMMIT_APPROVED_STATE
+    );
+
+    let committed = runtime.commit_approved_task_diff(
+        started.session_id,
+        task_id,
+        "Commit queued task diff",
+    )?;
+    let events = runtime.events_for_session(started.session_id)?;
+
+    assert_eq!(committed.status, COMMITTED_STATE);
+    assert_eq!(
+        committed.commit.as_ref().expect("commit slot").state,
+        COMMITTED_STATE
+    );
+    assert!(
+        committed
+            .commit
+            .as_ref()
+            .expect("commit slot")
+            .commit_sha
+            .as_deref()
+            .is_some_and(|sha| sha.len() == 40)
+    );
+    assert_eq!(git_commit_count(&worktree)?, commit_count_before + 1);
+    assert_eq!(git_text(&worktree, &["status", "--short"])?, "");
+    assert!(events.iter().any(|event| {
+        event.event_type == EventType::CommitApproved
+            && event.payload["task_id"] == task_id.to_string()
+    }));
+    assert!(events.iter().any(|event| {
+        event.event_type == EventType::CommitStarted
+            && event.payload["task_id"] == task_id.to_string()
+    }));
+    assert!(events.iter().any(|event| {
+        event.event_type == EventType::CommitSucceeded
+            && event.payload["task_id"] == task_id.to_string()
+    }));
+    assert!(!events.iter().any(|event| {
+        matches!(
+            event.event_type,
+            EventType::CommitApproved | EventType::CommitStarted | EventType::CommitSucceeded
+        ) && event.payload.get("task_id").is_none()
+    }));
+
+    Ok(())
+}
+
+#[test]
+fn task_scoped_rejection_and_commit_failure_replay() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let (script_name, script) = fake_success_runner_script();
+    let reject_repo = git_fixture_repo_with_files(&[(script_name, script)])?;
+    let fail_repo = git_fixture_repo_with_files(&[(script_name, script)])?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let reject_session =
+        runtime.start_session(StartSessionRequest::new(reject_repo.display().to_string()))?;
+    let reject_task_id = create_and_enqueue_task(
+        &mut runtime,
+        reject_session.session_id,
+        "write the rejected task-scoped approval task",
+    )?;
+    runtime
+        .run_next_leased_codex_worker_task(LeasedCodexWorkerTaskRequest::new(
+            "task-reject-worker",
+            CodexWorkerLaneRequest::new_subprocess("placeholder", fake_runner_command(script_name)),
+        ))?
+        .expect("reject task should run");
+
+    let rejected = runtime.reject_task_pending_diff(
+        reject_session.session_id,
+        reject_task_id,
+        "not safe for commit",
+    )?;
+    let rejected_commit = runtime
+        .commit_approved_task_diff(
+            reject_session.session_id,
+            reject_task_id,
+            "Should not commit",
+        )
+        .expect_err("rejected task should not commit");
+    assert_eq!(rejected.status, COMMIT_REJECTED_STATE);
+    assert_eq!(
+        rejected
+            .approval
+            .as_ref()
+            .expect("approval slot")
+            .rejection_reason
+            .as_deref(),
+        Some("not safe for commit")
+    );
+    assert!(
+        rejected_commit
+            .to_string()
+            .contains("current state is rejected")
+    );
+
+    let fail_session =
+        runtime.start_session(StartSessionRequest::new(fail_repo.display().to_string()))?;
+    let fail_task_id = create_and_enqueue_task(
+        &mut runtime,
+        fail_session.session_id,
+        "write the failed task-scoped commit task",
+    )?;
+    let failed_run = runtime
+        .run_next_leased_codex_worker_task(LeasedCodexWorkerTaskRequest::new(
+            "task-fail-worker",
+            CodexWorkerLaneRequest::new_subprocess("placeholder", fake_runner_command(script_name)),
+        ))?
+        .expect("failed commit task should run");
+    let fail_worktree = PathBuf::from(
+        failed_run
+            .task
+            .worktree
+            .as_ref()
+            .expect("task worktree")
+            .worktree_path
+            .clone(),
+    );
+    run_git(&fail_worktree, &["checkout", "--", "README.md"])?;
+    runtime.approve_task_pending_diff(fail_session.session_id, fail_task_id)?;
+
+    let failed =
+        runtime.commit_approved_task_diff(fail_session.session_id, fail_task_id, "Commit fails")?;
+    let events = runtime.events_for_session(fail_session.session_id)?;
+
+    assert_eq!(failed.status, COMMIT_FAILED_STATE);
+    assert_eq!(
+        failed.commit.as_ref().expect("commit slot").state,
+        COMMIT_FAILED_STATE
+    );
+    assert!(
+        failed
+            .commit
+            .as_ref()
+            .expect("commit slot")
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("approved diff has no local changes"))
+    );
+    assert!(events.iter().any(|event| {
+        event.event_type == EventType::CommitFailed
+            && event.payload["task_id"] == fail_task_id.to_string()
+    }));
 
     Ok(())
 }

@@ -241,6 +241,29 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
 
                     Ok(())
                 }
+                "approve" => {
+                    let session_id = session_id_arg(&args, 2)?;
+                    let task_id = task_id_arg(&args, 3)?;
+                    let task = runtime.approve_task_pending_diff(session_id, task_id)?;
+                    print_task_projection(&task);
+                    Ok(())
+                }
+                "reject" => {
+                    let session_id = session_id_arg(&args, 2)?;
+                    let task_id = task_id_arg(&args, 3)?;
+                    let reason = required_arg_value(&args, "--reason")?;
+                    let task = runtime.reject_task_pending_diff(session_id, task_id, reason)?;
+                    print_task_projection(&task);
+                    Ok(())
+                }
+                "commit" => {
+                    let session_id = session_id_arg(&args, 2)?;
+                    let task_id = task_id_arg(&args, 3)?;
+                    let message = required_arg_value(&args, "--message")?;
+                    let task = runtime.commit_approved_task_diff(session_id, task_id, message)?;
+                    print_task_projection(&task);
+                    Ok(())
+                }
                 "complete" => {
                     let task_id = task_id_arg(&args, 2)?;
                     let lease_id = lease_id_arg(&args)?;
