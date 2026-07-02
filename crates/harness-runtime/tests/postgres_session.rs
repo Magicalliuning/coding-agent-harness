@@ -28,7 +28,7 @@ use harness_runtime::{
     TASK_COMPLETED_STATE, TASK_FAILED_STATE, TASK_LEASED_STATE, TASK_QUEUED_STATE,
     TASK_RETRY_QUEUED_STATE, TASK_STOP_REASON_LEASE_EXPIRED, TASK_STOP_REASON_MAX_RETRIES_EXCEEDED,
     TASK_STOPPED_STATE, TaskQueueInspectRequest, UsageConfidence, VerificationCommandRequest,
-    WorkerLaneStatus, detect_codex_cli_availability,
+    WorkerLaneDiffInspectRequest, WorkerLaneStatus, detect_codex_cli_availability,
 };
 use uuid::Uuid;
 
@@ -3480,6 +3480,182 @@ fn codex_worker_lane_runs_fake_subprocess_and_records_diff_pending_approval()
     assert_eq!(
         events.last().expect("last event").event_type,
         EventType::CommitApprovalPending
+    );
+
+    Ok(())
+}
+
+#[test]
+fn worker_lane_diff_inspect_report_captures_success_diff_and_is_read_only()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let (script_name, script) = fake_success_runner_script();
+    let repo = git_fixture_repo_with_files(&[(script_name, script)])?;
+    let repo_path = repo.display().to_string();
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo_path.clone()))?;
+    let task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "write worker lane diff inspect evidence",
+    )?;
+
+    let mut worker =
+        CodexWorkerLaneRequest::new_subprocess("placeholder", fake_runner_command(script_name));
+    worker.budget.max_stdout_bytes = 4;
+    runtime
+        .run_next_leased_codex_worker_task(LeasedCodexWorkerTaskRequest::new(
+            "worker-lane-inspect-worker",
+            worker,
+        ))?
+        .expect("queued task should run");
+
+    let store = PostgresEventStore::connect(&database_url)?;
+    let events_before = runtime.events_for_session(started.session_id)?;
+    let task_before = runtime.show_task(started.session_id, task_id)?;
+    let queue_before = store.task_queue_records(Some(started.session_id))?;
+    let report = runtime.inspect_worker_lane_diff(
+        WorkerLaneDiffInspectRequest::new(started.session_id)
+            .with_task_id(task_id)
+            .with_payload_limit_bytes(32),
+    )?;
+
+    assert_eq!(report.scope, "task");
+    assert_eq!(report.task_id, Some(task_id));
+    assert_eq!(report.event_count, events_before.len());
+    assert_eq!(report.lane_count, 1);
+    assert_eq!(report.diff_count, 1);
+    assert_eq!(report.source_of_truth, "EventLog");
+    assert_eq!(report.projection_kind, "worker_lane_diff_inspect_report");
+
+    let lane = &report.lanes[0];
+    assert_eq!(lane.task_id, Some(task_id));
+    assert_eq!(lane.lane_kind, "codex_cli");
+    assert_eq!(lane.request_status.as_deref(), Some("requested"));
+    assert_eq!(
+        lane.policy.as_ref().map(|policy| policy.decision.as_str()),
+        Some("allow")
+    );
+    assert_eq!(lane.current_state.as_deref(), Some("succeeded"));
+    assert!(lane.is_terminal);
+    assert_eq!(lane.terminal_state.as_deref(), Some("succeeded"));
+    assert_eq!(
+        lane.workspace.session_repo_path.as_deref(),
+        Some(repo_path.as_str())
+    );
+    assert_eq!(
+        lane.workspace.task_repo_path.as_deref(),
+        Some(repo_path.as_str())
+    );
+    assert!(lane.workspace.allocated_worktree_path.is_some());
+    let observation = lane.observation.as_ref().expect("worker observation");
+    assert_eq!(observation.status, "succeeded");
+    assert_eq!(observation.exit_code, Some(0));
+    assert_eq!(observation.stdout.text, "0123");
+    assert_eq!(observation.stderr.text, "abcd");
+    assert_eq!(observation.usage_confidence, "unknown");
+
+    let diff = &report.diffs[0];
+    assert_eq!(diff.task_id, Some(task_id));
+    assert_eq!(diff.files_changed, 1);
+    assert_eq!(diff.paths, vec!["README.md".to_owned()]);
+    assert_eq!(lane.workspace.diff_repo_path, diff.repo_path);
+    assert!(diff.git_status.text.contains("README.md"));
+    assert!(diff.git_diff.truncated);
+    assert!(diff.git_diff.text.len() <= 32);
+
+    let events_after = runtime.events_for_session(started.session_id)?;
+    let task_after = runtime.show_task(started.session_id, task_id)?;
+    let queue_after = store.task_queue_records(Some(started.session_id))?;
+    assert_eq!(events_after.len(), events_before.len());
+    assert_eq!(task_after, task_before);
+    assert_eq!(queue_after, queue_before);
+
+    Ok(())
+}
+
+#[test]
+fn worker_lane_diff_inspect_report_captures_failure_timeout_and_cancellation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let (failure_script_name, failure_script) = fake_failure_runner_script();
+    let (timeout_script_name, timeout_script) = fake_timeout_runner_script();
+    let repo = git_fixture_repo_with_files(&[
+        (failure_script_name, failure_script),
+        (timeout_script_name, timeout_script),
+    ])?;
+    let repo_path = repo.display().to_string();
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo_path))?;
+
+    runtime.run_codex_worker_lane(
+        started.session_id,
+        CodexWorkerLaneRequest::new_subprocess(
+            "failing inspect task",
+            fake_runner_command(failure_script_name),
+        ),
+    )?;
+
+    let mut timeout_request = CodexWorkerLaneRequest::new_subprocess(
+        "timeout inspect task",
+        fake_runner_command(timeout_script_name),
+    );
+    timeout_request.timeout_ms = 20;
+    runtime.run_codex_worker_lane(started.session_id, timeout_request)?;
+
+    let mut cancelled_request = CodexWorkerLaneRequest::new_subprocess(
+        "cancelled inspect task",
+        CodexWorkerSubprocess::new("missing-runner-should-not-start", Vec::new()),
+    );
+    cancelled_request.cancellation_requested = true;
+    runtime.run_codex_worker_lane(started.session_id, cancelled_request)?;
+
+    let report = runtime.inspect_worker_lane_diff(
+        WorkerLaneDiffInspectRequest::new(started.session_id).with_payload_limit_bytes(128),
+    )?;
+
+    assert_eq!(report.lane_count, 3);
+    assert_eq!(report.diff_count, 0);
+    let statuses = report
+        .lanes
+        .iter()
+        .map(|lane| lane.terminal_state.as_deref().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert!(statuses.contains(&"failed"));
+    assert!(statuses.contains(&"timed_out"));
+    assert!(statuses.contains(&"cancelled"));
+    assert!(report.lanes.iter().any(|lane| {
+        lane.failure_reason.is_some()
+            && lane
+                .observation
+                .as_ref()
+                .is_some_and(|observation| observation.exit_code == Some(7))
+    }));
+    assert!(report.lanes.iter().any(|lane| {
+        lane.timeout_reason.is_some()
+            && lane
+                .observation
+                .as_ref()
+                .is_some_and(|observation| observation.status == "timed_out")
+    }));
+    assert!(
+        report
+            .lanes
+            .iter()
+            .any(|lane| lane.cancellation_reason.is_some()
+                && lane.observation.as_ref().is_some_and(|observation| {
+                    observation.stderr.text.contains("cancelled before start")
+                }))
     );
 
     Ok(())

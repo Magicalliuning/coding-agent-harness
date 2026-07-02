@@ -19,6 +19,7 @@ use harness_runtime::{
     SessionProjection, SmallCodingTaskRequest, SmallCodingTaskResult, StartSessionRequest,
     TaskInspectReport, TaskProjection, TaskQueueInspectReport, TaskQueueInspectRequest,
     TaskQueueInspectStatusCount, VerificationCommandRequest, VerificationCommandResult,
+    WorkerLaneDiffInspectReport, WorkerLaneDiffInspectRequest,
 };
 use uuid::Uuid;
 
@@ -167,6 +168,45 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
                 print_event_timeline_json(&report)?;
             } else {
                 print_event_timeline_report(&report);
+            }
+
+            Ok(())
+        }
+        "worker" => {
+            let action = args
+                .get(1)
+                .ok_or_else(|| HarnessError::new("worker action is required"))?;
+            if action != "inspect" {
+                return Err(HarnessError::new(format!(
+                    "unknown worker action: {action}; usage: harness-cli session worker inspect <session_id> [--task-id <task_id>] [--payload-bytes <bytes>] [--json]"
+                )));
+            }
+
+            let session_id = session_id_arg(&args, 2)?;
+            let task_id = optional_arg_value(&args, "--task-id")
+                .map(|task_id| {
+                    Uuid::parse_str(task_id).map_err(|error| {
+                        HarnessError::new(format!("task id must be a UUID: {error}"))
+                    })
+                })
+                .transpose()?;
+            let payload_limit_bytes = optional_arg_value(&args, "--payload-bytes")
+                .map(|value| parse_usize_arg("--payload-bytes", value))
+                .transpose()?
+                .unwrap_or(DEFAULT_TIMELINE_PAYLOAD_LIMIT_BYTES);
+            let database_url = database_url_from_args(args.clone())?;
+            let runtime = Runtime::connect_postgres(&database_url)?;
+            let mut request = WorkerLaneDiffInspectRequest::new(session_id)
+                .with_payload_limit_bytes(payload_limit_bytes);
+            if let Some(task_id) = task_id {
+                request = request.with_task_id(task_id);
+            }
+            let report = runtime.inspect_worker_lane_diff(request)?;
+
+            if has_flag(&args, "--json") {
+                print_worker_lane_diff_inspect_json(&report)?;
+            } else {
+                print_worker_lane_diff_inspect_report(&report);
             }
 
             Ok(())
@@ -1007,6 +1047,267 @@ fn print_storage_projection(index: usize, projection: &RuntimeStorageProjectionR
     println!("projection_{index}_name={}", projection.name);
     println!("projection_{index}_source={}", projection.source);
     println!("projection_{index}_summary={}", projection.summary);
+}
+
+fn print_worker_lane_diff_inspect_report(report: &WorkerLaneDiffInspectReport) {
+    println!("session_id={}", report.session_id);
+    println!(
+        "task_id={}",
+        report
+            .task_id
+            .map_or_else(String::new, |task_id| task_id.to_string())
+    );
+    println!("worker_lane_scope={}", report.scope);
+    println!("lane_count={}", report.lane_count);
+    println!("diff_count={}", report.diff_count);
+    println!("event_count={}", report.event_count);
+    println!("payload_limit_bytes={}", report.payload_limit_bytes);
+    println!("source_of_truth={}", report.source_of_truth);
+    println!("projection_kind={}", report.projection_kind);
+
+    for (index, lane) in report.lanes.iter().enumerate() {
+        println!(
+            "lane_{index}_task_id={}",
+            lane.task_id
+                .map_or_else(String::new, |task_id| task_id.to_string())
+        );
+        println!("lane_{index}_id={}", lane.lane_id);
+        println!("lane_{index}_kind={}", lane.lane_kind);
+        println!(
+            "lane_{index}_request_status={}",
+            lane.request_status.as_deref().unwrap_or_default()
+        );
+        println!(
+            "lane_{index}_policy_tool={}",
+            lane.policy
+                .as_ref()
+                .map(|policy| policy.tool_name.as_str())
+                .unwrap_or_default()
+        );
+        println!(
+            "lane_{index}_policy_decision={}",
+            lane.policy
+                .as_ref()
+                .map(|policy| policy.decision.as_str())
+                .unwrap_or_default()
+        );
+        println!(
+            "lane_{index}_policy_reason={}",
+            lane.policy
+                .as_ref()
+                .map(|policy| policy.reason.as_str())
+                .unwrap_or_default()
+        );
+        println!(
+            "lane_{index}_current_state={}",
+            lane.current_state.as_deref().unwrap_or_default()
+        );
+        println!("lane_{index}_running={}", lane.is_running);
+        println!("lane_{index}_terminal={}", lane.is_terminal);
+        println!(
+            "lane_{index}_terminal_state={}",
+            lane.terminal_state.as_deref().unwrap_or_default()
+        );
+        println!(
+            "lane_{index}_terminal_reason={}",
+            lane.terminal_reason.as_deref().unwrap_or_default()
+        );
+        println!(
+            "lane_{index}_failure_reason={}",
+            lane.failure_reason.as_deref().unwrap_or_default()
+        );
+        println!(
+            "lane_{index}_timeout_reason={}",
+            lane.timeout_reason.as_deref().unwrap_or_default()
+        );
+        println!(
+            "lane_{index}_cancellation_reason={}",
+            lane.cancellation_reason.as_deref().unwrap_or_default()
+        );
+        println!(
+            "lane_{index}_requested_workspace_path={}",
+            lane.workspace
+                .requested_workspace_path
+                .as_deref()
+                .unwrap_or_default()
+        );
+        println!(
+            "lane_{index}_requested_worktree_path={}",
+            lane.workspace
+                .requested_worktree_path
+                .as_deref()
+                .unwrap_or_default()
+        );
+        println!(
+            "lane_{index}_allocated_worktree_path={}",
+            lane.workspace
+                .allocated_worktree_path
+                .as_deref()
+                .unwrap_or_default()
+        );
+        println!(
+            "lane_{index}_session_repo_path={}",
+            lane.workspace
+                .session_repo_path
+                .as_deref()
+                .unwrap_or_default()
+        );
+        println!(
+            "lane_{index}_task_repo_path={}",
+            lane.workspace.task_repo_path.as_deref().unwrap_or_default()
+        );
+        println!(
+            "lane_{index}_diff_repo_path={}",
+            lane.workspace.diff_repo_path.as_deref().unwrap_or_default()
+        );
+        println!(
+            "lane_{index}_base_ref={}",
+            lane.workspace.base_ref.as_deref().unwrap_or_default()
+        );
+        println!("lane_{index}_state_count={}", lane.states.len());
+
+        if let Some(request) = &lane.request {
+            println!("lane_{index}_request_timeout_ms={}", request.timeout_ms);
+            println!(
+                "lane_{index}_request_cancellation_requested={}",
+                request.cancellation_requested
+            );
+            println!(
+                "lane_{index}_request_workspace_path={}",
+                request.workspace_path
+            );
+            println!(
+                "lane_{index}_request_worktree_path={}",
+                request.worktree_path.as_deref().unwrap_or_default()
+            );
+            println!(
+                "lane_{index}_request_task_original_bytes={}",
+                request.task.original_bytes
+            );
+            println!(
+                "lane_{index}_request_task_truncated={}",
+                request.task.truncated
+            );
+            println!("lane_{index}_request_task_summary={}", request.task.text);
+            println!(
+                "lane_{index}_budget_max_prompt_tokens={}",
+                request.budget.max_prompt_tokens
+            );
+            println!(
+                "lane_{index}_budget_max_output_tokens={}",
+                request.budget.max_output_tokens
+            );
+            println!(
+                "lane_{index}_budget_max_stdout_bytes={}",
+                request.budget.max_stdout_bytes
+            );
+            println!(
+                "lane_{index}_request_event_sequence={}",
+                request.event_sequence
+            );
+        }
+
+        if let Some(observation) = &lane.observation {
+            println!("lane_{index}_observation_status={}", observation.status);
+            println!(
+                "lane_{index}_observation_exit_code={}",
+                observation
+                    .exit_code
+                    .map_or_else(String::new, |exit_code| exit_code.to_string())
+            );
+            println!(
+                "lane_{index}_observation_duration_ms={}",
+                observation.duration_ms
+            );
+            println!(
+                "lane_{index}_observation_prompt_tokens={}",
+                observation
+                    .prompt_tokens
+                    .map_or_else(String::new, |tokens| tokens.to_string())
+            );
+            println!(
+                "lane_{index}_observation_completion_tokens={}",
+                observation
+                    .completion_tokens
+                    .map_or_else(String::new, |tokens| tokens.to_string())
+            );
+            println!(
+                "lane_{index}_observation_usage_confidence={}",
+                observation.usage_confidence
+            );
+            println!(
+                "lane_{index}_observation_skipped_or_unavailable_reason={}",
+                observation
+                    .skipped_or_unavailable_reason
+                    .as_deref()
+                    .unwrap_or_default()
+            );
+            println!(
+                "lane_{index}_stdout_original_bytes={}",
+                observation.stdout.original_bytes
+            );
+            println!(
+                "lane_{index}_stdout_truncated={}",
+                observation.stdout.truncated
+            );
+            println!("lane_{index}_stdout_summary={}", observation.stdout.text);
+            println!(
+                "lane_{index}_stderr_original_bytes={}",
+                observation.stderr.original_bytes
+            );
+            println!(
+                "lane_{index}_stderr_truncated={}",
+                observation.stderr.truncated
+            );
+            println!("lane_{index}_stderr_summary={}", observation.stderr.text);
+            println!(
+                "lane_{index}_observation_event_sequence={}",
+                observation.event_sequence
+            );
+        }
+    }
+
+    for (index, diff) in report.diffs.iter().enumerate() {
+        println!(
+            "diff_{index}_task_id={}",
+            diff.task_id
+                .map_or_else(String::new, |task_id| task_id.to_string())
+        );
+        println!(
+            "diff_{index}_repo_path={}",
+            diff.repo_path.as_deref().unwrap_or_default()
+        );
+        println!("diff_{index}_files_changed={}", diff.files_changed);
+        println!("diff_{index}_insertions={}", diff.insertions);
+        println!("diff_{index}_deletions={}", diff.deletions);
+        println!("diff_{index}_paths={}", diff.paths.join(","));
+        println!(
+            "diff_{index}_git_status_original_bytes={}",
+            diff.git_status.original_bytes
+        );
+        println!(
+            "diff_{index}_git_status_truncated={}",
+            diff.git_status.truncated
+        );
+        println!("diff_{index}_git_status_summary={}", diff.git_status.text);
+        println!(
+            "diff_{index}_git_diff_original_bytes={}",
+            diff.git_diff.original_bytes
+        );
+        println!(
+            "diff_{index}_git_diff_truncated={}",
+            diff.git_diff.truncated
+        );
+        println!("diff_{index}_git_diff_summary={}", diff.git_diff.text);
+        println!("diff_{index}_event_sequence={}", diff.event_sequence);
+    }
+}
+
+fn print_worker_lane_diff_inspect_json(report: &WorkerLaneDiffInspectReport) -> HarnessResult<()> {
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|error| HarnessError::new(error.to_string()))?;
+    println!("{json}");
+    Ok(())
 }
 
 fn print_approval_commit_inspect_report(report: &ApprovalCommitInspectReport) {

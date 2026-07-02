@@ -728,6 +728,144 @@ pub struct ApprovalCommitInspectReport {
     pub projection_kind: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerLaneDiffInspectRequest {
+    pub session_id: Uuid,
+    pub task_id: Option<Uuid>,
+    pub payload_limit_bytes: usize,
+}
+
+impl WorkerLaneDiffInspectRequest {
+    #[must_use]
+    pub const fn new(session_id: Uuid) -> Self {
+        Self {
+            session_id,
+            task_id: None,
+            payload_limit_bytes: DEFAULT_TIMELINE_PAYLOAD_LIMIT_BYTES,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_task_id(mut self, task_id: Uuid) -> Self {
+        self.task_id = Some(task_id);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_payload_limit_bytes(mut self, payload_limit_bytes: usize) -> Self {
+        self.payload_limit_bytes = payload_limit_bytes;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkerLaneBudgetInspect {
+    pub max_prompt_tokens: usize,
+    pub max_output_tokens: usize,
+    pub max_stdout_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkerLaneRequestInspectEntry {
+    pub task: BoundedPayloadSummary,
+    pub workspace_path: String,
+    pub worktree_path: Option<String>,
+    pub timeout_ms: u64,
+    pub cancellation_requested: bool,
+    pub budget: WorkerLaneBudgetInspect,
+    pub event_sequence: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkerLanePolicyInspectEntry {
+    pub tool_name: String,
+    pub decision: String,
+    pub reason: String,
+    pub event_sequence: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkerLaneStateInspectEntry {
+    pub from_state: Option<String>,
+    pub to_state: String,
+    pub reason: String,
+    pub event_sequence: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkerLaneWorkspaceInspectEntry {
+    pub requested_workspace_path: Option<String>,
+    pub requested_worktree_path: Option<String>,
+    pub allocated_worktree_path: Option<String>,
+    pub session_repo_path: Option<String>,
+    pub task_repo_path: Option<String>,
+    pub diff_repo_path: Option<String>,
+    pub base_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkerLaneObservationInspectEntry {
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub stdout: BoundedPayloadSummary,
+    pub stderr: BoundedPayloadSummary,
+    pub duration_ms: u64,
+    pub prompt_tokens: Option<usize>,
+    pub completion_tokens: Option<usize>,
+    pub usage_confidence: String,
+    pub skipped_or_unavailable_reason: Option<String>,
+    pub event_sequence: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkerLaneInspectEntry {
+    pub task_id: Option<Uuid>,
+    pub lane_id: String,
+    pub lane_kind: String,
+    pub request_status: Option<String>,
+    pub request: Option<WorkerLaneRequestInspectEntry>,
+    pub policy: Option<WorkerLanePolicyInspectEntry>,
+    pub states: Vec<WorkerLaneStateInspectEntry>,
+    pub current_state: Option<String>,
+    pub is_running: bool,
+    pub is_terminal: bool,
+    pub terminal_state: Option<String>,
+    pub terminal_reason: Option<String>,
+    pub failure_reason: Option<String>,
+    pub timeout_reason: Option<String>,
+    pub cancellation_reason: Option<String>,
+    pub workspace: WorkerLaneWorkspaceInspectEntry,
+    pub observation: Option<WorkerLaneObservationInspectEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkerLaneDiffEvidenceInspectEntry {
+    pub task_id: Option<Uuid>,
+    pub repo_path: Option<String>,
+    pub files_changed: usize,
+    pub insertions: usize,
+    pub deletions: usize,
+    pub paths: Vec<String>,
+    pub git_status: BoundedPayloadSummary,
+    pub git_diff: BoundedPayloadSummary,
+    pub event_sequence: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkerLaneDiffInspectReport {
+    pub session_id: Uuid,
+    pub task_id: Option<Uuid>,
+    pub scope: String,
+    pub lane_count: usize,
+    pub diff_count: usize,
+    pub event_count: usize,
+    pub payload_limit_bytes: usize,
+    pub lanes: Vec<WorkerLaneInspectEntry>,
+    pub diffs: Vec<WorkerLaneDiffEvidenceInspectEntry>,
+    pub source_of_truth: String,
+    pub projection_kind: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskWorktreeProjection {
     pub lane_id: String,
@@ -1261,6 +1399,22 @@ impl Runtime {
         }
 
         approval_commit_inspect_report_from_events(request, &events)
+    }
+
+    pub fn inspect_worker_lane_diff(
+        &self,
+        request: WorkerLaneDiffInspectRequest,
+    ) -> HarnessResult<WorkerLaneDiffInspectReport> {
+        let events = self.event_store.events_for_session(request.session_id)?;
+        project_session(request.session_id, &events)?;
+        if let Some(task_id) = request.task_id {
+            let tasks = task_projections_from_events(request.session_id, &events)?;
+            if !tasks.iter().any(|task| task.task_id == task_id) {
+                return Err(HarnessError::new(format!("task not found: {task_id}")));
+            }
+        }
+
+        worker_lane_diff_inspect_report_from_events(request, &events)
     }
 
     pub fn enqueue_task(
@@ -3736,6 +3890,295 @@ fn empty_approval_commit_workspace_evidence() -> ApprovalCommitWorkspaceEvidence
     }
 }
 
+fn worker_lane_diff_inspect_report_from_events(
+    request: WorkerLaneDiffInspectRequest,
+    events: &[EventEnvelope],
+) -> HarnessResult<WorkerLaneDiffInspectReport> {
+    let mut session_repo_path = None;
+    let mut task_repo_paths = BTreeMap::new();
+    for event in events {
+        match event.event_type {
+            EventType::SessionStarted => {
+                session_repo_path = Some(payload_string(&event.payload, "repo_path")?);
+            }
+            EventType::TaskCreated => {
+                task_repo_paths.insert(
+                    payload_uuid(&event.payload, "task_id")?,
+                    payload_string(&event.payload, "repo_path")?,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let mut lanes: BTreeMap<WorkerLaneKey, WorkerLaneInspectEntry> = BTreeMap::new();
+    let mut diffs = Vec::new();
+    let mut pending_policy_lane_key: Option<WorkerLaneKey> = None;
+    let mut latest_lane_by_task_scope: BTreeMap<Option<Uuid>, WorkerLaneKey> = BTreeMap::new();
+
+    for event in events {
+        let event_task_id = payload_task_id(&event.payload)?;
+        let matches_task_scope = request
+            .task_id
+            .is_none_or(|task_id| event_task_id == Some(task_id));
+
+        if event.event_type == EventType::PolicyDecided {
+            if let Some(lane_key) = pending_policy_lane_key.take() {
+                let tool_name = payload_string(&event.payload, "tool_name")?;
+                if tool_name == harness_tools::CODEX_WORKER_LANE_TOOL.name
+                    && let Some(lane) = lanes.get_mut(&lane_key)
+                {
+                    lane.policy = Some(WorkerLanePolicyInspectEntry {
+                        tool_name,
+                        decision: payload_string(&event.payload, "decision")?,
+                        reason: payload_string(&event.payload, "reason")?,
+                        event_sequence: event.sequence,
+                    });
+                }
+            }
+            continue;
+        }
+
+        if !matches_task_scope {
+            continue;
+        }
+
+        match event.event_type {
+            EventType::WorkerLaneRequested => {
+                let lane_id = payload_string(&event.payload, "lane_id")?;
+                let lane_kind = payload_string(&event.payload, "lane_kind")?;
+                let lane_key = (event_task_id, lane_id.clone());
+                let task_repo_path = event_task_id
+                    .and_then(|task_id| task_repo_paths.get(&task_id).map(ToOwned::to_owned));
+                let lane = worker_lane_entry_mut(
+                    &mut lanes,
+                    event_task_id,
+                    lane_id,
+                    lane_kind,
+                    session_repo_path.clone(),
+                    task_repo_path,
+                );
+                let budget = event
+                    .payload
+                    .get("budget")
+                    .ok_or_else(|| HarnessError::new("worker lane budget is missing"))?;
+                lane.request_status = Some("requested".to_owned());
+                lane.workspace.requested_workspace_path =
+                    Some(payload_string(&event.payload, "workspace_path")?);
+                lane.workspace.requested_worktree_path =
+                    payload_optional_string(&event.payload, "worktree_path");
+                lane.request = Some(WorkerLaneRequestInspectEntry {
+                    task: bounded_text_summary(
+                        payload_string(&event.payload, "task")?,
+                        request.payload_limit_bytes,
+                    ),
+                    workspace_path: payload_string(&event.payload, "workspace_path")?,
+                    worktree_path: payload_optional_string(&event.payload, "worktree_path"),
+                    timeout_ms: payload_u64(&event.payload, "timeout_ms")?,
+                    cancellation_requested: payload_bool(&event.payload, "cancellation_requested")?,
+                    budget: WorkerLaneBudgetInspect {
+                        max_prompt_tokens: payload_usize(budget, "max_prompt_tokens")?,
+                        max_output_tokens: payload_usize(budget, "max_output_tokens")?,
+                        max_stdout_bytes: payload_usize(budget, "max_stdout_bytes")?,
+                    },
+                    event_sequence: event.sequence,
+                });
+                pending_policy_lane_key = Some(lane_key.clone());
+                latest_lane_by_task_scope.insert(event_task_id, lane_key);
+            }
+            EventType::WorkerLaneStateChanged => {
+                let lane_id = payload_string(&event.payload, "lane_id")?;
+                let lane_kind = payload_string(&event.payload, "lane_kind")?;
+                let task_repo_path = event_task_id
+                    .and_then(|task_id| task_repo_paths.get(&task_id).map(ToOwned::to_owned));
+                let lane = worker_lane_entry_mut(
+                    &mut lanes,
+                    event_task_id,
+                    lane_id,
+                    lane_kind,
+                    session_repo_path.clone(),
+                    task_repo_path,
+                );
+                let to_state = payload_string(&event.payload, "to_state")?;
+                let reason = payload_string(&event.payload, "reason")?;
+                lane.states.push(WorkerLaneStateInspectEntry {
+                    from_state: payload_optional_string(&event.payload, "from_state"),
+                    to_state: to_state.clone(),
+                    reason: reason.clone(),
+                    event_sequence: event.sequence,
+                });
+                lane.current_state = Some(to_state.clone());
+                lane.is_running = to_state == WorkerLaneStatus::Running.as_str();
+                if worker_lane_state_is_terminal(&to_state) {
+                    lane.is_terminal = true;
+                    lane.terminal_state = Some(to_state.clone());
+                    lane.terminal_reason = Some(reason.clone());
+                }
+                match to_state.as_str() {
+                    "failed" | "rejected" => lane.failure_reason = Some(reason),
+                    "timed_out" => lane.timeout_reason = Some(reason),
+                    "cancelled" => lane.cancellation_reason = Some(reason),
+                    _ => {}
+                }
+            }
+            EventType::WorkerLaneWorktreeAllocated => {
+                let lane_id = payload_string(&event.payload, "lane_id")?;
+                let lane_kind = payload_string(&event.payload, "lane_kind")?;
+                let task_repo_path = event_task_id
+                    .and_then(|task_id| task_repo_paths.get(&task_id).map(ToOwned::to_owned));
+                let lane = worker_lane_entry_mut(
+                    &mut lanes,
+                    event_task_id,
+                    lane_id,
+                    lane_kind,
+                    session_repo_path.clone(),
+                    task_repo_path,
+                );
+                lane.workspace.allocated_worktree_path =
+                    Some(payload_string(&event.payload, "worktree_path")?);
+                lane.workspace.session_repo_path =
+                    Some(payload_string(&event.payload, "session_repo_path")?);
+                lane.workspace.base_ref = Some(payload_string(&event.payload, "base_ref")?);
+            }
+            EventType::WorkerLaneObservationRecorded => {
+                let lane_id = payload_string(&event.payload, "lane_id")?;
+                let lane_kind = payload_string(&event.payload, "lane_kind")?;
+                let task_repo_path = event_task_id
+                    .and_then(|task_id| task_repo_paths.get(&task_id).map(ToOwned::to_owned));
+                let lane = worker_lane_entry_mut(
+                    &mut lanes,
+                    event_task_id,
+                    lane_id,
+                    lane_kind,
+                    session_repo_path.clone(),
+                    task_repo_path,
+                );
+                let status = payload_string(&event.payload, "status")?;
+                let stderr = payload_string(&event.payload, "stderr")?;
+                lane.observation = Some(WorkerLaneObservationInspectEntry {
+                    status: status.clone(),
+                    exit_code: payload_i32_optional(&event.payload, "exit_code")?,
+                    stdout: bounded_text_summary(
+                        payload_string(&event.payload, "stdout")?,
+                        request.payload_limit_bytes,
+                    ),
+                    stderr: bounded_text_summary(stderr.clone(), request.payload_limit_bytes),
+                    duration_ms: payload_u64(&event.payload, "duration_ms")?,
+                    prompt_tokens: payload_usize_optional(&event.payload, "prompt_tokens")?,
+                    completion_tokens: payload_usize_optional(&event.payload, "completion_tokens")?,
+                    usage_confidence: payload_string(&event.payload, "usage_confidence")?,
+                    skipped_or_unavailable_reason: skipped_or_unavailable_reason(&status, &stderr),
+                    event_sequence: event.sequence,
+                });
+            }
+            EventType::DiffRecorded => {
+                let diff = diff_summary_from_payload(&event.payload)?;
+                let repo_path = payload_optional_string(&event.payload, "repo_path");
+                if let Some(lane_key) = latest_lane_by_task_scope.get(&event_task_id)
+                    && let Some(lane) = lanes.get_mut(lane_key)
+                {
+                    lane.workspace.diff_repo_path = repo_path.clone();
+                }
+                diffs.push(WorkerLaneDiffEvidenceInspectEntry {
+                    task_id: event_task_id,
+                    repo_path,
+                    files_changed: diff.files_changed,
+                    insertions: diff.insertions,
+                    deletions: diff.deletions,
+                    paths: diff.paths,
+                    git_status: bounded_text_summary(
+                        payload_optional_string(&event.payload, "git_status").unwrap_or_default(),
+                        request.payload_limit_bytes,
+                    ),
+                    git_diff: bounded_text_summary(
+                        payload_optional_string(&event.payload, "git_diff").unwrap_or_default(),
+                        request.payload_limit_bytes,
+                    ),
+                    event_sequence: event.sequence,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let lanes = lanes.into_values().collect::<Vec<_>>();
+    Ok(WorkerLaneDiffInspectReport {
+        session_id: request.session_id,
+        task_id: request.task_id,
+        scope: if request.task_id.is_some() {
+            "task".to_owned()
+        } else {
+            "session".to_owned()
+        },
+        lane_count: lanes.len(),
+        diff_count: diffs.len(),
+        event_count: events.len(),
+        payload_limit_bytes: request.payload_limit_bytes,
+        lanes,
+        diffs,
+        source_of_truth: "EventLog".to_owned(),
+        projection_kind: "worker_lane_diff_inspect_report".to_owned(),
+    })
+}
+
+type WorkerLaneKey = (Option<Uuid>, String);
+
+fn worker_lane_entry_mut(
+    lanes: &mut BTreeMap<WorkerLaneKey, WorkerLaneInspectEntry>,
+    task_id: Option<Uuid>,
+    lane_id: String,
+    lane_kind: String,
+    session_repo_path: Option<String>,
+    task_repo_path: Option<String>,
+) -> &mut WorkerLaneInspectEntry {
+    lanes
+        .entry((task_id, lane_id.clone()))
+        .or_insert_with(|| WorkerLaneInspectEntry {
+            task_id,
+            lane_id,
+            lane_kind,
+            request_status: None,
+            request: None,
+            policy: None,
+            states: Vec::new(),
+            current_state: None,
+            is_running: false,
+            is_terminal: false,
+            terminal_state: None,
+            terminal_reason: None,
+            failure_reason: None,
+            timeout_reason: None,
+            cancellation_reason: None,
+            workspace: WorkerLaneWorkspaceInspectEntry {
+                requested_workspace_path: None,
+                requested_worktree_path: None,
+                allocated_worktree_path: None,
+                session_repo_path,
+                task_repo_path,
+                diff_repo_path: None,
+                base_ref: None,
+            },
+            observation: None,
+        })
+}
+
+fn worker_lane_state_is_terminal(state: &str) -> bool {
+    matches!(
+        state,
+        "succeeded" | "failed" | "cancelled" | "timed_out" | "rejected"
+    )
+}
+
+fn skipped_or_unavailable_reason(status: &str, stderr: &str) -> Option<String> {
+    let normalized_status = status.to_ascii_lowercase();
+    let normalized_stderr = stderr.to_ascii_lowercase();
+    if normalized_status.contains("skipped") || normalized_stderr.contains("unavailable") {
+        Some(stderr.to_owned())
+    } else {
+        None
+    }
+}
+
 fn task_projections_from_events(
     session_id: Uuid,
     events: &[EventEnvelope],
@@ -4238,6 +4681,13 @@ fn payload_i32_optional(payload: &serde_json::Value, key: &str) -> HarnessResult
         .transpose()
 }
 
+fn payload_bool(payload: &serde_json::Value, key: &str) -> HarnessResult<bool> {
+    payload
+        .get(key)
+        .and_then(|value| value.as_bool())
+        .ok_or_else(|| HarnessError::new(format!("payload {key} is missing")))
+}
+
 fn task_lease_payload_from_record(record: &TaskQueueRecord) -> HarnessResult<TaskLeasePayload> {
     Ok(TaskLeasePayload::new(
         record.task_id,
@@ -4355,6 +4805,17 @@ fn payload_usize(payload: &serde_json::Value, key: &str) -> HarnessResult<usize>
         .ok_or_else(|| HarnessError::new(format!("diff {key} is missing")))?;
 
     usize::try_from(value).map_err(|_| HarnessError::new(format!("diff {key} is out of range")))
+}
+
+fn payload_usize_optional(payload: &serde_json::Value, key: &str) -> HarnessResult<Option<usize>> {
+    payload
+        .get(key)
+        .and_then(|value| value.as_u64())
+        .map(|value| {
+            usize::try_from(value)
+                .map_err(|_| HarnessError::new(format!("payload {key} is out of range")))
+        })
+        .transpose()
 }
 
 #[must_use]
