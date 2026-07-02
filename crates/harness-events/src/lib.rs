@@ -16,6 +16,9 @@ pub const DIFF_RECORDED_EVENT: &str = "diff.recorded";
 pub const COMMIT_APPROVAL_PENDING_EVENT: &str = "commit.approval_pending";
 pub const COMMIT_APPROVED_EVENT: &str = "commit.approved";
 pub const COMMIT_REJECTED_EVENT: &str = "commit.rejected";
+pub const COMMIT_STARTED_EVENT: &str = "commit.started";
+pub const COMMIT_SUCCEEDED_EVENT: &str = "commit.succeeded";
+pub const COMMIT_FAILED_EVENT: &str = "commit.failed";
 pub const RECOVERY_FAILURE_CLASSIFIED_EVENT: &str = "recovery.failure_classified";
 pub const RECOVERY_PLAN_RECORDED_EVENT: &str = "recovery.plan_recorded";
 pub const RECOVERY_REPAIR_ATTEMPTED_EVENT: &str = "recovery.repair_attempted";
@@ -38,6 +41,9 @@ pub enum EventType {
     CommitApprovalPending,
     CommitApproved,
     CommitRejected,
+    CommitStarted,
+    CommitSucceeded,
+    CommitFailed,
     RecoveryFailureClassified,
     RecoveryPlanRecorded,
     RecoveryRepairAttempted,
@@ -63,6 +69,9 @@ impl EventType {
             Self::CommitApprovalPending => COMMIT_APPROVAL_PENDING_EVENT,
             Self::CommitApproved => COMMIT_APPROVED_EVENT,
             Self::CommitRejected => COMMIT_REJECTED_EVENT,
+            Self::CommitStarted => COMMIT_STARTED_EVENT,
+            Self::CommitSucceeded => COMMIT_SUCCEEDED_EVENT,
+            Self::CommitFailed => COMMIT_FAILED_EVENT,
             Self::RecoveryFailureClassified => RECOVERY_FAILURE_CLASSIFIED_EVENT,
             Self::RecoveryPlanRecorded => RECOVERY_PLAN_RECORDED_EVENT,
             Self::RecoveryRepairAttempted => RECOVERY_REPAIR_ATTEMPTED_EVENT,
@@ -87,6 +96,9 @@ impl EventType {
             COMMIT_APPROVAL_PENDING_EVENT => Ok(Self::CommitApprovalPending),
             COMMIT_APPROVED_EVENT => Ok(Self::CommitApproved),
             COMMIT_REJECTED_EVENT => Ok(Self::CommitRejected),
+            COMMIT_STARTED_EVENT => Ok(Self::CommitStarted),
+            COMMIT_SUCCEEDED_EVENT => Ok(Self::CommitSucceeded),
+            COMMIT_FAILED_EVENT => Ok(Self::CommitFailed),
             RECOVERY_FAILURE_CLASSIFIED_EVENT => Ok(Self::RecoveryFailureClassified),
             RECOVERY_PLAN_RECORDED_EVENT => Ok(Self::RecoveryPlanRecorded),
             RECOVERY_REPAIR_ATTEMPTED_EVENT => Ok(Self::RecoveryRepairAttempted),
@@ -463,6 +475,68 @@ impl CommitApprovalDecisionPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitHandoffPayload {
+    pub state: String,
+    pub repo_path: String,
+    pub message: String,
+    pub actor: String,
+    pub commit_sha: Option<String>,
+    pub failure_reason: Option<String>,
+}
+
+impl CommitHandoffPayload {
+    #[must_use]
+    pub fn started(
+        repo_path: impl Into<String>,
+        message: impl Into<String>,
+        actor: impl Into<String>,
+    ) -> Self {
+        Self {
+            state: "committing".to_owned(),
+            repo_path: repo_path.into(),
+            message: message.into(),
+            actor: actor.into(),
+            commit_sha: None,
+            failure_reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn succeeded(
+        repo_path: impl Into<String>,
+        message: impl Into<String>,
+        actor: impl Into<String>,
+        commit_sha: impl Into<String>,
+    ) -> Self {
+        Self {
+            state: "committed".to_owned(),
+            repo_path: repo_path.into(),
+            message: message.into(),
+            actor: actor.into(),
+            commit_sha: Some(commit_sha.into()),
+            failure_reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn failed(
+        repo_path: impl Into<String>,
+        message: impl Into<String>,
+        actor: impl Into<String>,
+        failure_reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            state: "commit_failed".to_owned(),
+            repo_path: repo_path.into(),
+            message: message.into(),
+            actor: actor.into(),
+            commit_sha: None,
+            failure_reason: Some(failure_reason.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryFailurePayload {
     pub round: usize,
     pub classification: String,
@@ -760,6 +834,21 @@ impl NewEvent {
         Self::new(session_id, EventType::CommitRejected, payload)
     }
 
+    pub fn commit_started(session_id: Uuid, payload: CommitHandoffPayload) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::CommitStarted, payload)
+    }
+
+    pub fn commit_succeeded(
+        session_id: Uuid,
+        payload: CommitHandoffPayload,
+    ) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::CommitSucceeded, payload)
+    }
+
+    pub fn commit_failed(session_id: Uuid, payload: CommitHandoffPayload) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::CommitFailed, payload)
+    }
+
     pub fn recovery_failure_classified(
         session_id: Uuid,
         payload: RecoveryFailurePayload,
@@ -1007,6 +1096,31 @@ mod tests {
             CommitApprovalDecisionPayload::new("rejected", "not the intended change", "runtime"),
         )
         .expect("commit rejected event");
+        let started = NewEvent::commit_started(
+            session_id,
+            CommitHandoffPayload::started("C:/repo", "Commit approved patch", "runtime"),
+        )
+        .expect("commit started event");
+        let succeeded = NewEvent::commit_succeeded(
+            session_id,
+            CommitHandoffPayload::succeeded(
+                "C:/repo",
+                "Commit approved patch",
+                "runtime",
+                "0123456789abcdef0123456789abcdef01234567",
+            ),
+        )
+        .expect("commit succeeded event");
+        let failed = NewEvent::commit_failed(
+            session_id,
+            CommitHandoffPayload::failed(
+                "C:/repo",
+                "Commit approved patch",
+                "runtime",
+                "git failed",
+            ),
+        )
+        .expect("commit failed event");
 
         assert_eq!(diff.event_type.as_str(), "diff.recorded");
         assert_eq!(diff.payload["files_changed"], 1);
@@ -1019,6 +1133,19 @@ mod tests {
         assert_eq!(rejected.event_type.as_str(), "commit.rejected");
         assert_eq!(rejected.payload["state"], "rejected");
         assert_eq!(rejected.payload["reason"], "not the intended change");
+        assert_eq!(started.event_type.as_str(), "commit.started");
+        assert_eq!(started.payload["state"], "committing");
+        assert_eq!(started.payload["repo_path"], "C:/repo");
+        assert_eq!(started.payload["commit_sha"], serde_json::Value::Null);
+        assert_eq!(succeeded.event_type.as_str(), "commit.succeeded");
+        assert_eq!(succeeded.payload["state"], "committed");
+        assert_eq!(
+            succeeded.payload["commit_sha"],
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(failed.event_type.as_str(), "commit.failed");
+        assert_eq!(failed.payload["state"], "commit_failed");
+        assert_eq!(failed.payload["failure_reason"], "git failed");
     }
 
     #[test]

@@ -7,14 +7,14 @@ use harness_context::{CompiledContextBundle, ContextCompileRequest, compile_repo
 use harness_core::{HarnessError, HarnessResult};
 use harness_db::PostgresEventStore;
 use harness_events::{
-    CommitApprovalDecisionPayload, CommitApprovalPendingPayload, ContextCompiledPayload,
-    ContextSourcePayload, DiffSummaryPayload, EventEnvelope, EventType, FilePatchIntentPayload,
-    FilePatchObservationPayload, FilePatchPayload, ModelDecisionPayload, ModelRequestPayload,
-    NewEvent, PolicyDecisionPayload, RecoveryFailurePayload, RecoveryPlanPayload,
-    RecoveryRepairAttemptPayload, RecoveryStoppedPayload, SessionStartedPayload,
-    SkillMetadataPayload, ToolCallIntentPayload, ToolObservationPayload, WorkerLaneBudgetPayload,
-    WorkerLaneObservationPayload, WorkerLaneRequestPayload, WorkerLaneStatePayload,
-    WorkerLaneWorktreeAllocatedPayload,
+    CommitApprovalDecisionPayload, CommitApprovalPendingPayload, CommitHandoffPayload,
+    ContextCompiledPayload, ContextSourcePayload, DiffSummaryPayload, EventEnvelope, EventType,
+    FilePatchIntentPayload, FilePatchObservationPayload, FilePatchPayload, ModelDecisionPayload,
+    ModelRequestPayload, NewEvent, PolicyDecisionPayload, RecoveryFailurePayload,
+    RecoveryPlanPayload, RecoveryRepairAttemptPayload, RecoveryStoppedPayload,
+    SessionStartedPayload, SkillMetadataPayload, ToolCallIntentPayload, ToolObservationPayload,
+    WorkerLaneBudgetPayload, WorkerLaneObservationPayload, WorkerLaneRequestPayload,
+    WorkerLaneStatePayload, WorkerLaneWorktreeAllocatedPayload,
 };
 use harness_models::{DeterministicFakeModelProvider, FakeModelRequest, FilePatchProposal};
 use harness_policy::{
@@ -35,6 +35,9 @@ use uuid::Uuid;
 pub const PENDING_COMMIT_APPROVAL_STATE: &str = "pending_commit_approval";
 pub const COMMIT_APPROVED_STATE: &str = "approved";
 pub const COMMIT_REJECTED_STATE: &str = "rejected";
+pub const COMMITTING_STATE: &str = "committing";
+pub const COMMITTED_STATE: &str = "committed";
+pub const COMMIT_FAILED_STATE: &str = "commit_failed";
 pub const RECOVERY_FAILED_STATE: &str = "recovery_failed";
 pub const SELF_RECOVERY_MAX_ROUNDS: usize = 2;
 pub const DEFAULT_CODEX_CLI_PROGRAM: &str = "codex";
@@ -202,6 +205,17 @@ pub struct ApprovalProjection {
     pub diff: DiffSummary,
     pub summary: String,
     pub rejection_reason: Option<String>,
+    pub event_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitHandoffProjection {
+    pub session_id: Uuid,
+    pub state: String,
+    pub repo_path: String,
+    pub message: String,
+    pub commit_sha: Option<String>,
+    pub failure_reason: Option<String>,
     pub event_count: usize,
 }
 
@@ -547,6 +561,66 @@ impl Runtime {
         )?)?;
 
         self.show_approval(session_id)
+    }
+
+    pub fn commit_approved_diff(
+        &mut self,
+        session_id: Uuid,
+        message: impl Into<String>,
+    ) -> HarnessResult<CommitHandoffProjection> {
+        let message = message.into();
+        if message.trim().is_empty() {
+            return Err(HarnessError::new("commit message is required"));
+        }
+
+        let approval = self.show_approval(session_id)?;
+        if approval.state != COMMIT_APPROVED_STATE {
+            return Err(HarnessError::new(format!(
+                "approved diff is required before commit; current state is {}",
+                approval.state
+            )));
+        }
+
+        let events = self.event_store.events_for_session(session_id)?;
+        if let Some(state) = existing_commit_handoff_state_from_events(&events)? {
+            return Err(HarnessError::new(format!(
+                "commit handoff is already {state}"
+            )));
+        }
+
+        let repo_path = commit_repo_path_from_events(&events)?;
+        self.event_store.append_event(NewEvent::commit_started(
+            session_id,
+            CommitHandoffPayload::started(&repo_path, message.trim(), "runtime"),
+        )?)?;
+
+        match run_harness_commit(&repo_path, message.trim()) {
+            Ok(commit_sha) => {
+                self.event_store.append_event(NewEvent::commit_succeeded(
+                    session_id,
+                    CommitHandoffPayload::succeeded(
+                        &repo_path,
+                        message.trim(),
+                        "runtime",
+                        commit_sha,
+                    ),
+                )?)?;
+            }
+            Err(error) => {
+                self.event_store.append_event(NewEvent::commit_failed(
+                    session_id,
+                    CommitHandoffPayload::failed(
+                        &repo_path,
+                        message.trim(),
+                        "runtime",
+                        error.to_string(),
+                    ),
+                )?)?;
+            }
+        }
+
+        let events = self.event_store.events_for_session(session_id)?;
+        commit_handoff_projection_from_events(session_id, &events)
     }
 
     pub fn run_verification_command(
@@ -1559,6 +1633,90 @@ fn approval_projection_from_events(
     })
 }
 
+fn commit_handoff_projection_from_events(
+    session_id: Uuid,
+    events: &[EventEnvelope],
+) -> HarnessResult<CommitHandoffProjection> {
+    let mut projection = None;
+
+    for event in events {
+        match event.event_type {
+            EventType::CommitStarted | EventType::CommitSucceeded | EventType::CommitFailed => {
+                projection = Some(CommitHandoffProjection {
+                    session_id,
+                    state: payload_string(&event.payload, "state")?,
+                    repo_path: payload_string(&event.payload, "repo_path")?,
+                    message: payload_string(&event.payload, "message")?,
+                    commit_sha: event
+                        .payload
+                        .get("commit_sha")
+                        .and_then(|value| value.as_str())
+                        .map(ToOwned::to_owned),
+                    failure_reason: event
+                        .payload
+                        .get("failure_reason")
+                        .and_then(|value| value.as_str())
+                        .map(ToOwned::to_owned),
+                    event_count: events.len(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    projection.ok_or_else(|| HarnessError::new("commit handoff was not recorded"))
+}
+
+fn existing_commit_handoff_state_from_events(
+    events: &[EventEnvelope],
+) -> HarnessResult<Option<String>> {
+    let mut state = None;
+
+    for event in events {
+        match event.event_type {
+            EventType::CommitStarted | EventType::CommitSucceeded | EventType::CommitFailed => {
+                state = Some(payload_string(&event.payload, "state")?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(state)
+}
+
+fn commit_repo_path_from_events(events: &[EventEnvelope]) -> HarnessResult<String> {
+    let mut session_repo_path = None;
+    let mut latest_worktree_path = None;
+    let mut diff_repo_path = None;
+
+    for event in events {
+        match event.event_type {
+            EventType::SessionStarted => {
+                session_repo_path = Some(payload_string(&event.payload, "repo_path")?);
+            }
+            EventType::WorkerLaneWorktreeAllocated => {
+                latest_worktree_path = Some(payload_string(&event.payload, "worktree_path")?);
+            }
+            EventType::DiffRecorded => {
+                diff_repo_path = latest_worktree_path
+                    .clone()
+                    .or_else(|| session_repo_path.clone());
+            }
+            _ => {}
+        }
+    }
+
+    diff_repo_path.ok_or_else(|| HarnessError::new("diff repository path was not recorded"))
+}
+
+fn payload_string(payload: &serde_json::Value, key: &str) -> HarnessResult<String> {
+    payload
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| HarnessError::new(format!("payload {key} is missing")))
+}
+
 fn diff_summary_from_payload(payload: &serde_json::Value) -> HarnessResult<DiffSummary> {
     let files_changed = payload_usize(payload, "files_changed")?;
     let insertions = payload_usize(payload, "insertions")?;
@@ -1683,6 +1841,50 @@ fn capture_git_diff_evidence(
         git_status,
         git_diff,
     }))
+}
+
+fn run_harness_commit(repo_path: &str, message: &str) -> HarnessResult<String> {
+    let status = run_git_text(repo_path, &["status", "--short"])?;
+    if status.trim().is_empty() {
+        return Err(HarnessError::new(
+            "approved diff has no local changes to commit",
+        ));
+    }
+
+    run_git_text(repo_path, &["add", "-A"])?;
+    run_git_commit(repo_path, message)?;
+    Ok(run_git_text(repo_path, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_owned())
+}
+
+fn run_git_commit(repo_path: &str, message: &str) -> HarnessResult<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("-c")
+        .arg("user.name=Coding Agent Harness")
+        .arg("-c")
+        .arg("user.email=harness@example.invalid")
+        .arg("commit")
+        .arg("-m")
+        .arg(message)
+        .output()
+        .map_err(|error| HarnessError::new(format!("could not start git commit: {error}")))?;
+
+    if !output.status.success() {
+        return Err(HarnessError::new(format!(
+            "git commit failed with status {}: {}{}",
+            output
+                .status
+                .code()
+                .map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    Ok(())
 }
 
 fn run_git_text(repo_path: &str, args: &[&str]) -> HarnessResult<String> {
