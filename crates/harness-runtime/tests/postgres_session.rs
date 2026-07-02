@@ -6,11 +6,12 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use harness_core::HarnessError;
 use harness_db::PostgresEventStore;
 use harness_events::{
     CommitApprovalDecisionPayload, CommitApprovalPendingPayload, CommitHandoffPayload,
-    DiffSummaryPayload, EventType, NewEvent, ToolCallIntentPayload, WorkerLaneObservationPayload,
-    WorkerLaneWorktreeAllocatedPayload,
+    DiffSummaryPayload, EventType, NewEvent, TaskQueuePayload, ToolCallIntentPayload,
+    WorkerLaneObservationPayload, WorkerLaneWorktreeAllocatedPayload,
 };
 use harness_policy::PolicyDecision;
 use harness_runtime::{
@@ -647,6 +648,205 @@ fn concurrent_event_appends_keep_session_sequence_contiguous()
 
     assert_eq!(events.len(), worker_count + 1);
     assert_eq!(sequences, expected);
+
+    Ok(())
+}
+
+#[test]
+fn task_queue_row_is_not_leaseable_before_enqueued_event_commit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let store = PostgresEventStore::connect(&database_url)?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new("atomic-enqueue-fixture"))?;
+    let task = runtime.create_task(
+        started.session_id,
+        CreateTaskRequest::new("queue atomically"),
+    )?;
+
+    store.enqueue_task(started.session_id, task.task_id, 1, |record| {
+        let mut worker_runtime = Runtime::connect_postgres(&database_url)?;
+        let leased = worker_runtime
+            .lease_next_task(LeaseNextTaskRequest::new("worker-before-enqueue-commit"))?;
+        assert!(leased.is_none());
+
+        NewEvent::task_enqueued(
+            record.session_id,
+            TaskQueuePayload::new(
+                record.task_id,
+                TASK_QUEUED_STATE,
+                record
+                    .last_reason
+                    .as_deref()
+                    .unwrap_or("task enqueued for worker execution"),
+            )
+            .with_retry_state(
+                record.retry_count,
+                record.max_retries,
+                record.stop_reason.clone(),
+            ),
+        )
+    })?;
+
+    let leased = runtime
+        .lease_next_task(LeaseNextTaskRequest::new("worker-after-enqueue-commit"))?
+        .expect("task should be leaseable after enqueue event commits");
+    let queue_record = store
+        .task_queue_record(task.task_id)?
+        .expect("queue row should exist");
+
+    assert_eq!(leased.status, TASK_LEASED_STATE);
+    assert_eq!(queue_record.status, TASK_LEASED_STATE);
+
+    Ok(())
+}
+
+#[test]
+fn task_queue_event_failures_roll_back_visible_queue_mutations()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let store = PostgresEventStore::connect(&database_url)?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new("queue-rollback-fixture"))?;
+    let task = runtime.create_task(
+        started.session_id,
+        CreateTaskRequest::new("rollback enqueue event failure"),
+    )?;
+
+    let error = store
+        .enqueue_task(started.session_id, task.task_id, 1, |_record| {
+            Err(HarnessError::new("injected enqueue event failure"))
+        })
+        .expect_err("injected event failure should abort enqueue transaction");
+    assert!(error.to_string().contains("injected enqueue event failure"));
+    assert!(store.task_queue_record(task.task_id)?.is_none());
+    assert!(
+        runtime
+            .lease_next_task(LeaseNextTaskRequest::new("worker-after-failed-enqueue"))?
+            .is_none()
+    );
+
+    runtime.enqueue_task(started.session_id, task.task_id)?;
+    let lease_error = store
+        .lease_next_queued_task(
+            "worker-failed-lease-event",
+            Uuid::new_v4(),
+            current_time_ms_for_test()? + 60_000,
+            |_record| Err(HarnessError::new("injected lease event failure")),
+        )
+        .expect_err("injected event failure should abort lease transaction");
+    assert!(
+        lease_error
+            .to_string()
+            .contains("injected lease event failure")
+    );
+
+    let queue_record = store
+        .task_queue_record(task.task_id)?
+        .expect("queue row should remain after successful enqueue");
+    assert_eq!(queue_record.status, TASK_QUEUED_STATE);
+
+    let leased = runtime
+        .lease_next_task(LeaseNextTaskRequest::new("worker-after-failed-lease"))?
+        .expect("task should remain leaseable after failed lease transaction");
+    let queue_record = store
+        .task_queue_record(task.task_id)?
+        .expect("queue row should exist after lease");
+    assert_eq!(leased.status, TASK_LEASED_STATE);
+    assert_eq!(queue_record.status, TASK_LEASED_STATE);
+
+    Ok(())
+}
+
+#[test]
+fn terminal_and_expire_event_failures_roll_back_queue_mutations()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let store = PostgresEventStore::connect(&database_url)?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new("queue-terminal-rollback"))?;
+
+    let terminal_task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "rollback terminal event failure",
+    )?;
+    let terminal_lease = runtime
+        .lease_next_task(LeaseNextTaskRequest::new("terminal-worker"))?
+        .expect("terminal task should lease");
+    let terminal_lease_id = terminal_lease.lease.as_ref().expect("lease slot").lease_id;
+
+    let terminal_error = store
+        .transition_leased_task(
+            terminal_task_id,
+            terminal_lease_id,
+            TASK_COMPLETED_STATE,
+            "complete with injected event failure",
+            |_record| Err(HarnessError::new("injected terminal event failure")),
+        )
+        .expect_err("injected event failure should abort terminal transaction");
+    assert!(
+        terminal_error
+            .to_string()
+            .contains("injected terminal event failure")
+    );
+    let queue_record = store
+        .task_queue_record(terminal_task_id)?
+        .expect("terminal task queue row should exist");
+    assert_eq!(queue_record.status, TASK_LEASED_STATE);
+    assert_eq!(
+        runtime
+            .show_task(started.session_id, terminal_task_id)?
+            .status,
+        TASK_LEASED_STATE
+    );
+
+    let expire_task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "rollback expire event failure",
+    )?;
+    let mut expire_request = LeaseNextTaskRequest::new("expire-worker");
+    expire_request.lease_duration_ms = 1;
+    runtime
+        .lease_next_task(expire_request)?
+        .expect("expire task should lease");
+    let expire_error = store
+        .expire_due_task_leases(current_time_ms_for_test()? + 60_000, |_record| {
+            Err(HarnessError::new("injected expire event failure"))
+        })
+        .expect_err("injected event failure should abort expire transaction");
+    assert!(
+        expire_error
+            .to_string()
+            .contains("injected expire event failure")
+    );
+
+    let queue_record = store
+        .task_queue_record(expire_task_id)?
+        .expect("expire task queue row should exist");
+    assert_eq!(queue_record.status, TASK_LEASED_STATE);
+    assert_eq!(
+        runtime
+            .show_task(started.session_id, expire_task_id)?
+            .status,
+        TASK_LEASED_STATE
+    );
 
     Ok(())
 }
