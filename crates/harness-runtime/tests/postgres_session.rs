@@ -7,15 +7,20 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use harness_db::PostgresEventStore;
-use harness_events::{EventType, NewEvent, ToolCallIntentPayload};
+use harness_events::{
+    CommitApprovalDecisionPayload, CommitApprovalPendingPayload, CommitHandoffPayload,
+    DiffSummaryPayload, EventType, NewEvent, ToolCallIntentPayload, WorkerLaneObservationPayload,
+    WorkerLaneWorktreeAllocatedPayload,
+};
 use harness_policy::PolicyDecision;
 use harness_runtime::{
-    CodexCliAvailabilityRequest, CodexWorkerLaneBudget, CodexWorkerLaneFixture,
-    CodexWorkerLaneRequest, CodexWorkerLaneWorkspace, CodexWorkerSubprocess, CodexWorkerUsage,
-    ContextBudget, FakeModelTurnRequest, PENDING_COMMIT_APPROVAL_STATE, RECOVERY_FAILED_STATE,
-    RecoveryStopReason, Runtime, SelfRecoveryLoopRequest, SessionContextCompileRequest,
-    SessionStatus, SmallCodingTaskRequest, StartSessionRequest, UsageConfidence,
-    VerificationCommandRequest, WorkerLaneStatus, detect_codex_cli_availability,
+    COMMIT_APPROVED_STATE, COMMITTED_STATE, CodexCliAvailabilityRequest, CodexWorkerLaneBudget,
+    CodexWorkerLaneFixture, CodexWorkerLaneRequest, CodexWorkerLaneWorkspace,
+    CodexWorkerSubprocess, CodexWorkerUsage, ContextBudget, CreateTaskRequest,
+    DEFAULT_TASK_WORKER_LANE_KIND, FakeModelTurnRequest, PENDING_COMMIT_APPROVAL_STATE,
+    RECOVERY_FAILED_STATE, RecoveryStopReason, Runtime, SelfRecoveryLoopRequest,
+    SessionContextCompileRequest, SessionStatus, SmallCodingTaskRequest, StartSessionRequest,
+    UsageConfidence, VerificationCommandRequest, WorkerLaneStatus, detect_codex_cli_availability,
 };
 use uuid::Uuid;
 
@@ -38,6 +43,171 @@ fn started_session_can_be_replayed_from_postgres_eventlog() -> Result<(), Box<dy
     assert_eq!(replayed.repo_path, repo_path);
     assert_eq!(replayed.status, SessionStatus::Started);
     assert_eq!(replayed.event_count, 1);
+
+    Ok(())
+}
+
+#[test]
+fn task_create_list_show_projects_first_class_tasks() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo_path = format!("task-fixture-repo-{}", Uuid::new_v4());
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo_path.clone()))?;
+    let first = runtime.create_task(
+        started.session_id,
+        CreateTaskRequest {
+            input: "write the first runtime task".to_owned(),
+            repo_path: None,
+            worker_lane_kind: "codex_cli_worker_lane".to_owned(),
+            context: SessionContextCompileRequest {
+                budget: ContextBudget {
+                    max_bytes: 4096,
+                    max_files: 8,
+                    max_skill_files: 2,
+                },
+                focus_terms: vec!["agent".to_owned(), "task".to_owned()],
+            },
+            max_output_tokens: 384,
+        },
+    )?;
+    let second = runtime.create_task(
+        started.session_id,
+        CreateTaskRequest::new("write the second runtime task"),
+    )?;
+    let tasks = runtime.list_tasks(started.session_id)?;
+    let shown = runtime.show_task(started.session_id, first.task_id)?;
+
+    assert_ne!(first.task_id, second.task_id);
+    assert_eq!(tasks.len(), 2);
+    assert_eq!(tasks[0].task_id, first.task_id);
+    assert_eq!(tasks[1].task_id, second.task_id);
+    assert_eq!(shown.session_id, started.session_id);
+    assert_eq!(shown.repo_path, repo_path);
+    assert_eq!(shown.input, "write the first runtime task");
+    assert_eq!(shown.status, "created");
+    assert_eq!(shown.worker_lane_kind, "codex_cli_worker_lane");
+    assert_eq!(shown.context_budget.max_bytes, 4096);
+    assert_eq!(shown.context_budget.max_files, 8);
+    assert_eq!(shown.context_budget.max_skill_files, 2);
+    assert_eq!(
+        shown.focus_terms,
+        vec!["agent".to_owned(), "task".to_owned()]
+    );
+    assert_eq!(shown.max_output_tokens, 384);
+    assert_eq!(shown.worktree, None);
+    assert_eq!(shown.worker_output, None);
+    assert_eq!(shown.diff, None);
+    assert_eq!(shown.approval, None);
+    assert_eq!(shown.commit, None);
+    assert_eq!(shown.event_count, 3);
+
+    Ok(())
+}
+
+#[test]
+fn task_projection_replays_task_scoped_status_slots() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new("task-slot-fixture"))?;
+    let task = runtime.create_task(
+        started.session_id,
+        CreateTaskRequest::new("write the task scoped fake patch"),
+    )?;
+    let store = PostgresEventStore::connect(&database_url)?;
+
+    store.append_event(NewEvent::worker_lane_worktree_allocated(
+        started.session_id,
+        WorkerLaneWorktreeAllocatedPayload::new(
+            "lane-1",
+            DEFAULT_TASK_WORKER_LANE_KIND,
+            "C:/repo",
+            "C:/repo-worktree",
+            "HEAD",
+        )
+        .with_task_id(task.task_id),
+    )?)?;
+    store.append_event(NewEvent::worker_lane_observation_recorded(
+        started.session_id,
+        WorkerLaneObservationPayload {
+            task_id: Some(task.task_id),
+            lane_id: "lane-1".to_owned(),
+            lane_kind: DEFAULT_TASK_WORKER_LANE_KIND.to_owned(),
+            status: "succeeded".to_owned(),
+            exit_code: Some(0),
+            stdout: "worker output".to_owned(),
+            stderr: String::new(),
+            duration_ms: 42,
+            prompt_tokens: Some(100),
+            completion_tokens: Some(25),
+            usage_confidence: "local_estimate".to_owned(),
+        },
+    )?)?;
+    store.append_event(NewEvent::diff_recorded(
+        started.session_id,
+        DiffSummaryPayload::new(1, 3, 0, vec![".harness/fake-agent-turn.md".to_owned()])
+            .with_task_id(task.task_id),
+    )?)?;
+    store.append_event(NewEvent::commit_approval_pending(
+        started.session_id,
+        CommitApprovalPendingPayload::new(
+            PENDING_COMMIT_APPROVAL_STATE,
+            "verification passed; awaiting human commit approval",
+        )
+        .with_task_id(task.task_id),
+    )?)?;
+    store.append_event(NewEvent::commit_approved(
+        started.session_id,
+        CommitApprovalDecisionPayload::new(
+            COMMIT_APPROVED_STATE,
+            "approved by runtime approval state machine",
+            "runtime",
+        )
+        .with_task_id(task.task_id),
+    )?)?;
+    store.append_event(NewEvent::commit_succeeded(
+        started.session_id,
+        CommitHandoffPayload::succeeded(
+            "C:/repo-worktree",
+            "Commit approved task patch",
+            "runtime",
+            "0123456789abcdef0123456789abcdef01234567",
+        )
+        .with_task_id(task.task_id),
+    )?)?;
+
+    let shown = runtime.show_task(started.session_id, task.task_id)?;
+
+    assert_eq!(shown.status, COMMITTED_STATE);
+    let worktree = shown.worktree.expect("task worktree slot");
+    assert_eq!(worktree.lane_id, "lane-1");
+    assert_eq!(worktree.worktree_path, "C:/repo-worktree");
+    let worker_output = shown.worker_output.expect("task worker output slot");
+    assert_eq!(worker_output.status, "succeeded");
+    assert_eq!(worker_output.stdout, "worker output");
+    assert_eq!(worker_output.exit_code, Some(0));
+    let diff = shown.diff.expect("task diff slot");
+    assert_eq!(diff.files_changed, 1);
+    assert_eq!(diff.paths, vec![".harness/fake-agent-turn.md"]);
+    let approval = shown.approval.expect("task approval slot");
+    assert_eq!(approval.state, COMMIT_APPROVED_STATE);
+    assert_eq!(approval.rejection_reason, None);
+    let commit = shown.commit.expect("task commit slot");
+    assert_eq!(commit.state, COMMITTED_STATE);
+    assert_eq!(
+        commit.commit_sha.as_deref(),
+        Some("0123456789abcdef0123456789abcdef01234567")
+    );
+    assert_eq!(shown.event_count, 8);
 
     Ok(())
 }
