@@ -2003,6 +2003,16 @@ fn expired_lease_owner_cannot_terminal_transition_task() -> Result<(), Box<dyn s
     let (complete_task_id, complete_lease_id) = lease_expired_task("expired complete should fail")?;
     let (fail_task_id, fail_lease_id) = lease_expired_task("expired fail should fail")?;
     let (cancel_task_id, cancel_lease_id) = lease_expired_task("expired cancel should fail")?;
+    let wrong_lease_task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "wrong lease id should fail distinctly",
+    )?;
+    let mut wrong_lease_request = LeaseNextTaskRequest::new("wrong-lease-worker");
+    wrong_lease_request.lease_duration_ms = 600_000;
+    runtime
+        .lease_next_task(wrong_lease_request)?
+        .expect("wrong lease id task should lease");
 
     let complete_error = runtime
         .complete_task_lease(
@@ -2012,6 +2022,20 @@ fn expired_lease_owner_cannot_terminal_transition_task() -> Result<(), Box<dyn s
         )
         .expect_err("expired complete should be rejected");
     assert!(complete_error.to_string().contains("task lease expired"));
+
+    let wrong_lease_error = runtime
+        .complete_task_lease(
+            wrong_lease_task_id,
+            Uuid::new_v4(),
+            "wrong lease id should not look expired",
+        )
+        .expect_err("wrong lease id should be rejected distinctly");
+    assert!(
+        wrong_lease_error
+            .to_string()
+            .contains("active task lease was not found")
+    );
+    assert_ne!(wrong_lease_error.to_string(), complete_error.to_string());
 
     let fail_error = runtime
         .fail_task_lease(fail_task_id, fail_lease_id, "late fail should not win")
