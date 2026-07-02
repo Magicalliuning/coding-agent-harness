@@ -26,8 +26,8 @@ use harness_runtime::{
     SessionStatus, SmallCodingTaskRequest, StartSessionRequest, TASK_CANCELLED_STATE,
     TASK_COMPLETED_STATE, TASK_FAILED_STATE, TASK_LEASED_STATE, TASK_QUEUED_STATE,
     TASK_RETRY_QUEUED_STATE, TASK_STOP_REASON_LEASE_EXPIRED, TASK_STOP_REASON_MAX_RETRIES_EXCEEDED,
-    TASK_STOPPED_STATE, UsageConfidence, VerificationCommandRequest, WorkerLaneStatus,
-    detect_codex_cli_availability,
+    TASK_STOPPED_STATE, TaskQueueInspectRequest, UsageConfidence, VerificationCommandRequest,
+    WorkerLaneStatus, detect_codex_cli_availability,
 };
 use uuid::Uuid;
 
@@ -588,6 +588,228 @@ fn task_inspect_report_exposes_rejected_and_commit_failed_terminal_evidence()
     assert_eq!(failed_commit.repo_path.as_deref(), Some("C:/failed-repo"));
     assert_eq!(failed_commit.actor.as_deref(), Some("runtime"));
     assert_eq!(failed_commit.failure_reason.as_deref(), Some("git failed"));
+
+    Ok(())
+}
+
+#[test]
+fn task_queue_inspect_report_handles_empty_and_queued_session_scope()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new("queue-inspect-empty"))?;
+
+    let empty = runtime.inspect_task_queue(
+        TaskQueueInspectRequest::new()
+            .with_session_id(started.session_id)
+            .with_now_ms(0),
+    )?;
+    assert_eq!(empty.session_id, Some(started.session_id));
+    assert!(empty.empty);
+    assert_eq!(empty.total_count, 0);
+    assert!(empty.tasks.is_empty());
+    assert_eq!(empty.source_of_truth, "task_queue+EventLog");
+    assert_eq!(empty.projection_kind, "task_queue_inspect_report");
+
+    let task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "write the queued inspect task",
+    )?;
+    let report = runtime.inspect_task_queue(
+        TaskQueueInspectRequest::new()
+            .with_session_id(started.session_id)
+            .with_now_ms(0),
+    )?;
+
+    assert!(!report.empty);
+    assert_eq!(report.total_count, 1);
+    assert_eq!(report.queue_status_counts[0].status, TASK_QUEUED_STATE);
+    assert_eq!(report.queue_status_counts[0].count, 1);
+    assert_eq!(report.task_status_counts[0].status, TASK_QUEUED_STATE);
+    assert_eq!(report.tasks[0].session_id, started.session_id);
+    assert_eq!(report.tasks[0].task_id, task_id);
+    assert_eq!(report.tasks[0].queue_status, TASK_QUEUED_STATE);
+    assert_eq!(
+        report.tasks[0].task_status.as_deref(),
+        Some(TASK_QUEUED_STATE)
+    );
+    assert_eq!(report.tasks[0].status_class, TASK_QUEUED_STATE);
+    assert_eq!(report.tasks[0].lease_state, "none");
+    assert_eq!(
+        report.tasks[0].last_reason.as_deref(),
+        Some("task enqueued for worker execution")
+    );
+
+    let missing = runtime.inspect_task_queue(
+        TaskQueueInspectRequest::new()
+            .with_session_id(Uuid::new_v4())
+            .with_now_ms(0),
+    );
+    assert!(
+        missing
+            .expect_err("missing session should fail")
+            .to_string()
+            .contains("session not found")
+    );
+
+    Ok(())
+}
+
+#[test]
+fn task_queue_inspect_report_marks_expired_looking_leases_without_mutating()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new("queue-inspect-lease"))?;
+    let task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "write the leased inspect task",
+    )?;
+    let leased = runtime
+        .lease_next_task(LeaseNextTaskRequest {
+            worker_id: "queue-inspect-worker".to_owned(),
+            lease_duration_ms: 30_000,
+        })?
+        .expect("task should be leased");
+    let lease = leased.lease.as_ref().expect("lease slot");
+    let lease_id = lease.lease_id;
+    let lease_deadline_ms = lease
+        .lease_deadline_ms
+        .expect("lease deadline should be recorded");
+    let events_before = runtime.events_for_session(started.session_id)?;
+    let store = PostgresEventStore::connect(&database_url)?;
+    let queue_before = store.task_queue_records(Some(started.session_id))?;
+
+    let active = runtime.inspect_task_queue(
+        TaskQueueInspectRequest::new()
+            .with_session_id(started.session_id)
+            .with_now_ms(0),
+    )?;
+    assert_eq!(active.active_leased_count, 1);
+    assert_eq!(active.expired_looking_leased_count, 0);
+    assert_eq!(active.tasks[0].task_id, task_id);
+    assert_eq!(active.tasks[0].queue_status, TASK_LEASED_STATE);
+    assert_eq!(active.tasks[0].status_class, "active_leased");
+    assert_eq!(active.tasks[0].lease_state, "active");
+    assert_eq!(
+        active.tasks[0].worker_id.as_deref(),
+        Some("queue-inspect-worker")
+    );
+    assert_eq!(active.tasks[0].lease_id, Some(lease_id));
+    assert_eq!(active.tasks[0].lease_deadline_ms, Some(lease_deadline_ms));
+
+    let expired_looking = runtime.inspect_task_queue(
+        TaskQueueInspectRequest::new()
+            .with_session_id(started.session_id)
+            .with_now_ms(i64::MAX),
+    )?;
+    assert_eq!(expired_looking.active_leased_count, 0);
+    assert_eq!(expired_looking.expired_looking_leased_count, 1);
+    assert_eq!(expired_looking.tasks[0].queue_status, TASK_LEASED_STATE);
+    assert_eq!(
+        expired_looking.tasks[0].status_class,
+        "expired_looking_leased"
+    );
+    assert_eq!(expired_looking.tasks[0].lease_state, "expired_looking");
+
+    let events_after = runtime.events_for_session(started.session_id)?;
+    let queue_after = store.task_queue_records(Some(started.session_id))?;
+    assert_eq!(events_after.len(), events_before.len());
+    assert_eq!(queue_after, queue_before);
+
+    Ok(())
+}
+
+#[test]
+fn task_queue_inspect_report_exposes_retry_stopped_and_max_retry_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let stopped_session =
+        runtime.start_session(StartSessionRequest::new("queue-inspect-stopped"))?;
+    let stopped_task_id = create_and_enqueue_task_with_max_retries(
+        &mut runtime,
+        stopped_session.session_id,
+        "write the stopped inspect task",
+        0,
+    )?;
+    runtime
+        .lease_next_task(LeaseNextTaskRequest {
+            worker_id: "queue-stopped-worker".to_owned(),
+            lease_duration_ms: 1,
+        })?
+        .expect("stopped task should be leased");
+    runtime.expire_task_leases(i64::MAX)?;
+
+    let stopped_report = runtime.inspect_task_queue(
+        TaskQueueInspectRequest::new()
+            .with_session_id(stopped_session.session_id)
+            .with_now_ms(0),
+    )?;
+    assert_eq!(stopped_report.total_count, 1);
+    assert_eq!(stopped_report.tasks[0].task_id, stopped_task_id);
+    assert_eq!(stopped_report.tasks[0].queue_status, TASK_STOPPED_STATE);
+    assert_eq!(
+        stopped_report.tasks[0].task_status.as_deref(),
+        Some(TASK_STOPPED_STATE)
+    );
+    assert_eq!(stopped_report.tasks[0].retry_count, 0);
+    assert_eq!(stopped_report.tasks[0].max_retries, 0);
+    assert_eq!(
+        stopped_report.tasks[0].stop_reason.as_deref(),
+        Some(TASK_STOP_REASON_MAX_RETRIES_EXCEEDED)
+    );
+
+    let retry_session = runtime.start_session(StartSessionRequest::new("queue-inspect-retry"))?;
+    let retry_task_id = create_and_enqueue_task_with_max_retries(
+        &mut runtime,
+        retry_session.session_id,
+        "write the retry inspect task",
+        2,
+    )?;
+    runtime
+        .lease_next_task(LeaseNextTaskRequest {
+            worker_id: "queue-retry-worker".to_owned(),
+            lease_duration_ms: 1,
+        })?
+        .expect("retry task should be leased");
+    runtime.expire_task_leases(i64::MAX)?;
+
+    let retry_report = runtime.inspect_task_queue(
+        TaskQueueInspectRequest::new()
+            .with_session_id(retry_session.session_id)
+            .with_now_ms(0),
+    )?;
+    assert_eq!(retry_report.total_count, 1);
+    assert_eq!(retry_report.tasks[0].task_id, retry_task_id);
+    assert_eq!(retry_report.tasks[0].queue_status, TASK_RETRY_QUEUED_STATE);
+    assert_eq!(
+        retry_report.tasks[0].task_status.as_deref(),
+        Some(TASK_RETRY_QUEUED_STATE)
+    );
+    assert_eq!(retry_report.tasks[0].retry_count, 1);
+    assert_eq!(retry_report.tasks[0].max_retries, 2);
+    assert_eq!(
+        retry_report.tasks[0].stop_reason.as_deref(),
+        Some(TASK_STOP_REASON_LEASE_EXPIRED)
+    );
 
     Ok(())
 }

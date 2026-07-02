@@ -109,6 +109,27 @@ impl PostgresEventStore {
         Ok(row.map(task_queue_record_from_row))
     }
 
+    pub fn task_queue_records(
+        &self,
+        session_id: Option<Uuid>,
+    ) -> HarnessResult<Vec<TaskQueueRecord>> {
+        let mut client = self.client()?;
+        let rows = client
+            .query(
+                "
+                SELECT session_id, task_id, status, worker_id, lease_id, lease_deadline_ms,
+                    last_reason, retry_count, max_retries, stop_reason
+                FROM harness_runtime.task_queue
+                WHERE ($1::uuid IS NULL OR session_id = $1)
+                ORDER BY created_at ASC, task_id ASC
+                ",
+                &[&session_id],
+            )
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+
+        Ok(rows.into_iter().map(task_queue_record_from_row).collect())
+    }
+
     pub fn enqueue_task(
         &self,
         session_id: Uuid,

@@ -14,7 +14,8 @@ use harness_runtime::{
     LeasedCodexWorkerTaskResult, Runtime, SelfRecoveryLoopRequest, SelfRecoveryLoopResult,
     SessionContextCompileRequest, SessionContextCompileResult, SessionInspectReport,
     SessionProjection, SmallCodingTaskRequest, SmallCodingTaskResult, StartSessionRequest,
-    TaskInspectReport, TaskProjection, VerificationCommandRequest, VerificationCommandResult,
+    TaskInspectReport, TaskProjection, TaskQueueInspectReport, TaskQueueInspectRequest,
+    TaskQueueInspectStatusCount, VerificationCommandRequest, VerificationCommandResult,
 };
 use uuid::Uuid;
 
@@ -192,6 +193,34 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
                         print_task_inspect_json(&report)?;
                     } else {
                         print_task_inspect_report(&report);
+                    }
+
+                    Ok(())
+                }
+                "queue-inspect" => {
+                    let session_id = optional_arg_value(&args, "--session-id")
+                        .map(|session_id| {
+                            Uuid::parse_str(session_id).map_err(|error| {
+                                HarnessError::new(format!("session id must be a UUID: {error}"))
+                            })
+                        })
+                        .transpose()?;
+                    let now_ms = optional_arg_value(&args, "--now-ms")
+                        .map(|value| parse_i64_arg("--now-ms", value))
+                        .transpose()?;
+                    let mut request = TaskQueueInspectRequest::new();
+                    if let Some(session_id) = session_id {
+                        request = request.with_session_id(session_id);
+                    }
+                    if let Some(now_ms) = now_ms {
+                        request = request.with_now_ms(now_ms);
+                    }
+                    let report = runtime.inspect_task_queue(request)?;
+
+                    if has_flag(&args, "--json") {
+                        print_task_queue_inspect_json(&report)?;
+                    } else {
+                        print_task_queue_inspect_report(&report);
                     }
 
                     Ok(())
@@ -1235,6 +1264,92 @@ fn print_task_inspect_json(report: &TaskInspectReport) -> HarnessResult<()> {
         .map_err(|error| HarnessError::new(error.to_string()))?;
     println!("{json}");
     Ok(())
+}
+
+fn print_task_queue_inspect_report(report: &TaskQueueInspectReport) {
+    println!(
+        "session_id={}",
+        report
+            .session_id
+            .map_or_else(String::new, |session_id| session_id.to_string())
+    );
+    println!("queue_now_ms={}", report.now_ms);
+    println!("queue_empty={}", report.empty);
+    println!("queue_total_count={}", report.total_count);
+    println!("queue_active_leased_count={}", report.active_leased_count);
+    println!(
+        "queue_expired_looking_leased_count={}",
+        report.expired_looking_leased_count
+    );
+    println!(
+        "queue_status_counts={}",
+        format_task_queue_counts(&report.queue_status_counts)
+    );
+    println!(
+        "queue_status_class_counts={}",
+        format_task_queue_counts(&report.status_class_counts)
+    );
+    println!(
+        "queue_task_status_counts={}",
+        format_task_queue_counts(&report.task_status_counts)
+    );
+    println!(
+        "queue_lease_state_counts={}",
+        format_task_queue_counts(&report.lease_state_counts)
+    );
+    println!("source_of_truth={}", report.source_of_truth);
+    println!("projection_kind={}", report.projection_kind);
+
+    for (index, task) in report.tasks.iter().enumerate() {
+        println!("queue_task_{index}_session_id={}", task.session_id);
+        println!("queue_task_{index}_id={}", task.task_id);
+        println!(
+            "queue_task_{index}_task_status={}",
+            task.task_status.as_deref().unwrap_or_default()
+        );
+        println!("queue_task_{index}_queue_status={}", task.queue_status);
+        println!("queue_task_{index}_status_class={}", task.status_class);
+        println!("queue_task_{index}_lease_state={}", task.lease_state);
+        println!(
+            "queue_task_{index}_worker_id={}",
+            task.worker_id.as_deref().unwrap_or_default()
+        );
+        println!(
+            "queue_task_{index}_lease_id={}",
+            task.lease_id
+                .map_or_else(String::new, |lease_id| lease_id.to_string())
+        );
+        println!(
+            "queue_task_{index}_lease_deadline_ms={}",
+            task.lease_deadline_ms
+                .map_or_else(String::new, |deadline| deadline.to_string())
+        );
+        println!("queue_task_{index}_retry_count={}", task.retry_count);
+        println!("queue_task_{index}_max_retries={}", task.max_retries);
+        println!(
+            "queue_task_{index}_stop_reason={}",
+            task.stop_reason.as_deref().unwrap_or_default()
+        );
+        println!(
+            "queue_task_{index}_last_reason={}",
+            task.last_reason.as_deref().unwrap_or_default()
+        );
+    }
+}
+
+fn print_task_queue_inspect_json(report: &TaskQueueInspectReport) -> HarnessResult<()> {
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|error| HarnessError::new(error.to_string()))?;
+    println!("{json}");
+    Ok(())
+}
+
+fn format_task_queue_counts(counts: &[TaskQueueInspectStatusCount]) -> String {
+    counts
+        .iter()
+        .map(|count| format!("{}:{}", count.status, count.count))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn print_verification_result(result: &VerificationCommandResult) {

@@ -860,6 +860,227 @@ fn cli_inspects_task_text_and_json_without_mutating_state() -> Result<(), Box<dy
 }
 
 #[test]
+fn cli_inspects_task_queue_text_and_json_without_mutating_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+
+    let migrate = Command::new(bin)
+        .args(["migrate", "--database-url", &database_url])
+        .output()?;
+    assert!(migrate.status.success());
+
+    let repo_path = std::env::current_dir()?.display().to_string();
+    let start = Command::new(bin)
+        .args([
+            "session",
+            "start",
+            "--repo",
+            &repo_path,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(start.status.success());
+
+    let start_stdout = String::from_utf8(start.stdout)?;
+    let session_id = value_for_key(&start_stdout, "session_id").expect("session_id output");
+
+    let empty = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "queue-inspect",
+            "--session-id",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--now-ms",
+            "0",
+        ])
+        .output()?;
+    assert!(empty.status.success());
+    let empty_stdout = String::from_utf8(empty.stdout)?;
+    assert!(empty_stdout.contains(&format!("session_id={session_id}")));
+    assert!(empty_stdout.contains("queue_empty=true"));
+    assert!(empty_stdout.contains("queue_total_count=0"));
+    assert!(empty_stdout.contains("projection_kind=task_queue_inspect_report"));
+
+    let create = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "create",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task",
+            "write the queue inspectable CLI task",
+        ])
+        .output()?;
+    assert!(create.status.success());
+    let create_stdout = String::from_utf8(create.stdout)?;
+    let task_id = value_for_key(&create_stdout, "task_id").expect("task_id output");
+
+    let enqueue = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "enqueue",
+            session_id,
+            task_id,
+            "--database-url",
+            &database_url,
+            "--max-retries",
+            "2",
+        ])
+        .output()?;
+    assert!(enqueue.status.success());
+
+    let lease = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "lease-next",
+            "--database-url",
+            &database_url,
+            "--worker-id",
+            "cli-queue-worker",
+            "--lease-ms",
+            "30000",
+        ])
+        .output()?;
+    assert!(lease.status.success());
+    let lease_stdout = String::from_utf8(lease.stdout)?;
+    let lease_id = value_for_key(&lease_stdout, "task_lease_id").expect("lease id output");
+    let lease_deadline_ms =
+        value_for_key(&lease_stdout, "task_lease_deadline_ms").expect("lease deadline output");
+
+    let before_show = Command::new(bin)
+        .args([
+            "session",
+            "show",
+            session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(before_show.status.success());
+    let before_show_stdout = String::from_utf8(before_show.stdout)?;
+    assert!(before_show_stdout.contains("event_count=4"));
+
+    let inspect_text = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "queue-inspect",
+            "--session-id",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--now-ms",
+            "0",
+        ])
+        .output()?;
+    assert!(inspect_text.status.success());
+    let inspect_text_stdout = String::from_utf8(inspect_text.stdout)?;
+    assert!(inspect_text_stdout.contains("queue_empty=false"));
+    assert!(inspect_text_stdout.contains("queue_total_count=1"));
+    assert!(inspect_text_stdout.contains("queue_active_leased_count=1"));
+    assert!(inspect_text_stdout.contains("queue_expired_looking_leased_count=0"));
+    assert!(inspect_text_stdout.contains("queue_status_counts=leased:1"));
+    assert!(inspect_text_stdout.contains("queue_status_class_counts=active_leased:1"));
+    assert!(inspect_text_stdout.contains("queue_task_status_counts=leased:1"));
+    assert!(inspect_text_stdout.contains("queue_lease_state_counts=active:1"));
+    assert!(inspect_text_stdout.contains(&format!("queue_task_0_id={task_id}")));
+    assert!(inspect_text_stdout.contains("queue_task_0_task_status=leased"));
+    assert!(inspect_text_stdout.contains("queue_task_0_queue_status=leased"));
+    assert!(inspect_text_stdout.contains("queue_task_0_status_class=active_leased"));
+    assert!(inspect_text_stdout.contains("queue_task_0_lease_state=active"));
+    assert!(inspect_text_stdout.contains("queue_task_0_worker_id=cli-queue-worker"));
+    assert!(inspect_text_stdout.contains(&format!("queue_task_0_lease_id={lease_id}")));
+    assert!(inspect_text_stdout.contains(&format!(
+        "queue_task_0_lease_deadline_ms={lease_deadline_ms}"
+    )));
+    assert!(inspect_text_stdout.contains("queue_task_0_retry_count=0"));
+    assert!(inspect_text_stdout.contains("queue_task_0_max_retries=2"));
+    assert!(inspect_text_stdout.contains("source_of_truth=task_queue+EventLog"));
+    assert!(inspect_text_stdout.contains("projection_kind=task_queue_inspect_report"));
+
+    let inspect_json = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "queue-inspect",
+            "--session-id",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--now-ms",
+            &i64::MAX.to_string(),
+            "--json",
+        ])
+        .output()?;
+    assert!(inspect_json.status.success());
+    let inspect_json_stdout = String::from_utf8(inspect_json.stdout)?;
+    let json: Value = serde_json::from_str(&inspect_json_stdout)?;
+    assert_eq!(json["session_id"], session_id);
+    assert_eq!(json["total_count"], 1);
+    assert_eq!(json["active_leased_count"], 0);
+    assert_eq!(json["expired_looking_leased_count"], 1);
+    assert_eq!(json["queue_status_counts"][0]["status"], "leased");
+    assert_eq!(
+        json["status_class_counts"][0]["status"],
+        "expired_looking_leased"
+    );
+    assert_eq!(json["lease_state_counts"][0]["status"], "expired_looking");
+    assert_eq!(json["tasks"][0]["task_id"], task_id);
+    assert_eq!(json["tasks"][0]["queue_status"], "leased");
+    assert_eq!(json["tasks"][0]["status_class"], "expired_looking_leased");
+    assert_eq!(json["tasks"][0]["lease_state"], "expired_looking");
+    assert_eq!(json["tasks"][0]["worker_id"], "cli-queue-worker");
+    assert_eq!(json["tasks"][0]["lease_id"], lease_id);
+    assert_eq!(json["tasks"][0]["retry_count"], 0);
+    assert_eq!(json["tasks"][0]["max_retries"], 2);
+    assert_eq!(json["source_of_truth"], "task_queue+EventLog");
+
+    let after_show = Command::new(bin)
+        .args([
+            "session",
+            "show",
+            session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(after_show.status.success());
+    let after_show_stdout = String::from_utf8(after_show.stdout)?;
+    assert!(after_show_stdout.contains("event_count=4"));
+
+    let after_task = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "show",
+            session_id,
+            task_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(after_task.status.success());
+    let after_task_stdout = String::from_utf8(after_task.stdout)?;
+    assert!(after_task_stdout.contains("task_queue_status=leased"));
+    assert!(after_task_stdout.contains(&format!("task_lease_id={lease_id}")));
+    assert!(after_task_stdout.contains(&format!("task_lease_deadline_ms={lease_deadline_ms}")));
+
+    Ok(())
+}
+
+#[test]
 fn cli_enqueues_leases_and_completes_session_task() -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
         return Ok(());
