@@ -204,6 +204,121 @@ fn cli_creates_lists_and_shows_session_tasks() -> Result<(), Box<dyn std::error:
 }
 
 #[test]
+fn cli_enqueues_leases_and_completes_session_task() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+
+    let migrate = Command::new(bin)
+        .args(["migrate", "--database-url", &database_url])
+        .output()?;
+    assert!(migrate.status.success());
+
+    let repo_path = std::env::current_dir()?.display().to_string();
+    let start = Command::new(bin)
+        .args([
+            "session",
+            "start",
+            "--repo",
+            &repo_path,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(start.status.success());
+
+    let start_stdout = String::from_utf8(start.stdout)?;
+    let session_id = value_for_key(&start_stdout, "session_id").expect("session_id output");
+
+    let create = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "create",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task",
+            "write the queued CLI task",
+        ])
+        .output()?;
+    assert!(create.status.success());
+
+    let create_stdout = String::from_utf8(create.stdout)?;
+    let task_id = value_for_key(&create_stdout, "task_id").expect("task_id output");
+    assert!(create_stdout.contains("task_status=created"));
+    assert!(create_stdout.contains("task_queue_status="));
+
+    let enqueue = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "enqueue",
+            session_id,
+            task_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(enqueue.status.success());
+
+    let enqueue_stdout = String::from_utf8(enqueue.stdout)?;
+    assert!(enqueue_stdout.contains("task_status=queued"));
+    assert!(enqueue_stdout.contains("task_queue_status=queued"));
+    assert!(enqueue_stdout.contains("task_queue_reason=task enqueued for worker execution"));
+
+    let lease = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "lease-next",
+            "--database-url",
+            &database_url,
+            "--worker-id",
+            "cli-worker",
+            "--lease-ms",
+            "30000",
+        ])
+        .output()?;
+    assert!(lease.status.success());
+
+    let lease_stdout = String::from_utf8(lease.stdout)?;
+    let lease_id = value_for_key(&lease_stdout, "task_lease_id").expect("lease id output");
+    assert!(lease_stdout.contains("task_leased=true"));
+    assert!(lease_stdout.contains("task_status=leased"));
+    assert!(lease_stdout.contains("task_queue_status=leased"));
+    assert!(lease_stdout.contains("task_lease_worker_id=cli-worker"));
+    assert!(lease_stdout.contains("task_lease_status=leased"));
+    assert!(lease_stdout.contains("task_lease_deadline_ms="));
+
+    let complete = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "complete",
+            task_id,
+            "--database-url",
+            &database_url,
+            "--lease-id",
+            lease_id,
+            "--reason",
+            "CLI worker completed task",
+        ])
+        .output()?;
+    assert!(complete.status.success());
+
+    let complete_stdout = String::from_utf8(complete.stdout)?;
+    assert!(complete_stdout.contains("task_status=completed"));
+    assert!(complete_stdout.contains("task_queue_status=completed"));
+    assert!(complete_stdout.contains("task_lease_status=completed"));
+    assert!(complete_stdout.contains("task_lease_reason=CLI worker completed task"));
+
+    Ok(())
+}
+
+#[test]
 fn cli_codex_acceptance_reports_explicit_skip_when_unavailable()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {

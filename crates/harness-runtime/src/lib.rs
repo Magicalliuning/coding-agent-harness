@@ -1,20 +1,22 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
 pub use harness_context::ContextBudget;
 use harness_context::{CompiledContextBundle, ContextCompileRequest, compile_repository_context};
 use harness_core::{HarnessError, HarnessResult};
-use harness_db::PostgresEventStore;
+use harness_db::{PostgresEventStore, TaskQueueRecord};
 use harness_events::{
     CommitApprovalDecisionPayload, CommitApprovalPendingPayload, CommitHandoffPayload,
     ContextCompiledPayload, ContextSourcePayload, DiffSummaryPayload, EventEnvelope, EventType,
     FilePatchIntentPayload, FilePatchObservationPayload, FilePatchPayload, ModelDecisionPayload,
     ModelRequestPayload, NewEvent, PolicyDecisionPayload, RecoveryFailurePayload,
     RecoveryPlanPayload, RecoveryRepairAttemptPayload, RecoveryStoppedPayload,
-    SessionStartedPayload, SkillMetadataPayload, TaskCreatedPayload, ToolCallIntentPayload,
-    ToolObservationPayload, WorkerLaneBudgetPayload, WorkerLaneObservationPayload,
-    WorkerLaneRequestPayload, WorkerLaneStatePayload, WorkerLaneWorktreeAllocatedPayload,
+    SessionStartedPayload, SkillMetadataPayload, TaskCreatedPayload, TaskLeasePayload,
+    TaskQueuePayload, ToolCallIntentPayload, ToolObservationPayload, WorkerLaneBudgetPayload,
+    WorkerLaneObservationPayload, WorkerLaneRequestPayload, WorkerLaneStatePayload,
+    WorkerLaneWorktreeAllocatedPayload,
 };
 use harness_models::{DeterministicFakeModelProvider, FakeModelRequest, FilePatchProposal};
 use harness_policy::{
@@ -39,6 +41,11 @@ pub const COMMITTING_STATE: &str = "committing";
 pub const COMMITTED_STATE: &str = "committed";
 pub const COMMIT_FAILED_STATE: &str = "commit_failed";
 pub const TASK_CREATED_STATE: &str = "created";
+pub const TASK_QUEUED_STATE: &str = "queued";
+pub const TASK_LEASED_STATE: &str = "leased";
+pub const TASK_COMPLETED_STATE: &str = "completed";
+pub const TASK_FAILED_STATE: &str = "failed";
+pub const TASK_CANCELLED_STATE: &str = "cancelled";
 pub const DEFAULT_TASK_WORKER_LANE_KIND: &str = "codex_cli_worker_lane";
 pub const RECOVERY_FAILED_STATE: &str = "recovery_failed";
 pub const SELF_RECOVERY_MAX_ROUNDS: usize = 2;
@@ -104,6 +111,22 @@ impl CreateTaskRequest {
             worker_lane_kind: DEFAULT_TASK_WORKER_LANE_KIND.to_owned(),
             context: SessionContextCompileRequest::default(),
             max_output_tokens: 256,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseNextTaskRequest {
+    pub worker_id: String,
+    pub lease_duration_ms: u64,
+}
+
+impl LeaseNextTaskRequest {
+    #[must_use]
+    pub fn new(worker_id: impl Into<String>) -> Self {
+        Self {
+            worker_id: worker_id.into(),
+            lease_duration_ms: 60_000,
         }
     }
 }
@@ -278,6 +301,21 @@ pub struct TaskCommitProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskQueueProjection {
+    pub status: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskLeaseProjection {
+    pub lease_id: Uuid,
+    pub worker_id: String,
+    pub status: String,
+    pub lease_deadline_ms: Option<i64>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskProjection {
     pub session_id: Uuid,
     pub task_id: Uuid,
@@ -290,6 +328,8 @@ pub struct TaskProjection {
     pub max_output_tokens: usize,
     pub worktree: Option<TaskWorktreeProjection>,
     pub worker_output: Option<TaskWorkerOutputProjection>,
+    pub queue: Option<TaskQueueProjection>,
+    pub lease: Option<TaskLeaseProjection>,
     pub diff: Option<DiffSummary>,
     pub approval: Option<TaskApprovalProjection>,
     pub commit: Option<TaskCommitProjection>,
@@ -636,6 +676,123 @@ impl Runtime {
             .into_iter()
             .find(|task| task.task_id == task_id)
             .ok_or_else(|| HarnessError::new(format!("task not found: {task_id}")))
+    }
+
+    pub fn enqueue_task(
+        &mut self,
+        session_id: Uuid,
+        task_id: Uuid,
+    ) -> HarnessResult<TaskProjection> {
+        self.show_task(session_id, task_id)?;
+        let record = self.event_store.enqueue_task(session_id, task_id)?;
+        self.event_store.append_event(NewEvent::task_enqueued(
+            session_id,
+            TaskQueuePayload::new(
+                task_id,
+                TASK_QUEUED_STATE,
+                record
+                    .last_reason
+                    .as_deref()
+                    .unwrap_or("task enqueued for worker execution"),
+            ),
+        )?)?;
+
+        self.show_task(session_id, task_id)
+    }
+
+    pub fn lease_next_task(
+        &mut self,
+        request: LeaseNextTaskRequest,
+    ) -> HarnessResult<Option<TaskProjection>> {
+        if request.worker_id.trim().is_empty() {
+            return Err(HarnessError::new("worker id cannot be empty"));
+        }
+
+        if request.lease_duration_ms == 0 {
+            return Err(HarnessError::new("lease duration must be positive"));
+        }
+
+        let lease_id = Uuid::new_v4();
+        let lease_deadline_ms = current_time_ms()?.saturating_add(
+            i64::try_from(request.lease_duration_ms)
+                .map_err(|_| HarnessError::new("lease duration is out of range"))?,
+        );
+        let Some(record) = self.event_store.lease_next_queued_task(
+            request.worker_id.trim(),
+            lease_id,
+            lease_deadline_ms,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        self.event_store
+            .append_event(NewEvent::task_lease_acquired(
+                record.session_id,
+                task_lease_payload_from_record(&record)?,
+            )?)?;
+
+        self.show_task(record.session_id, record.task_id).map(Some)
+    }
+
+    pub fn complete_task_lease(
+        &mut self,
+        task_id: Uuid,
+        lease_id: Uuid,
+        reason: impl Into<String>,
+    ) -> HarnessResult<TaskProjection> {
+        self.finish_task_lease(task_id, lease_id, TASK_COMPLETED_STATE, reason)
+    }
+
+    pub fn fail_task_lease(
+        &mut self,
+        task_id: Uuid,
+        lease_id: Uuid,
+        reason: impl Into<String>,
+    ) -> HarnessResult<TaskProjection> {
+        self.finish_task_lease(task_id, lease_id, TASK_FAILED_STATE, reason)
+    }
+
+    pub fn cancel_task_lease(
+        &mut self,
+        task_id: Uuid,
+        lease_id: Uuid,
+        reason: impl Into<String>,
+    ) -> HarnessResult<TaskProjection> {
+        self.finish_task_lease(task_id, lease_id, TASK_CANCELLED_STATE, reason)
+    }
+
+    fn finish_task_lease(
+        &mut self,
+        task_id: Uuid,
+        lease_id: Uuid,
+        status: &str,
+        reason: impl Into<String>,
+    ) -> HarnessResult<TaskProjection> {
+        let reason = reason.into();
+        if reason.trim().is_empty() {
+            return Err(HarnessError::new(
+                "task lease transition reason is required",
+            ));
+        }
+
+        let record =
+            self.event_store
+                .transition_leased_task(task_id, lease_id, status, reason.trim())?;
+        let payload = task_lease_payload_from_record(&record)?;
+        let event = match status {
+            TASK_COMPLETED_STATE => NewEvent::task_lease_completed(record.session_id, payload)?,
+            TASK_FAILED_STATE => NewEvent::task_lease_failed(record.session_id, payload)?,
+            TASK_CANCELLED_STATE => NewEvent::task_lease_cancelled(record.session_id, payload)?,
+            other => {
+                return Err(HarnessError::new(format!(
+                    "unsupported task status: {other}"
+                )));
+            }
+        };
+        self.event_store.append_event(event)?;
+
+        self.show_task(record.session_id, task_id)
     }
 
     pub fn events_for_session(&self, session_id: Uuid) -> HarnessResult<Vec<EventEnvelope>> {
@@ -1644,6 +1801,33 @@ fn task_projections_from_events(
         };
 
         match event.event_type {
+            EventType::TaskEnqueued => {
+                let status = payload_string(&event.payload, "status")?;
+                task.status = status.clone();
+                task.queue = Some(TaskQueueProjection {
+                    status,
+                    reason: payload_optional_string(&event.payload, "reason"),
+                });
+            }
+            EventType::TaskLeaseAcquired
+            | EventType::TaskLeaseCompleted
+            | EventType::TaskLeaseFailed
+            | EventType::TaskLeaseCancelled => {
+                let status = payload_string(&event.payload, "status")?;
+                let reason = payload_optional_string(&event.payload, "reason");
+                task.status = status.clone();
+                task.queue = Some(TaskQueueProjection {
+                    status: status.clone(),
+                    reason: reason.clone(),
+                });
+                task.lease = Some(TaskLeaseProjection {
+                    lease_id: payload_uuid(&event.payload, "lease_id")?,
+                    worker_id: payload_string(&event.payload, "worker_id")?,
+                    status,
+                    lease_deadline_ms: payload_i64_optional(&event.payload, "lease_deadline_ms"),
+                    reason,
+                });
+            }
             EventType::WorkerLaneRequested => {
                 task.worker_lane_kind = payload_string(&event.payload, "lane_kind")?;
                 task.input = payload_string(&event.payload, "task")?;
@@ -1733,6 +1917,8 @@ fn task_projection_from_created_payload(
         max_output_tokens: payload.max_output_tokens,
         worktree: None,
         worker_output: None,
+        queue: None,
+        lease: None,
         diff: None,
         approval: None,
         commit: None,
@@ -1978,12 +2164,26 @@ fn payload_optional_string(payload: &serde_json::Value, key: &str) -> Option<Str
         .map(ToOwned::to_owned)
 }
 
+fn payload_uuid(payload: &serde_json::Value, key: &str) -> HarnessResult<Uuid> {
+    payload
+        .get(key)
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| HarnessError::new(format!("payload {key} is missing")))
+        .and_then(|value| {
+            Uuid::parse_str(value).map_err(|error| HarnessError::new(error.to_string()))
+        })
+}
+
 fn payload_task_id(payload: &serde_json::Value) -> HarnessResult<Option<Uuid>> {
     payload
         .get("task_id")
         .and_then(|value| value.as_str())
         .map(|value| Uuid::parse_str(value).map_err(|error| HarnessError::new(error.to_string())))
         .transpose()
+}
+
+fn payload_i64_optional(payload: &serde_json::Value, key: &str) -> Option<i64> {
+    payload.get(key).and_then(|value| value.as_i64())
 }
 
 fn payload_i32_optional(payload: &serde_json::Value, key: &str) -> HarnessResult<Option<i32>> {
@@ -1995,6 +2195,33 @@ fn payload_i32_optional(payload: &serde_json::Value, key: &str) -> HarnessResult
                 .map_err(|_| HarnessError::new(format!("payload {key} is out of range")))
         })
         .transpose()
+}
+
+fn task_lease_payload_from_record(record: &TaskQueueRecord) -> HarnessResult<TaskLeasePayload> {
+    Ok(TaskLeasePayload::new(
+        record.task_id,
+        record
+            .lease_id
+            .ok_or_else(|| HarnessError::new("task lease id was not recorded"))?,
+        record
+            .worker_id
+            .as_deref()
+            .ok_or_else(|| HarnessError::new("task lease worker id was not recorded"))?,
+        record.status.as_str(),
+        record.lease_deadline_ms,
+        record
+            .last_reason
+            .as_deref()
+            .unwrap_or("task lease updated"),
+    ))
+}
+
+fn current_time_ms() -> HarnessResult<i64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| HarnessError::new(error.to_string()))?;
+    i64::try_from(duration.as_millis())
+        .map_err(|_| HarnessError::new("system time is out of range"))
 }
 
 fn payload_u64(payload: &serde_json::Value, key: &str) -> HarnessResult<u64> {
@@ -2526,6 +2753,40 @@ mod tests {
             ),
         )
         .expect("task created event");
+        let lease_id = Uuid::new_v4();
+        let enqueued = NewEvent::task_enqueued(
+            session_id,
+            TaskQueuePayload::new(
+                task_id,
+                TASK_QUEUED_STATE,
+                "task enqueued for worker execution",
+            ),
+        )
+        .expect("task enqueued event");
+        let lease_acquired = NewEvent::task_lease_acquired(
+            session_id,
+            TaskLeasePayload::new(
+                task_id,
+                lease_id,
+                "worker-1",
+                TASK_LEASED_STATE,
+                Some(123_456),
+                "task lease acquired",
+            ),
+        )
+        .expect("task lease acquired event");
+        let lease_completed = NewEvent::task_lease_completed(
+            session_id,
+            TaskLeasePayload::new(
+                task_id,
+                lease_id,
+                "worker-1",
+                TASK_COMPLETED_STATE,
+                Some(123_456),
+                "worker completed task",
+            ),
+        )
+        .expect("task lease completed event");
         let diff = NewEvent::diff_recorded(
             session_id,
             DiffSummaryPayload::new(1, 3, 0, vec![".harness/task.md".to_owned()])
@@ -2555,9 +2816,12 @@ mod tests {
         let events = vec![
             event_envelope(1, session_started),
             event_envelope(2, task_created),
-            event_envelope(3, diff),
-            event_envelope(4, approval),
-            event_envelope(5, commit),
+            event_envelope(3, enqueued),
+            event_envelope(4, lease_acquired),
+            event_envelope(5, lease_completed),
+            event_envelope(6, diff),
+            event_envelope(7, approval),
+            event_envelope(8, commit),
         ];
 
         let tasks = task_projections_from_events(session_id, &events).expect("task projection");
@@ -2573,6 +2837,14 @@ mod tests {
             tasks[0].diff.as_ref().expect("diff slot").paths,
             vec![".harness/task.md"]
         );
+        let queue = tasks[0].queue.as_ref().expect("task queue slot");
+        assert_eq!(queue.status, TASK_COMPLETED_STATE);
+        assert_eq!(queue.reason.as_deref(), Some("worker completed task"));
+        let lease = tasks[0].lease.as_ref().expect("task lease slot");
+        assert_eq!(lease.lease_id, lease_id);
+        assert_eq!(lease.worker_id, "worker-1");
+        assert_eq!(lease.status, TASK_COMPLETED_STATE);
+        assert_eq!(lease.lease_deadline_ms, Some(123_456));
         assert_eq!(
             tasks[0].approval.as_ref().expect("approval slot").state,
             PENDING_COMMIT_APPROVAL_STATE
@@ -2586,7 +2858,7 @@ mod tests {
                 .as_deref(),
             Some("0123456789abcdef0123456789abcdef01234567")
         );
-        assert_eq!(tasks[0].event_count, 5);
+        assert_eq!(tasks[0].event_count, 8);
     }
 
     #[test]

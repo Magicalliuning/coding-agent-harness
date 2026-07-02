@@ -7,6 +7,11 @@ pub const EVENTLOG_SCHEMA_VERSION: u16 = 1;
 
 pub const SESSION_STARTED_EVENT: &str = "session.started";
 pub const TASK_CREATED_EVENT: &str = "task.created";
+pub const TASK_ENQUEUED_EVENT: &str = "task.enqueued";
+pub const TASK_LEASE_ACQUIRED_EVENT: &str = "task.lease_acquired";
+pub const TASK_LEASE_COMPLETED_EVENT: &str = "task.lease_completed";
+pub const TASK_LEASE_FAILED_EVENT: &str = "task.lease_failed";
+pub const TASK_LEASE_CANCELLED_EVENT: &str = "task.lease_cancelled";
 pub const TOOL_CALL_INTENDED_EVENT: &str = "tool.call_intended";
 pub const POLICY_DECIDED_EVENT: &str = "policy.decided";
 pub const TOOL_OBSERVATION_RECORDED_EVENT: &str = "tool.observation_recorded";
@@ -33,6 +38,11 @@ pub const WORKER_LANE_OBSERVATION_RECORDED_EVENT: &str = "worker_lane.observatio
 pub enum EventType {
     SessionStarted,
     TaskCreated,
+    TaskEnqueued,
+    TaskLeaseAcquired,
+    TaskLeaseCompleted,
+    TaskLeaseFailed,
+    TaskLeaseCancelled,
     ToolCallIntended,
     PolicyDecided,
     ToolObservationRecorded,
@@ -62,6 +72,11 @@ impl EventType {
         match self {
             Self::SessionStarted => SESSION_STARTED_EVENT,
             Self::TaskCreated => TASK_CREATED_EVENT,
+            Self::TaskEnqueued => TASK_ENQUEUED_EVENT,
+            Self::TaskLeaseAcquired => TASK_LEASE_ACQUIRED_EVENT,
+            Self::TaskLeaseCompleted => TASK_LEASE_COMPLETED_EVENT,
+            Self::TaskLeaseFailed => TASK_LEASE_FAILED_EVENT,
+            Self::TaskLeaseCancelled => TASK_LEASE_CANCELLED_EVENT,
             Self::ToolCallIntended => TOOL_CALL_INTENDED_EVENT,
             Self::PolicyDecided => POLICY_DECIDED_EVENT,
             Self::ToolObservationRecorded => TOOL_OBSERVATION_RECORDED_EVENT,
@@ -90,6 +105,11 @@ impl EventType {
         match value {
             SESSION_STARTED_EVENT => Ok(Self::SessionStarted),
             TASK_CREATED_EVENT => Ok(Self::TaskCreated),
+            TASK_ENQUEUED_EVENT => Ok(Self::TaskEnqueued),
+            TASK_LEASE_ACQUIRED_EVENT => Ok(Self::TaskLeaseAcquired),
+            TASK_LEASE_COMPLETED_EVENT => Ok(Self::TaskLeaseCompleted),
+            TASK_LEASE_FAILED_EVENT => Ok(Self::TaskLeaseFailed),
+            TASK_LEASE_CANCELLED_EVENT => Ok(Self::TaskLeaseCancelled),
             TOOL_CALL_INTENDED_EVENT => Ok(Self::ToolCallIntended),
             POLICY_DECIDED_EVENT => Ok(Self::PolicyDecided),
             TOOL_OBSERVATION_RECORDED_EVENT => Ok(Self::ToolObservationRecorded),
@@ -170,6 +190,55 @@ impl TaskCreatedPayload {
             max_context_skill_files,
             focus_terms,
             max_output_tokens,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskQueuePayload {
+    pub task_id: Uuid,
+    pub status: String,
+    pub reason: String,
+}
+
+impl TaskQueuePayload {
+    #[must_use]
+    pub fn new(task_id: Uuid, status: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            task_id,
+            status: status.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskLeasePayload {
+    pub task_id: Uuid,
+    pub lease_id: Uuid,
+    pub worker_id: String,
+    pub status: String,
+    pub lease_deadline_ms: Option<i64>,
+    pub reason: String,
+}
+
+impl TaskLeasePayload {
+    #[must_use]
+    pub fn new(
+        task_id: Uuid,
+        lease_id: Uuid,
+        worker_id: impl Into<String>,
+        status: impl Into<String>,
+        lease_deadline_ms: Option<i64>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            task_id,
+            lease_id,
+            worker_id: worker_id.into(),
+            status: status.into(),
+            lease_deadline_ms,
+            reason: reason.into(),
         }
     }
 }
@@ -868,6 +937,32 @@ impl NewEvent {
         Self::new(session_id, EventType::TaskCreated, payload)
     }
 
+    pub fn task_enqueued(session_id: Uuid, payload: TaskQueuePayload) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::TaskEnqueued, payload)
+    }
+
+    pub fn task_lease_acquired(session_id: Uuid, payload: TaskLeasePayload) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::TaskLeaseAcquired, payload)
+    }
+
+    pub fn task_lease_completed(
+        session_id: Uuid,
+        payload: TaskLeasePayload,
+    ) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::TaskLeaseCompleted, payload)
+    }
+
+    pub fn task_lease_failed(session_id: Uuid, payload: TaskLeasePayload) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::TaskLeaseFailed, payload)
+    }
+
+    pub fn task_lease_cancelled(
+        session_id: Uuid,
+        payload: TaskLeasePayload,
+    ) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::TaskLeaseCancelled, payload)
+    }
+
     pub fn tool_call_intended(
         session_id: Uuid,
         payload: ToolCallIntentPayload,
@@ -1108,6 +1203,53 @@ mod tests {
         assert_eq!(event.payload["max_context_bytes"], 4096);
         assert_eq!(event.payload["focus_terms"][0], "agent");
         assert_eq!(event.payload["max_output_tokens"], 256);
+    }
+
+    #[test]
+    fn task_queue_and_lease_events_serialize_runtime_evidence() {
+        let session_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let lease_id = Uuid::new_v4();
+        let enqueued = NewEvent::task_enqueued(
+            session_id,
+            TaskQueuePayload::new(task_id, "queued", "task enqueued for worker execution"),
+        )
+        .expect("task enqueued event");
+        let acquired = NewEvent::task_lease_acquired(
+            session_id,
+            TaskLeasePayload::new(
+                task_id,
+                lease_id,
+                "worker-1",
+                "leased",
+                Some(123_456),
+                "task lease acquired",
+            ),
+        )
+        .expect("task lease acquired event");
+        let completed = NewEvent::task_lease_completed(
+            session_id,
+            TaskLeasePayload::new(
+                task_id,
+                lease_id,
+                "worker-1",
+                "completed",
+                Some(123_456),
+                "worker completed task",
+            ),
+        )
+        .expect("task lease completed event");
+
+        assert_eq!(enqueued.event_type.as_str(), "task.enqueued");
+        assert_eq!(enqueued.payload["task_id"], task_id.to_string());
+        assert_eq!(enqueued.payload["status"], "queued");
+        assert_eq!(acquired.event_type.as_str(), "task.lease_acquired");
+        assert_eq!(acquired.payload["lease_id"], lease_id.to_string());
+        assert_eq!(acquired.payload["worker_id"], "worker-1");
+        assert_eq!(acquired.payload["lease_deadline_ms"], 123_456);
+        assert_eq!(completed.event_type.as_str(), "task.lease_completed");
+        assert_eq!(completed.payload["status"], "completed");
+        assert_eq!(completed.payload["reason"], "worker completed task");
     }
 
     #[test]
