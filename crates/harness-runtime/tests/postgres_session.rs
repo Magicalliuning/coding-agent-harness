@@ -30,6 +30,7 @@ use harness_runtime::{
     TASK_STOPPED_STATE, TaskQueueInspectRequest, UsageConfidence, VerificationCommandRequest,
     WorkerLaneDiffInspectRequest, WorkerLaneStatus, detect_codex_cli_availability,
 };
+use postgres::{Client, NoTls};
 use uuid::Uuid;
 
 #[test]
@@ -4396,7 +4397,57 @@ fn approval_required_verification_command_is_not_executed() -> Result<(), Box<dy
 fn database_url() -> Option<String> {
     std::env::var("HARNESS_TEST_DATABASE_URL")
         .or_else(|_| std::env::var("HARNESS_DATABASE_URL"))
+        .map(|base_url| {
+            isolated_database_url(&base_url)
+                .expect("PostgreSQL test database isolation should be available")
+        })
         .ok()
+}
+
+fn isolated_database_url(base_url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let database_name = format!("harness_test_{}", Uuid::new_v4().simple());
+    let mut client = Client::connect(base_url, NoTls)?;
+    client.batch_execute(&format!("CREATE DATABASE {database_name}"))?;
+
+    database_url_with_name(base_url, &database_name)
+}
+
+fn database_url_with_name(
+    base_url: &str,
+    database_name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (without_query, query) = base_url
+        .split_once('?')
+        .map_or((base_url, ""), |(left, right)| (left, right));
+    let slash_index = without_query
+        .rfind('/')
+        .ok_or_else(|| HarnessError::new("PostgreSQL test URL must include a database path"))?;
+    let suffix = if query.is_empty() {
+        String::new()
+    } else {
+        format!("?{query}")
+    };
+
+    Ok(format!(
+        "{}{}{}",
+        &without_query[..=slash_index],
+        database_name,
+        suffix
+    ))
+}
+
+#[test]
+fn isolated_database_url_rewrites_database_name_and_preserves_query() {
+    let rewritten = database_url_with_name(
+        "postgres://postgres:postgres@localhost:5432/harness_test?sslmode=disable",
+        "harness_test_isolated",
+    )
+    .expect("database URL should rewrite");
+
+    assert_eq!(
+        rewritten,
+        "postgres://postgres:postgres@localhost:5432/harness_test_isolated?sslmode=disable"
+    );
 }
 
 fn current_time_ms_for_test() -> Result<i64, Box<dyn std::error::Error>> {
