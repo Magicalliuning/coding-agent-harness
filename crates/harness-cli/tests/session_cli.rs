@@ -442,6 +442,189 @@ fn cli_session_inspect_reports_missing_and_malformed_session_ids()
 }
 
 #[test]
+fn cli_inspects_bounded_eventlog_timeline_text_and_json() -> Result<(), Box<dyn std::error::Error>>
+{
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+
+    let migrate = Command::new(bin)
+        .args(["migrate", "--database-url", &database_url])
+        .output()?;
+    assert!(migrate.status.success());
+
+    let repo_path = std::env::current_dir()?.display().to_string();
+    let start = Command::new(bin)
+        .args([
+            "session",
+            "start",
+            "--repo",
+            &repo_path,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(start.status.success());
+
+    let start_stdout = String::from_utf8(start.stdout)?;
+    let session_id = value_for_key(&start_stdout, "session_id").expect("session_id output");
+    let large_task = format!("write the bounded timeline task {}", "x".repeat(640));
+
+    let first = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "create",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task",
+            &large_task,
+        ])
+        .output()?;
+    assert!(first.status.success());
+    let first_stdout = String::from_utf8(first.stdout)?;
+    let first_task_id = value_for_key(&first_stdout, "task_id").expect("task_id output");
+
+    let second = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "create",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task",
+            "write the unrelated timeline task",
+        ])
+        .output()?;
+    assert!(second.status.success());
+    let second_stdout = String::from_utf8(second.stdout)?;
+    let second_task_id = value_for_key(&second_stdout, "task_id").expect("task_id output");
+
+    let before_show = Command::new(bin)
+        .args([
+            "session",
+            "show",
+            session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(before_show.status.success());
+    let before_show_stdout = String::from_utf8(before_show.stdout)?;
+    assert!(before_show_stdout.contains("event_count=3"));
+
+    let timeline_text = Command::new(bin)
+        .args([
+            "session",
+            "timeline",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--payload-bytes",
+            "48",
+        ])
+        .output()?;
+    assert!(timeline_text.status.success());
+    let timeline_text_stdout = String::from_utf8(timeline_text.stdout)?;
+    assert!(timeline_text_stdout.contains(&format!("session_id={session_id}")));
+    assert!(timeline_text_stdout.contains("timeline_scope=session"));
+    assert!(timeline_text_stdout.contains("event_count=3"));
+    assert!(timeline_text_stdout.contains("payload_limit_bytes=48"));
+    assert!(timeline_text_stdout.contains("event_0_sequence=1"));
+    assert!(timeline_text_stdout.contains("event_0_type=session.started"));
+    assert!(timeline_text_stdout.contains("event_0_schema_version=1"));
+    assert!(timeline_text_stdout.contains("event_1_type=task.created"));
+    assert!(timeline_text_stdout.contains("event_1_payload_truncated=true"));
+    assert!(timeline_text_stdout.contains("source_of_truth=EventLog"));
+    assert!(timeline_text_stdout.contains("projection_kind=bounded_eventlog_timeline"));
+
+    let timeline_json = Command::new(bin)
+        .args([
+            "session",
+            "timeline",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task-id",
+            first_task_id,
+            "--payload-bytes",
+            "48",
+            "--json",
+        ])
+        .output()?;
+    assert!(timeline_json.status.success());
+    let timeline_json_stdout = String::from_utf8(timeline_json.stdout)?;
+    let json: Value = serde_json::from_str(&timeline_json_stdout)?;
+    assert_eq!(json["session_id"], session_id);
+    assert_eq!(json["task_id"], first_task_id);
+    assert_eq!(json["event_count"], 1);
+    assert_eq!(json["payload_limit_bytes"], 48);
+    assert_eq!(json["source_of_truth"], "EventLog");
+    assert_eq!(json["projection_kind"], "bounded_eventlog_timeline");
+    let events = json["events"].as_array().expect("timeline events");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["sequence"], 2);
+    assert_eq!(events[0]["event_type"], "task.created");
+    assert_eq!(events[0]["schema_version"], 1);
+    assert_eq!(events[0]["task_id"], first_task_id);
+    assert_eq!(events[0]["payload"]["truncated"], true);
+    assert!(
+        events[0]["payload"]["text"]
+            .as_str()
+            .is_some_and(|text| text.len() <= 48)
+    );
+    assert!(!timeline_json_stdout.contains(second_task_id));
+
+    let missing_task = Command::new(bin)
+        .args([
+            "session",
+            "timeline",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task-id",
+            &uuid::Uuid::new_v4().to_string(),
+        ])
+        .output()?;
+    assert!(!missing_task.status.success());
+    let missing_task_stderr = String::from_utf8(missing_task.stderr)?;
+    assert!(missing_task_stderr.contains("task not found"));
+
+    let missing_session_id = uuid::Uuid::new_v4().to_string();
+    let missing_session = Command::new(bin)
+        .args([
+            "session",
+            "timeline",
+            &missing_session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(!missing_session.status.success());
+    let missing_session_stderr = String::from_utf8(missing_session.stderr)?;
+    assert!(missing_session_stderr.contains(&format!("session not found: {missing_session_id}")));
+
+    let after_show = Command::new(bin)
+        .args([
+            "session",
+            "show",
+            session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(after_show.status.success());
+    let after_show_stdout = String::from_utf8(after_show.stdout)?;
+    assert!(after_show_stdout.contains("event_count=3"));
+
+    Ok(())
+}
+
+#[test]
 fn cli_enqueues_leases_and_completes_session_task() -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
         return Ok(());

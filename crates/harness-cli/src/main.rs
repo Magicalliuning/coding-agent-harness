@@ -8,7 +8,8 @@ use harness_runtime::{
     CodexCliAvailabilityRequest, CodexWorkerLaneRequest, CodexWorkerSubprocess,
     CommitHandoffProjection, ContextBudget, CreateTaskRequest, DEFAULT_CODEX_CLI_ACCEPTANCE_TASK,
     DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS, DEFAULT_CODEX_CLI_PROGRAM,
-    DEFAULT_TASK_WORKER_LANE_KIND, FakeModelTurnRequest, FakeModelTurnResult,
+    DEFAULT_TASK_WORKER_LANE_KIND, DEFAULT_TIMELINE_PAYLOAD_LIMIT_BYTES,
+    EventTimelineInspectRequest, EventTimelineReport, FakeModelTurnRequest, FakeModelTurnResult,
     HeartbeatTaskLeaseRequest, LeaseNextTaskRequest, LeasedCodexWorkerTaskRequest,
     LeasedCodexWorkerTaskResult, Runtime, SelfRecoveryLoopRequest, SelfRecoveryLoopResult,
     SessionContextCompileRequest, SessionContextCompileResult, SessionInspectReport,
@@ -92,6 +93,36 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
                 print_session_inspect_json(&report)?;
             } else {
                 print_session_inspect_report(&report);
+            }
+
+            Ok(())
+        }
+        "timeline" => {
+            let session_id = session_id_arg(&args, 1)?;
+            let task_id = optional_arg_value(&args, "--task-id")
+                .map(|task_id| {
+                    Uuid::parse_str(task_id).map_err(|error| {
+                        HarnessError::new(format!("task id must be a UUID: {error}"))
+                    })
+                })
+                .transpose()?;
+            let payload_limit_bytes = optional_arg_value(&args, "--payload-bytes")
+                .map(|value| parse_usize_arg("--payload-bytes", value))
+                .transpose()?
+                .unwrap_or(DEFAULT_TIMELINE_PAYLOAD_LIMIT_BYTES);
+            let database_url = database_url_from_args(args.clone())?;
+            let runtime = Runtime::connect_postgres(&database_url)?;
+            let mut request = EventTimelineInspectRequest::new(session_id)
+                .with_payload_limit_bytes(payload_limit_bytes);
+            if let Some(task_id) = task_id {
+                request = request.with_task_id(task_id);
+            }
+            let report = runtime.inspect_event_timeline(request)?;
+
+            if has_flag(&args, "--json") {
+                print_event_timeline_json(&report)?;
+            } else {
+                print_event_timeline_report(&report);
             }
 
             Ok(())
@@ -732,6 +763,58 @@ fn print_session_inspect_report(report: &SessionInspectReport) {
 }
 
 fn print_session_inspect_json(report: &SessionInspectReport) -> HarnessResult<()> {
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|error| HarnessError::new(error.to_string()))?;
+    println!("{json}");
+    Ok(())
+}
+
+fn print_event_timeline_report(report: &EventTimelineReport) {
+    println!("session_id={}", report.session_id);
+    println!(
+        "task_id={}",
+        report
+            .task_id
+            .map_or_else(String::new, |task_id| task_id.to_string())
+    );
+    println!(
+        "timeline_scope={}",
+        if report.task_id.is_some() {
+            "task"
+        } else {
+            "session"
+        }
+    );
+    println!("event_count={}", report.event_count);
+    println!("payload_limit_bytes={}", report.payload_limit_bytes);
+    println!("source_of_truth={}", report.source_of_truth);
+    println!("projection_kind={}", report.projection_kind);
+
+    for (index, event) in report.events.iter().enumerate() {
+        println!("event_{index}_id={}", event.event_id);
+        println!("event_{index}_session_id={}", event.session_id);
+        println!("event_{index}_sequence={}", event.sequence);
+        println!("event_{index}_type={}", event.event_type);
+        println!("event_{index}_schema_version={}", event.schema_version);
+        println!(
+            "event_{index}_task_id={}",
+            event
+                .task_id
+                .map_or_else(String::new, |task_id| task_id.to_string())
+        );
+        println!(
+            "event_{index}_payload_original_bytes={}",
+            event.payload.original_bytes
+        );
+        println!(
+            "event_{index}_payload_truncated={}",
+            event.payload.truncated
+        );
+        println!("event_{index}_payload_summary={}", event.payload.text);
+    }
+}
+
+fn print_event_timeline_json(report: &EventTimelineReport) -> HarnessResult<()> {
     let json = serde_json::to_string_pretty(report)
         .map_err(|error| HarnessError::new(error.to_string()))?;
     println!("{json}");

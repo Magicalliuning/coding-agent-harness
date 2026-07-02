@@ -60,6 +60,7 @@ pub const SELF_RECOVERY_MAX_ROUNDS: usize = 2;
 pub const DEFAULT_CODEX_CLI_PROGRAM: &str = "codex";
 pub const DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS: u64 = 120_000;
 pub const DEFAULT_CODEX_CLI_ACCEPTANCE_TASK: &str = "Create or update .harness/codex-manual-acceptance.md with a short note saying local Codex CLI manual acceptance ran successfully. Do not commit the change.";
+pub const DEFAULT_TIMELINE_PAYLOAD_LIMIT_BYTES: usize = 512;
 
 pub struct Runtime {
     event_store: PostgresEventStore,
@@ -117,6 +118,65 @@ pub struct SessionInspectReport {
     pub latest_event_type: Option<String>,
     pub task_count: usize,
     pub task_status_counts: Vec<SessionTaskStatusCount>,
+    pub source_of_truth: String,
+    pub projection_kind: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventTimelineInspectRequest {
+    pub session_id: Uuid,
+    pub task_id: Option<Uuid>,
+    pub payload_limit_bytes: usize,
+}
+
+impl EventTimelineInspectRequest {
+    #[must_use]
+    pub const fn new(session_id: Uuid) -> Self {
+        Self {
+            session_id,
+            task_id: None,
+            payload_limit_bytes: DEFAULT_TIMELINE_PAYLOAD_LIMIT_BYTES,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_task_id(mut self, task_id: Uuid) -> Self {
+        self.task_id = Some(task_id);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_payload_limit_bytes(mut self, payload_limit_bytes: usize) -> Self {
+        self.payload_limit_bytes = payload_limit_bytes;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BoundedPayloadSummary {
+    pub text: String,
+    pub original_bytes: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EventTimelineEntry {
+    pub event_id: Uuid,
+    pub session_id: Uuid,
+    pub sequence: i64,
+    pub event_type: String,
+    pub schema_version: u16,
+    pub task_id: Option<Uuid>,
+    pub payload: BoundedPayloadSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EventTimelineReport {
+    pub session_id: Uuid,
+    pub task_id: Option<Uuid>,
+    pub event_count: usize,
+    pub payload_limit_bytes: usize,
+    pub events: Vec<EventTimelineEntry>,
     pub source_of_truth: String,
     pub projection_kind: String,
 }
@@ -698,6 +758,14 @@ impl Runtime {
     pub fn inspect_session(&self, session_id: Uuid) -> HarnessResult<SessionInspectReport> {
         let events = self.event_store.events_for_session(session_id)?;
         session_inspect_report_from_events(session_id, &events)
+    }
+
+    pub fn inspect_event_timeline(
+        &self,
+        request: EventTimelineInspectRequest,
+    ) -> HarnessResult<EventTimelineReport> {
+        let events = self.event_store.events_for_session(request.session_id)?;
+        event_timeline_report_from_events(request, &events)
     }
 
     pub fn create_task(
@@ -2240,6 +2308,78 @@ fn session_inspect_report_from_events(
             .collect(),
         source_of_truth: "EventLog".to_owned(),
         projection_kind: "derived_from_eventlog".to_owned(),
+    })
+}
+
+fn event_timeline_report_from_events(
+    request: EventTimelineInspectRequest,
+    events: &[EventEnvelope],
+) -> HarnessResult<EventTimelineReport> {
+    project_session(request.session_id, events)?;
+
+    if let Some(task_id) = request.task_id {
+        let tasks = task_projections_from_events(request.session_id, events)?;
+        if !tasks.iter().any(|task| task.task_id == task_id) {
+            return Err(HarnessError::new(format!("task not found: {task_id}")));
+        }
+    }
+
+    let mut entries = Vec::new();
+    for event in events {
+        let payload_task_id = payload_task_id(&event.payload)?;
+        if request
+            .task_id
+            .is_some_and(|task_id| payload_task_id != Some(task_id))
+        {
+            continue;
+        }
+
+        entries.push(EventTimelineEntry {
+            event_id: event.event_id,
+            session_id: event.session_id,
+            sequence: event.sequence,
+            event_type: event.event_type.as_str().to_owned(),
+            schema_version: event.schema_version,
+            task_id: payload_task_id,
+            payload: bounded_payload_summary(&event.payload, request.payload_limit_bytes)?,
+        });
+    }
+
+    Ok(EventTimelineReport {
+        session_id: request.session_id,
+        task_id: request.task_id,
+        event_count: entries.len(),
+        payload_limit_bytes: request.payload_limit_bytes,
+        events: entries,
+        source_of_truth: "EventLog".to_owned(),
+        projection_kind: "bounded_eventlog_timeline".to_owned(),
+    })
+}
+
+fn bounded_payload_summary(
+    payload: &serde_json::Value,
+    limit_bytes: usize,
+) -> HarnessResult<BoundedPayloadSummary> {
+    let serialized =
+        serde_json::to_string(payload).map_err(|error| HarnessError::new(error.to_string()))?;
+    let original_bytes = serialized.len();
+    if original_bytes <= limit_bytes {
+        return Ok(BoundedPayloadSummary {
+            text: serialized,
+            original_bytes,
+            truncated: false,
+        });
+    }
+
+    let mut end = limit_bytes;
+    while !serialized.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+
+    Ok(BoundedPayloadSummary {
+        text: serialized[..end].to_owned(),
+        original_bytes,
+        truncated: true,
     })
 }
 
