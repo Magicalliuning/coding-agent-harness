@@ -319,6 +319,186 @@ fn cli_enqueues_leases_and_completes_session_task() -> Result<(), Box<dyn std::e
 }
 
 #[test]
+fn cli_renews_expires_retries_and_stops_task_leases() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+
+    let migrate = Command::new(bin)
+        .args(["migrate", "--database-url", &database_url])
+        .output()?;
+    assert!(migrate.status.success());
+
+    let repo_path = std::env::current_dir()?.display().to_string();
+    let start = Command::new(bin)
+        .args([
+            "session",
+            "start",
+            "--repo",
+            &repo_path,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(start.status.success());
+
+    let start_stdout = String::from_utf8(start.stdout)?;
+    let session_id = value_for_key(&start_stdout, "session_id").expect("session_id output");
+
+    let create = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "create",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task",
+            "write the retrying CLI task",
+        ])
+        .output()?;
+    assert!(create.status.success());
+
+    let create_stdout = String::from_utf8(create.stdout)?;
+    let task_id = value_for_key(&create_stdout, "task_id").expect("task_id output");
+
+    let enqueue = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "enqueue",
+            session_id,
+            task_id,
+            "--database-url",
+            &database_url,
+            "--max-retries",
+            "1",
+        ])
+        .output()?;
+    assert!(enqueue.status.success());
+
+    let first_lease = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "lease-next",
+            "--database-url",
+            &database_url,
+            "--worker-id",
+            "cli-worker-1",
+            "--lease-ms",
+            "1",
+        ])
+        .output()?;
+    assert!(first_lease.status.success());
+
+    let first_lease_stdout = String::from_utf8(first_lease.stdout)?;
+    let first_lease_id =
+        value_for_key(&first_lease_stdout, "task_lease_id").expect("first lease id output");
+    assert!(first_lease_stdout.contains("task_status=leased"));
+    assert!(first_lease_stdout.contains("task_queue_retry_count=0"));
+    assert!(first_lease_stdout.contains("task_queue_max_retries=1"));
+
+    let heartbeat = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "heartbeat",
+            task_id,
+            "--database-url",
+            &database_url,
+            "--lease-id",
+            first_lease_id,
+            "--worker-id",
+            "cli-worker-1",
+            "--lease-ms",
+            "60000",
+        ])
+        .output()?;
+    assert!(heartbeat.status.success());
+
+    let heartbeat_stdout = String::from_utf8(heartbeat.stdout)?;
+    assert!(heartbeat_stdout.contains("task_status=leased"));
+    assert!(heartbeat_stdout.contains("task_lease_status=leased"));
+    assert!(heartbeat_stdout.contains("task_lease_reason=task lease renewed"));
+
+    let expire_retry = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "expire-leases",
+            "--database-url",
+            &database_url,
+            "--now-ms",
+            "9223372036854775807",
+        ])
+        .output()?;
+    assert!(expire_retry.status.success());
+
+    let expire_retry_stdout = String::from_utf8(expire_retry.stdout)?;
+    assert!(expire_retry_stdout.contains("expired_task_count=1"));
+    assert!(expire_retry_stdout.contains("task_status=retry_queued"));
+    assert!(expire_retry_stdout.contains("task_queue_retry_count=1"));
+    assert!(expire_retry_stdout.contains("task_queue_stop_reason=lease_expired"));
+    assert!(expire_retry_stdout.contains("task_lease_status=expired"));
+
+    let second_lease = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "lease-next",
+            "--database-url",
+            &database_url,
+            "--worker-id",
+            "cli-worker-2",
+        ])
+        .output()?;
+    assert!(second_lease.status.success());
+
+    let second_lease_stdout = String::from_utf8(second_lease.stdout)?;
+    assert!(second_lease_stdout.contains(&format!("task_id={task_id}")));
+    assert!(second_lease_stdout.contains("task_lease_worker_id=cli-worker-2"));
+    assert!(second_lease_stdout.contains("task_queue_retry_count=1"));
+
+    let expire_stop = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "expire-leases",
+            "--database-url",
+            &database_url,
+            "--now-ms",
+            "9223372036854775807",
+        ])
+        .output()?;
+    assert!(expire_stop.status.success());
+
+    let expire_stop_stdout = String::from_utf8(expire_stop.stdout)?;
+    assert!(expire_stop_stdout.contains("expired_task_count=1"));
+    assert!(expire_stop_stdout.contains("task_status=stopped"));
+    assert!(expire_stop_stdout.contains("task_queue_stop_reason=max_retries_exceeded"));
+    assert!(expire_stop_stdout.contains("task_lease_status=stopped"));
+
+    let empty_lease = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "lease-next",
+            "--database-url",
+            &database_url,
+            "--worker-id",
+            "cli-worker-late",
+        ])
+        .output()?;
+    assert!(empty_lease.status.success());
+    assert!(String::from_utf8(empty_lease.stdout)?.contains("task_leased=false"));
+
+    Ok(())
+}
+
+#[test]
 fn cli_codex_acceptance_reports_explicit_skip_when_unavailable()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {

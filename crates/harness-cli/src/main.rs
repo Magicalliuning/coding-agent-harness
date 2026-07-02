@@ -1,5 +1,6 @@
 use std::env;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use harness_core::{HarnessError, HarnessResult};
 use harness_runtime::{
@@ -7,10 +8,10 @@ use harness_runtime::{
     CodexCliAvailabilityRequest, CommitHandoffProjection, ContextBudget, CreateTaskRequest,
     DEFAULT_CODEX_CLI_ACCEPTANCE_TASK, DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS,
     DEFAULT_CODEX_CLI_PROGRAM, DEFAULT_TASK_WORKER_LANE_KIND, FakeModelTurnRequest,
-    FakeModelTurnResult, LeaseNextTaskRequest, Runtime, SelfRecoveryLoopRequest,
-    SelfRecoveryLoopResult, SessionContextCompileRequest, SessionContextCompileResult,
-    SessionProjection, SmallCodingTaskRequest, SmallCodingTaskResult, StartSessionRequest,
-    TaskProjection, VerificationCommandRequest, VerificationCommandResult,
+    FakeModelTurnResult, HeartbeatTaskLeaseRequest, LeaseNextTaskRequest, Runtime,
+    SelfRecoveryLoopRequest, SelfRecoveryLoopResult, SessionContextCompileRequest,
+    SessionContextCompileResult, SessionProjection, SmallCodingTaskRequest, SmallCodingTaskResult,
+    StartSessionRequest, TaskProjection, VerificationCommandRequest, VerificationCommandResult,
 };
 use uuid::Uuid;
 
@@ -133,7 +134,12 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
                 "enqueue" => {
                     let session_id = session_id_arg(&args, 2)?;
                     let task_id = task_id_arg(&args, 3)?;
-                    let task = runtime.enqueue_task(session_id, task_id)?;
+                    let max_retries = optional_arg_value(&args, "--max-retries")
+                        .map(|value| parse_i32_arg("--max-retries", value))
+                        .transpose()?
+                        .unwrap_or(1);
+                    let task =
+                        runtime.enqueue_task_with_max_retries(session_id, task_id, max_retries)?;
                     print_task_projection(&task);
                     Ok(())
                 }
@@ -155,6 +161,41 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
                         println!("task_leased=false");
                     }
 
+                    Ok(())
+                }
+                "heartbeat" => {
+                    let task_id = task_id_arg(&args, 2)?;
+                    let lease_id = lease_id_arg(&args)?;
+                    let worker_id = required_arg_value(&args, "--worker-id")?;
+                    let lease_duration_ms = optional_arg_value(&args, "--lease-ms")
+                        .map(|value| parse_u64_arg("--lease-ms", value))
+                        .transpose()?
+                        .unwrap_or(60_000);
+                    let task = runtime.heartbeat_task_lease(
+                        task_id,
+                        lease_id,
+                        HeartbeatTaskLeaseRequest {
+                            worker_id: worker_id.to_owned(),
+                            lease_duration_ms,
+                        },
+                    )?;
+                    print_task_projection(&task);
+                    Ok(())
+                }
+                "expire-leases" => {
+                    let now_ms = optional_arg_value(&args, "--now-ms")
+                        .map(|value| parse_i64_arg("--now-ms", value))
+                        .transpose()?
+                        .unwrap_or_else(current_time_ms_for_cli);
+                    let tasks = runtime.expire_task_leases(now_ms)?;
+                    println!("expired_task_count={}", tasks.len());
+                    for (index, task) in tasks.iter().enumerate() {
+                        println!("expired_task_{index}_id={}", task.task_id);
+                        println!("expired_task_{index}_status={}", task.status);
+                    }
+                    if tasks.len() == 1 {
+                        print_task_projection(&tasks[0]);
+                    }
                     Ok(())
                 }
                 "complete" => {
@@ -478,6 +519,32 @@ fn parse_u64_arg(name: &str, value: &str) -> HarnessResult<u64> {
         .map_err(|error| HarnessError::new(format!("{name} must be a positive integer: {error}")))
 }
 
+fn parse_i32_arg(name: &str, value: &str) -> HarnessResult<i32> {
+    let parsed = value
+        .parse()
+        .map_err(|error| HarnessError::new(format!("{name} must be an integer: {error}")))?;
+
+    if parsed < 0 {
+        return Err(HarnessError::new(format!("{name} cannot be negative")));
+    }
+
+    Ok(parsed)
+}
+
+fn parse_i64_arg(name: &str, value: &str) -> HarnessResult<i64> {
+    value
+        .parse()
+        .map_err(|error| HarnessError::new(format!("{name} must be an integer: {error}")))
+}
+
+fn current_time_ms_for_cli() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(i64::MAX)
+}
+
 fn args_before_separator(args: &[String]) -> &[String] {
     let index = args
         .iter()
@@ -622,9 +689,28 @@ fn print_task_projection(task: &TaskProjection) {
             "task_queue_reason={}",
             queue.reason.as_deref().unwrap_or("")
         );
+        println!(
+            "task_queue_retry_count={}",
+            queue
+                .retry_count
+                .map_or_else(String::new, |retry_count| retry_count.to_string())
+        );
+        println!(
+            "task_queue_max_retries={}",
+            queue
+                .max_retries
+                .map_or_else(String::new, |max_retries| max_retries.to_string())
+        );
+        println!(
+            "task_queue_stop_reason={}",
+            queue.stop_reason.as_deref().unwrap_or("")
+        );
     } else {
         println!("task_queue_status=");
         println!("task_queue_reason=");
+        println!("task_queue_retry_count=");
+        println!("task_queue_max_retries=");
+        println!("task_queue_stop_reason=");
     }
 
     if let Some(lease) = &task.lease {
