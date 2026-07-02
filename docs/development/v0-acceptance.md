@@ -70,7 +70,7 @@ PostgreSQL should contain the session EventLog entries for session start, contex
 ## Known Limits
 
 - This V0 gate uses the internal deterministic fake-model loop, not a real LLM.
-- The governed Codex lane is available as a contract/schema/fixture-adapter boundary, but this manual gate does not invoke a real Codex CLI worker.
+- The real Codex CLI manual gate is documented separately in `docs/development/local-codex-cli-acceptance.md`, including the queue-driven Task lease path.
 - The harness stops at `pending_commit_approval`; it does not commit or push user code.
 - Self-recovery is intentionally bounded to the configured recovery rounds and repair budget.
 - PostgreSQL is required for the runtime source of truth; SQLite/JSONL export is not the V0 runtime path.

@@ -537,6 +537,31 @@ pub struct CodexWorkerLaneResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeasedCodexWorkerTaskRequest {
+    pub worker_id: String,
+    pub lease_duration_ms: u64,
+    pub worker: CodexWorkerLaneRequest,
+}
+
+impl LeasedCodexWorkerTaskRequest {
+    #[must_use]
+    pub fn new(worker_id: impl Into<String>, worker: CodexWorkerLaneRequest) -> Self {
+        Self {
+            worker_id: worker_id.into(),
+            lease_duration_ms: 60_000,
+            worker,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeasedCodexWorkerTaskResult {
+    pub task: TaskProjection,
+    pub worker: CodexWorkerLaneResult,
+    pub lease_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexCliAvailabilityRequest {
     pub program: String,
     pub codex_home: Option<PathBuf>,
@@ -1449,6 +1474,15 @@ impl Runtime {
         session_id: Uuid,
         request: CodexWorkerLaneRequest,
     ) -> HarnessResult<CodexWorkerLaneResult> {
+        self.run_codex_worker_lane_scoped(session_id, None, request)
+    }
+
+    fn run_codex_worker_lane_scoped(
+        &mut self,
+        session_id: Uuid,
+        task_id: Option<Uuid>,
+        request: CodexWorkerLaneRequest,
+    ) -> HarnessResult<CodexWorkerLaneResult> {
         let session = self.show_session(session_id)?;
 
         let lane_id = Uuid::new_v4().to_string();
@@ -1467,7 +1501,7 @@ impl Runtime {
         self.event_store
             .append_event(NewEvent::worker_lane_requested(
                 session_id,
-                worker_lane_request_payload(&lane_id, lane_kind, &intent),
+                worker_lane_request_payload(&lane_id, lane_kind, &intent, task_id),
             )?)?;
 
         let evaluation = evaluate_codex_worker_lane(&CodexWorkerLanePolicyInput {
@@ -1493,6 +1527,7 @@ impl Runtime {
         if evaluation.decision != PolicyDecision::Allow {
             self.append_worker_lane_state(
                 session_id,
+                task_id,
                 &lane_id,
                 None,
                 WorkerLaneStatus::Rejected,
@@ -1523,6 +1558,7 @@ impl Runtime {
                 Err(error) => {
                     self.append_worker_lane_state(
                         session_id,
+                        task_id,
                         &lane_id,
                         None,
                         WorkerLaneStatus::Failed,
@@ -1553,7 +1589,8 @@ impl Runtime {
                         &session.repo_path,
                         &allocation.worktree_path,
                         &allocation.base_ref,
-                    ),
+                    )
+                    .with_optional_task_id(task_id),
                 )?)?;
 
             intent.workspace_path = allocation.worktree_path.clone();
@@ -1562,6 +1599,7 @@ impl Runtime {
 
         self.append_worker_lane_state(
             session_id,
+            task_id,
             &lane_id,
             None,
             WorkerLaneStatus::Queued,
@@ -1573,6 +1611,7 @@ impl Runtime {
         } else {
             self.append_worker_lane_state(
                 session_id,
+                task_id,
                 &lane_id,
                 Some(WorkerLaneStatus::Queued),
                 WorkerLaneStatus::Running,
@@ -1592,11 +1631,12 @@ impl Runtime {
         self.event_store
             .append_event(NewEvent::worker_lane_observation_recorded(
                 session_id,
-                worker_lane_observation_payload(&lane_id, lane_kind, &observation),
+                worker_lane_observation_payload(&lane_id, lane_kind, &observation, task_id),
             )?)?;
 
         self.append_worker_lane_state(
             session_id,
+            task_id,
             &lane_id,
             Some(previous_state),
             observation.status,
@@ -1606,6 +1646,7 @@ impl Runtime {
         let pending_commit_state = if observation.status == WorkerLaneStatus::Succeeded {
             self.record_worker_lane_diff_if_needed(
                 session_id,
+                task_id,
                 &intent.workspace_path,
                 intent.budget.max_stdout_bytes,
             )?
@@ -1627,6 +1668,56 @@ impl Runtime {
             event_replay: event_replay_summary(&events),
             event_count: events.len(),
         })
+    }
+
+    pub fn run_next_leased_codex_worker_task(
+        &mut self,
+        request: LeasedCodexWorkerTaskRequest,
+    ) -> HarnessResult<Option<LeasedCodexWorkerTaskResult>> {
+        let Some(leased_task) = self.lease_next_task(LeaseNextTaskRequest {
+            worker_id: request.worker_id.clone(),
+            lease_duration_ms: request.lease_duration_ms,
+        })?
+        else {
+            return Ok(None);
+        };
+        let lease_id = leased_task
+            .lease
+            .as_ref()
+            .ok_or_else(|| HarnessError::new("leased task projection did not include lease"))?
+            .lease_id;
+        let mut worker_request = request.worker;
+        worker_request.task = leased_task.input.clone();
+
+        let worker = self.run_codex_worker_lane_scoped(
+            leased_task.session_id,
+            Some(leased_task.task_id),
+            worker_request,
+        )?;
+        let task = match worker.final_status {
+            WorkerLaneStatus::Succeeded => {
+                self.complete_task_lease(leased_task.task_id, lease_id, "worker lane succeeded")?
+            }
+            WorkerLaneStatus::Cancelled => {
+                self.cancel_task_lease(leased_task.task_id, lease_id, "worker lane cancelled")?
+            }
+            WorkerLaneStatus::Failed | WorkerLaneStatus::TimedOut | WorkerLaneStatus::Rejected => {
+                self.fail_task_lease(
+                    leased_task.task_id,
+                    lease_id,
+                    format!("worker lane {}", worker.final_status.as_str()),
+                )?
+            }
+            WorkerLaneStatus::Queued | WorkerLaneStatus::Running => {
+                return Err(HarnessError::new("worker lane ended in non-terminal state"));
+            }
+        };
+
+        Ok(Some(LeasedCodexWorkerTaskResult {
+            task,
+            worker,
+            lease_id,
+        }))
     }
 
     pub fn run_codex_cli_manual_acceptance(
@@ -1725,6 +1816,7 @@ impl Runtime {
     fn append_worker_lane_state(
         &mut self,
         session_id: Uuid,
+        task_id: Option<Uuid>,
         lane_id: &str,
         from_state: Option<WorkerLaneStatus>,
         to_state: WorkerLaneStatus,
@@ -1739,7 +1831,8 @@ impl Runtime {
                     from_state.map(|state| state.as_str().to_owned()),
                     to_state.as_str(),
                     reason,
-                ),
+                )
+                .with_optional_task_id(task_id),
             )?)?;
 
         Ok(())
@@ -1748,6 +1841,7 @@ impl Runtime {
     fn record_worker_lane_diff_if_needed(
         &mut self,
         session_id: Uuid,
+        task_id: Option<Uuid>,
         repo_path: &str,
         max_diff_bytes: usize,
     ) -> HarnessResult<Option<String>> {
@@ -1758,7 +1852,8 @@ impl Runtime {
         self.event_store.append_event(NewEvent::diff_recorded(
             session_id,
             diff_summary_payload(&evidence.summary)
-                .with_git_evidence(evidence.git_status, evidence.git_diff),
+                .with_git_evidence(evidence.git_status, evidence.git_diff)
+                .with_optional_task_id(task_id),
         )?)?;
         self.event_store
             .append_event(NewEvent::commit_approval_pending(
@@ -1766,7 +1861,8 @@ impl Runtime {
                 CommitApprovalPendingPayload::new(
                     PENDING_COMMIT_APPROVAL_STATE,
                     "worker lane succeeded with reviewable diff; awaiting human commit approval",
-                ),
+                )
+                .with_optional_task_id(task_id),
             )?)?;
 
         Ok(Some(PENDING_COMMIT_APPROVAL_STATE.to_owned()))
@@ -1928,7 +2024,9 @@ fn task_projections_from_events(
             | EventType::TaskLeaseCancelled => {
                 let status = payload_string(&event.payload, "status")?;
                 let reason = payload_optional_string(&event.payload, "reason");
-                task.status = status.clone();
+                if event.event_type != EventType::TaskLeaseCompleted || task.approval.is_none() {
+                    task.status = status.clone();
+                }
                 if event.event_type != EventType::TaskLeaseExpired {
                     task.queue = Some(TaskQueueProjection {
                         status: status.clone(),
@@ -2754,9 +2852,10 @@ fn worker_lane_request_payload(
     lane_id: &str,
     lane_kind: &str,
     intent: &CodexWorkerLaneIntent,
+    task_id: Option<Uuid>,
 ) -> WorkerLaneRequestPayload {
     WorkerLaneRequestPayload {
-        task_id: None,
+        task_id,
         lane_id: lane_id.to_owned(),
         lane_kind: lane_kind.to_owned(),
         task: intent.task.clone(),
@@ -2776,9 +2875,10 @@ fn worker_lane_observation_payload(
     lane_id: &str,
     lane_kind: &str,
     observation: &CodexWorkerLaneObservation,
+    task_id: Option<Uuid>,
 ) -> WorkerLaneObservationPayload {
     WorkerLaneObservationPayload {
-        task_id: None,
+        task_id,
         lane_id: lane_id.to_owned(),
         lane_kind: lane_kind.to_owned(),
         status: observation.status.as_str().to_owned(),

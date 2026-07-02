@@ -620,6 +620,12 @@ impl DiffSummaryPayload {
         self.task_id = Some(task_id);
         self
     }
+
+    #[must_use]
+    pub const fn with_optional_task_id(mut self, task_id: Option<Uuid>) -> Self {
+        self.task_id = task_id;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -643,6 +649,12 @@ impl CommitApprovalPendingPayload {
     #[must_use]
     pub const fn with_task_id(mut self, task_id: Uuid) -> Self {
         self.task_id = Some(task_id);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_optional_task_id(mut self, task_id: Option<Uuid>) -> Self {
+        self.task_id = task_id;
         self
     }
 }
@@ -914,6 +926,12 @@ impl WorkerLaneStatePayload {
         self.task_id = Some(task_id);
         self
     }
+
+    #[must_use]
+    pub const fn with_optional_task_id(mut self, task_id: Option<Uuid>) -> Self {
+        self.task_id = task_id;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -949,6 +967,12 @@ impl WorkerLaneWorktreeAllocatedPayload {
     #[must_use]
     pub const fn with_task_id(mut self, task_id: Uuid) -> Self {
         self.task_id = Some(task_id);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_optional_task_id(mut self, task_id: Option<Uuid>) -> Self {
+        self.task_id = task_id;
         self
     }
 }

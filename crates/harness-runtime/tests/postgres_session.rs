@@ -18,12 +18,13 @@ use harness_runtime::{
     CodexWorkerLaneFixture, CodexWorkerLaneRequest, CodexWorkerLaneWorkspace,
     CodexWorkerSubprocess, CodexWorkerUsage, ContextBudget, CreateTaskRequest,
     DEFAULT_TASK_WORKER_LANE_KIND, FakeModelTurnRequest, HeartbeatTaskLeaseRequest,
-    LeaseNextTaskRequest, PENDING_COMMIT_APPROVAL_STATE, RECOVERY_FAILED_STATE, RecoveryStopReason,
-    Runtime, SelfRecoveryLoopRequest, SessionContextCompileRequest, SessionStatus,
-    SmallCodingTaskRequest, StartSessionRequest, TASK_CANCELLED_STATE, TASK_COMPLETED_STATE,
-    TASK_FAILED_STATE, TASK_LEASED_STATE, TASK_QUEUED_STATE, TASK_RETRY_QUEUED_STATE,
-    TASK_STOP_REASON_LEASE_EXPIRED, TASK_STOP_REASON_MAX_RETRIES_EXCEEDED, TASK_STOPPED_STATE,
-    UsageConfidence, VerificationCommandRequest, WorkerLaneStatus, detect_codex_cli_availability,
+    LeaseNextTaskRequest, LeasedCodexWorkerTaskRequest, PENDING_COMMIT_APPROVAL_STATE,
+    RECOVERY_FAILED_STATE, RecoveryStopReason, Runtime, SelfRecoveryLoopRequest,
+    SessionContextCompileRequest, SessionStatus, SmallCodingTaskRequest, StartSessionRequest,
+    TASK_CANCELLED_STATE, TASK_COMPLETED_STATE, TASK_FAILED_STATE, TASK_LEASED_STATE,
+    TASK_QUEUED_STATE, TASK_RETRY_QUEUED_STATE, TASK_STOP_REASON_LEASE_EXPIRED,
+    TASK_STOP_REASON_MAX_RETRIES_EXCEEDED, TASK_STOPPED_STATE, UsageConfidence,
+    VerificationCommandRequest, WorkerLaneStatus, detect_codex_cli_availability,
 };
 use uuid::Uuid;
 
@@ -1215,6 +1216,226 @@ fn self_recovery_fixture_stops_when_repair_budget_exceeded()
         event.event_type == EventType::RecoveryStopped
             && event.payload["stop_reason"] == "repair_budget_exceeded"
     }));
+
+    Ok(())
+}
+
+#[test]
+fn leased_task_runs_codex_worker_lane_and_enters_pending_approval()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let (script_name, script) = fake_success_runner_script();
+    let repo = git_fixture_repo_with_files(&[(script_name, script)])?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo.display().to_string()))?;
+    let first_task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "write the first queued worker task",
+    )?;
+    let second_task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "write the second queued worker task",
+    )?;
+    let mut worker = CodexWorkerLaneRequest::new_subprocess(
+        "placeholder task should be replaced",
+        fake_runner_command(script_name).with_env("HARNESS_CUSTOM_MARKER", "leased-task"),
+    );
+    worker.budget.max_stdout_bytes = 4;
+
+    let result = runtime
+        .run_next_leased_codex_worker_task(LeasedCodexWorkerTaskRequest::new(
+            "queue-worker-1",
+            worker,
+        ))?
+        .expect("queued task should be leased and run");
+    let events = runtime.events_for_session(started.session_id)?;
+    let diff_event = events
+        .iter()
+        .find(|event| event.event_type == EventType::DiffRecorded)
+        .expect("diff event");
+    let pending_event = events
+        .iter()
+        .find(|event| event.event_type == EventType::CommitApprovalPending)
+        .expect("pending approval event");
+    let shown_first = runtime.show_task(started.session_id, first_task_id)?;
+    let shown_second = runtime.show_task(started.session_id, second_task_id)?;
+
+    assert_eq!(result.task.task_id, first_task_id);
+    assert_eq!(result.worker.final_status, WorkerLaneStatus::Succeeded);
+    assert_eq!(
+        result.worker.pending_commit_state.as_deref(),
+        Some(PENDING_COMMIT_APPROVAL_STATE)
+    );
+    assert_eq!(result.task.status, PENDING_COMMIT_APPROVAL_STATE);
+    assert_eq!(
+        result.task.lease.as_ref().expect("lease slot").status,
+        TASK_COMPLETED_STATE
+    );
+    assert_eq!(
+        result.task.queue.as_ref().expect("queue slot").status,
+        TASK_COMPLETED_STATE
+    );
+    assert_eq!(
+        result
+            .task
+            .worker_output
+            .as_ref()
+            .expect("worker output")
+            .status,
+        "succeeded"
+    );
+    assert_eq!(
+        result.task.diff.as_ref().expect("diff slot").paths,
+        vec!["README.md"]
+    );
+    assert_eq!(
+        result.task.approval.as_ref().expect("approval slot").state,
+        PENDING_COMMIT_APPROVAL_STATE
+    );
+    assert_eq!(shown_first.status, PENDING_COMMIT_APPROVAL_STATE);
+    assert_eq!(shown_second.status, TASK_QUEUED_STATE);
+    assert_eq!(diff_event.payload["task_id"], first_task_id.to_string());
+    assert_eq!(pending_event.payload["task_id"], first_task_id.to_string());
+    assert!(events.iter().any(|event| {
+        event.event_type == EventType::WorkerLaneObservationRecorded
+            && event.payload["task_id"] == first_task_id.to_string()
+            && event.payload["status"] == "succeeded"
+    }));
+
+    Ok(())
+}
+
+#[test]
+fn leased_task_worker_failure_timeout_and_cancellation_update_task_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = git_fixture_repo()?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo.display().to_string()))?;
+    let failed_task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "write the failed leased task",
+    )?;
+    let timed_out_task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "write the timed out leased task",
+    )?;
+    let cancelled_task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "write the cancelled leased task",
+    )?;
+
+    let failed = runtime
+        .run_next_leased_codex_worker_task(LeasedCodexWorkerTaskRequest::new(
+            "queue-worker-fail",
+            CodexWorkerLaneRequest::new(
+                "placeholder",
+                CodexWorkerLaneFixture {
+                    status: WorkerLaneStatus::Failed,
+                    exit_code: Some(7),
+                    stdout: "failure stdout".to_owned(),
+                    stderr: "failure stderr".to_owned(),
+                    duration_ms: 7,
+                    usage: CodexWorkerUsage::unknown(),
+                },
+            ),
+        ))?
+        .expect("failed task should run");
+
+    let mut timeout_worker = CodexWorkerLaneRequest::new(
+        "placeholder",
+        CodexWorkerLaneFixture {
+            status: WorkerLaneStatus::Succeeded,
+            exit_code: Some(0),
+            stdout: "timeout stdout".to_owned(),
+            stderr: String::new(),
+            duration_ms: 100,
+            usage: CodexWorkerUsage::unknown(),
+        },
+    );
+    timeout_worker.timeout_ms = 1;
+    let timed_out = runtime
+        .run_next_leased_codex_worker_task(LeasedCodexWorkerTaskRequest::new(
+            "queue-worker-timeout",
+            timeout_worker,
+        ))?
+        .expect("timed out task should run");
+
+    let mut cancelled_worker = CodexWorkerLaneRequest::new(
+        "placeholder",
+        CodexWorkerLaneFixture::succeeded("should not run"),
+    );
+    cancelled_worker.cancellation_requested = true;
+    let cancelled = runtime
+        .run_next_leased_codex_worker_task(LeasedCodexWorkerTaskRequest::new(
+            "queue-worker-cancel",
+            cancelled_worker,
+        ))?
+        .expect("cancelled task should run");
+
+    assert_eq!(failed.task.task_id, failed_task_id);
+    assert_eq!(failed.worker.final_status, WorkerLaneStatus::Failed);
+    assert_eq!(failed.task.status, TASK_FAILED_STATE);
+    assert_eq!(
+        failed.task.lease.as_ref().expect("lease slot").status,
+        TASK_FAILED_STATE
+    );
+    assert_eq!(
+        failed
+            .task
+            .worker_output
+            .as_ref()
+            .expect("worker output")
+            .exit_code,
+        Some(7)
+    );
+
+    assert_eq!(timed_out.task.task_id, timed_out_task_id);
+    assert_eq!(timed_out.worker.final_status, WorkerLaneStatus::TimedOut);
+    assert_eq!(timed_out.task.status, TASK_FAILED_STATE);
+    assert_eq!(
+        timed_out
+            .task
+            .worker_output
+            .as_ref()
+            .expect("worker output")
+            .status,
+        "timed_out"
+    );
+
+    assert_eq!(cancelled.task.task_id, cancelled_task_id);
+    assert_eq!(cancelled.worker.final_status, WorkerLaneStatus::Cancelled);
+    assert_eq!(cancelled.task.status, TASK_CANCELLED_STATE);
+    assert_eq!(
+        cancelled.task.lease.as_ref().expect("lease slot").status,
+        TASK_CANCELLED_STATE
+    );
+    assert!(
+        runtime
+            .run_next_leased_codex_worker_task(LeasedCodexWorkerTaskRequest::new(
+                "queue-worker-empty",
+                CodexWorkerLaneRequest::new(
+                    "placeholder",
+                    CodexWorkerLaneFixture::succeeded("empty"),
+                ),
+            ))?
+            .is_none()
+    );
 
     Ok(())
 }
