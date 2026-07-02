@@ -10,8 +10,8 @@ use harness_core::HarnessError;
 use harness_db::PostgresEventStore;
 use harness_events::{
     CommitApprovalDecisionPayload, CommitApprovalPendingPayload, CommitHandoffPayload,
-    DiffSummaryPayload, EventType, NewEvent, TaskQueuePayload, ToolCallIntentPayload,
-    WorkerLaneObservationPayload, WorkerLaneWorktreeAllocatedPayload,
+    DiffSummaryPayload, EventType, NewEvent, TaskLeasePayload, TaskQueuePayload,
+    ToolCallIntentPayload, WorkerLaneObservationPayload, WorkerLaneWorktreeAllocatedPayload,
 };
 use harness_policy::PolicyDecision;
 use harness_runtime::{
@@ -797,6 +797,7 @@ fn terminal_and_expire_event_failures_roll_back_queue_mutations()
             terminal_lease_id,
             TASK_COMPLETED_STATE,
             "complete with injected event failure",
+            current_time_ms_for_test()?,
             |_record| Err(HarnessError::new("injected terminal event failure")),
         )
         .expect_err("injected event failure should abort terminal transaction");
@@ -846,6 +847,127 @@ fn terminal_and_expire_event_failures_roll_back_queue_mutations()
             .show_task(started.session_id, expire_task_id)?
             .status,
         TASK_LEASED_STATE
+    );
+
+    Ok(())
+}
+
+#[test]
+fn expired_lease_owner_cannot_terminal_transition_task() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let store = PostgresEventStore::connect(&database_url)?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new("expired-terminal-reject"))?;
+
+    let mut lease_expired_task = |input: &str| -> Result<(Uuid, Uuid), Box<dyn std::error::Error>> {
+        let task_id = create_and_enqueue_task(&mut runtime, started.session_id, input)?;
+        let lease_id = Uuid::new_v4();
+        let deadline_ms = current_time_ms_for_test()?.saturating_sub(1);
+        let record = store
+            .lease_next_queued_task("expired-worker", lease_id, deadline_ms, |record| {
+                NewEvent::task_lease_acquired(
+                    record.session_id,
+                    TaskLeasePayload::new(
+                        record.task_id,
+                        record
+                            .lease_id
+                            .ok_or_else(|| HarnessError::new("lease id missing"))?,
+                        record
+                            .worker_id
+                            .as_deref()
+                            .ok_or_else(|| HarnessError::new("worker id missing"))?,
+                        record.status.as_str(),
+                        record.lease_deadline_ms,
+                        record
+                            .last_reason
+                            .as_deref()
+                            .unwrap_or("task lease acquired"),
+                    )
+                    .with_retry_state(
+                        record.retry_count,
+                        record.max_retries,
+                        record.stop_reason.clone(),
+                    ),
+                )
+            })?
+            .expect("task should lease with expired deadline");
+        assert_eq!(record.task_id, task_id);
+
+        Ok((task_id, lease_id))
+    };
+
+    let (complete_task_id, complete_lease_id) = lease_expired_task("expired complete should fail")?;
+    let (fail_task_id, fail_lease_id) = lease_expired_task("expired fail should fail")?;
+    let (cancel_task_id, cancel_lease_id) = lease_expired_task("expired cancel should fail")?;
+
+    let complete_error = runtime
+        .complete_task_lease(
+            complete_task_id,
+            complete_lease_id,
+            "late complete should not win",
+        )
+        .expect_err("expired complete should be rejected");
+    assert!(complete_error.to_string().contains("task lease expired"));
+
+    let fail_error = runtime
+        .fail_task_lease(fail_task_id, fail_lease_id, "late fail should not win")
+        .expect_err("expired fail should be rejected");
+    assert!(fail_error.to_string().contains("task lease expired"));
+
+    let cancel_error = runtime
+        .cancel_task_lease(
+            cancel_task_id,
+            cancel_lease_id,
+            "late cancel should not win",
+        )
+        .expect_err("expired cancel should be rejected");
+    assert!(cancel_error.to_string().contains("task lease expired"));
+
+    let events = runtime.events_for_session(started.session_id)?;
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.event_type == EventType::TaskLeaseCompleted)
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.event_type == EventType::TaskLeaseFailed)
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.event_type == EventType::TaskLeaseCancelled)
+    );
+
+    assert_eq!(
+        runtime
+            .show_task(started.session_id, complete_task_id)?
+            .status,
+        TASK_LEASED_STATE
+    );
+    assert_eq!(
+        runtime.show_task(started.session_id, fail_task_id)?.status,
+        TASK_LEASED_STATE
+    );
+    assert_eq!(
+        runtime
+            .show_task(started.session_id, cancel_task_id)?
+            .status,
+        TASK_LEASED_STATE
+    );
+
+    let expired = runtime.expire_task_leases(current_time_ms_for_test()? + 60_000)?;
+    assert_eq!(expired.len(), 3);
+    assert!(
+        expired
+            .iter()
+            .all(|task| task.status == TASK_RETRY_QUEUED_STATE)
     );
 
     Ok(())
