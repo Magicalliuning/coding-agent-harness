@@ -1313,6 +1313,92 @@ fn leased_task_runs_codex_worker_lane_and_enters_pending_approval()
 }
 
 #[test]
+fn leased_codex_worker_uses_task_repo_lane_and_budget() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let (script_name, script) = fake_success_runner_script();
+    let session_repo = git_fixture_repo()?;
+    let task_repo = git_fixture_repo_with_files(&[(script_name, script)])?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started =
+        runtime.start_session(StartSessionRequest::new(session_repo.display().to_string()))?;
+
+    let mut other_lane_request = CreateTaskRequest::new("run with a future worker lane");
+    other_lane_request.worker_lane_kind = "future_worker_lane".to_owned();
+    let other_lane_task = runtime.create_task(started.session_id, other_lane_request)?;
+    runtime.enqueue_task(started.session_id, other_lane_task.task_id)?;
+
+    let mut codex_request = CreateTaskRequest::new("write the override repo queued task");
+    codex_request.repo_path = Some(task_repo.display().to_string());
+    codex_request.context.budget.max_bytes = 1_234;
+    codex_request.max_output_tokens = 17;
+    let codex_task = runtime.create_task(started.session_id, codex_request)?;
+    runtime.enqueue_task(started.session_id, codex_task.task_id)?;
+
+    let mut worker = CodexWorkerLaneRequest::new_subprocess(
+        "placeholder task should be replaced",
+        fake_runner_command(script_name),
+    );
+    worker.budget.max_prompt_tokens = 99_999;
+    worker.budget.max_output_tokens = 88_888;
+    worker.budget.max_stdout_bytes = 4;
+
+    let result = runtime
+        .run_next_leased_codex_worker_task(LeasedCodexWorkerTaskRequest::new(
+            "task-source-worker",
+            worker,
+        ))?
+        .expect("codex task should be leased");
+    let events = runtime.events_for_session(started.session_id)?;
+    let requested = events
+        .iter()
+        .find(|event| {
+            event.event_type == EventType::WorkerLaneRequested
+                && event.payload["task_id"] == codex_task.task_id.to_string()
+        })
+        .expect("task-scoped worker request");
+    let allocated = result.task.worktree.as_ref().expect("task worktree");
+    let shown_other = runtime.show_task(started.session_id, other_lane_task.task_id)?;
+
+    assert_eq!(result.task.task_id, codex_task.task_id);
+    assert_eq!(shown_other.status, TASK_QUEUED_STATE);
+    assert_eq!(shown_other.worker_lane_kind, "future_worker_lane");
+    assert_eq!(result.task.worker_lane_kind, DEFAULT_TASK_WORKER_LANE_KIND);
+    assert_eq!(requested.payload["budget"]["max_prompt_tokens"], 1_234);
+    assert_eq!(requested.payload["budget"]["max_output_tokens"], 17);
+    assert_eq!(requested.payload["budget"]["max_stdout_bytes"], 4);
+    assert!(allocated.worktree_path.contains(".harness-worktrees"));
+    assert!(
+        allocated.worktree_path.contains(
+            task_repo
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("task repo name")
+        )
+    );
+    assert_eq!(
+        git_text(&session_repo, &["status", "--short"])?,
+        "",
+        "session repo should not receive task repo worker changes"
+    );
+    assert!(
+        result
+            .task
+            .diff
+            .as_ref()
+            .expect("task diff")
+            .paths
+            .contains(&"README.md".to_owned())
+    );
+
+    Ok(())
+}
+
+#[test]
 fn leased_task_worker_failure_timeout_and_cancellation_update_task_state()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {

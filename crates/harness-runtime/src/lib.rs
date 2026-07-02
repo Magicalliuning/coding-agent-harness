@@ -773,6 +773,26 @@ impl Runtime {
         &mut self,
         request: LeaseNextTaskRequest,
     ) -> HarnessResult<Option<TaskProjection>> {
+        self.lease_next_task_matching(request, None)
+    }
+
+    fn lease_next_task_for_worker_lane(
+        &mut self,
+        request: LeaseNextTaskRequest,
+        worker_lane_kind: &str,
+    ) -> HarnessResult<Option<TaskProjection>> {
+        if worker_lane_kind.trim().is_empty() {
+            return Err(HarnessError::new("worker lane kind cannot be empty"));
+        }
+
+        self.lease_next_task_matching(request, Some(worker_lane_kind.trim()))
+    }
+
+    fn lease_next_task_matching(
+        &mut self,
+        request: LeaseNextTaskRequest,
+        worker_lane_kind: Option<&str>,
+    ) -> HarnessResult<Option<TaskProjection>> {
         if request.worker_id.trim().is_empty() {
             return Err(HarnessError::new("worker id cannot be empty"));
         }
@@ -786,12 +806,21 @@ impl Runtime {
             i64::try_from(request.lease_duration_ms)
                 .map_err(|_| HarnessError::new("lease duration is out of range"))?,
         );
-        let Some(record) = self.event_store.lease_next_queued_task(
-            request.worker_id.trim(),
-            lease_id,
-            lease_deadline_ms,
-        )?
-        else {
+        let record = if let Some(worker_lane_kind) = worker_lane_kind {
+            self.event_store.lease_next_queued_task_for_worker_lane(
+                request.worker_id.trim(),
+                lease_id,
+                lease_deadline_ms,
+                worker_lane_kind,
+            )?
+        } else {
+            self.event_store.lease_next_queued_task(
+                request.worker_id.trim(),
+                lease_id,
+                lease_deadline_ms,
+            )?
+        };
+        let Some(record) = record else {
             return Ok(None);
         };
 
@@ -1474,21 +1503,23 @@ impl Runtime {
         session_id: Uuid,
         request: CodexWorkerLaneRequest,
     ) -> HarnessResult<CodexWorkerLaneResult> {
-        self.run_codex_worker_lane_scoped(session_id, None, request)
+        self.run_codex_worker_lane_scoped(session_id, None, None, request)
     }
 
     fn run_codex_worker_lane_scoped(
         &mut self,
         session_id: Uuid,
         task_id: Option<Uuid>,
+        repo_path_override: Option<&str>,
         request: CodexWorkerLaneRequest,
     ) -> HarnessResult<CodexWorkerLaneResult> {
         let session = self.show_session(session_id)?;
+        let repo_path = repo_path_override.unwrap_or(&session.repo_path).to_owned();
 
         let lane_id = Uuid::new_v4().to_string();
         let lane_kind = "codex_cli";
         let tool_name = harness_tools::CODEX_WORKER_LANE_TOOL.name;
-        let workspace = requested_codex_worker_workspace(&request.workspace, &session.repo_path);
+        let workspace = requested_codex_worker_workspace(&request.workspace, &repo_path);
         let intent = CodexWorkerLaneIntent {
             task: request.task,
             workspace_path: workspace.workspace_path,
@@ -1506,7 +1537,7 @@ impl Runtime {
 
         let evaluation = evaluate_codex_worker_lane(&CodexWorkerLanePolicyInput {
             task: &intent.task,
-            session_repo_path: &session.repo_path,
+            session_repo_path: &repo_path,
             workspace_path: &intent.workspace_path,
             worktree_path: intent.worktree_path.as_deref(),
             timeout_ms: intent.timeout_ms,
@@ -1553,7 +1584,7 @@ impl Runtime {
             request.workspace,
             CodexWorkerLaneWorkspace::AllocateTaskWorktree
         ) {
-            let allocation = match allocate_task_worktree(&session.repo_path, &lane_id) {
+            let allocation = match allocate_task_worktree(&repo_path, &lane_id) {
                 Ok(allocation) => allocation,
                 Err(error) => {
                     self.append_worker_lane_state(
@@ -1586,7 +1617,7 @@ impl Runtime {
                     WorkerLaneWorktreeAllocatedPayload::new(
                         &lane_id,
                         lane_kind,
-                        &session.repo_path,
+                        &repo_path,
                         &allocation.worktree_path,
                         &allocation.base_ref,
                     )
@@ -1674,10 +1705,13 @@ impl Runtime {
         &mut self,
         request: LeasedCodexWorkerTaskRequest,
     ) -> HarnessResult<Option<LeasedCodexWorkerTaskResult>> {
-        let Some(leased_task) = self.lease_next_task(LeaseNextTaskRequest {
-            worker_id: request.worker_id.clone(),
-            lease_duration_ms: request.lease_duration_ms,
-        })?
+        let Some(leased_task) = self.lease_next_task_for_worker_lane(
+            LeaseNextTaskRequest {
+                worker_id: request.worker_id.clone(),
+                lease_duration_ms: request.lease_duration_ms,
+            },
+            DEFAULT_TASK_WORKER_LANE_KIND,
+        )?
         else {
             return Ok(None);
         };
@@ -1688,10 +1722,13 @@ impl Runtime {
             .lease_id;
         let mut worker_request = request.worker;
         worker_request.task = leased_task.input.clone();
+        worker_request.budget.max_prompt_tokens = leased_task.context_budget.max_bytes;
+        worker_request.budget.max_output_tokens = leased_task.max_output_tokens;
 
         let worker = self.run_codex_worker_lane_scoped(
             leased_task.session_id,
             Some(leased_task.task_id),
+            Some(&leased_task.repo_path),
             worker_request,
         )?;
         let task = match worker.final_status {
@@ -2045,7 +2082,6 @@ fn task_projections_from_events(
                 });
             }
             EventType::WorkerLaneRequested => {
-                task.worker_lane_kind = payload_string(&event.payload, "lane_kind")?;
                 task.input = payload_string(&event.payload, "task")?;
             }
             EventType::WorkerLaneStateChanged => {

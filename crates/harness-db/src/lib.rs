@@ -167,6 +167,31 @@ impl PostgresEventStore {
         lease_id: Uuid,
         lease_deadline_ms: i64,
     ) -> HarnessResult<Option<TaskQueueRecord>> {
+        self.lease_next_queued_task_matching(worker_id, lease_id, lease_deadline_ms, None)
+    }
+
+    pub fn lease_next_queued_task_for_worker_lane(
+        &self,
+        worker_id: &str,
+        lease_id: Uuid,
+        lease_deadline_ms: i64,
+        worker_lane_kind: &str,
+    ) -> HarnessResult<Option<TaskQueueRecord>> {
+        self.lease_next_queued_task_matching(
+            worker_id,
+            lease_id,
+            lease_deadline_ms,
+            Some(worker_lane_kind),
+        )
+    }
+
+    fn lease_next_queued_task_matching(
+        &self,
+        worker_id: &str,
+        lease_id: Uuid,
+        lease_deadline_ms: i64,
+        worker_lane_kind: Option<&str>,
+    ) -> HarnessResult<Option<TaskQueueRecord>> {
         let mut client = self.client()?;
         let mut transaction = client
             .transaction()
@@ -178,6 +203,17 @@ impl PostgresEventStore {
                     SELECT task_id
                     FROM harness_runtime.task_queue
                     WHERE status IN ('queued', 'retry_queued')
+                        AND (
+                            $4::text IS NULL
+                            OR EXISTS (
+                                SELECT 1
+                                FROM harness_runtime.event_log
+                                WHERE event_log.session_id = task_queue.session_id
+                                    AND event_log.event_type = 'task.created'
+                                    AND event_log.payload->>'task_id' = task_queue.task_id::text
+                                    AND event_log.payload->>'worker_lane_kind' = $4
+                            )
+                        )
                     ORDER BY created_at ASC
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
@@ -198,7 +234,7 @@ impl PostgresEventStore {
                     task_queue.last_reason, task_queue.retry_count, task_queue.max_retries,
                     task_queue.stop_reason
                 ",
-                &[&worker_id, &lease_id, &lease_deadline_ms],
+                &[&worker_id, &lease_id, &lease_deadline_ms, &worker_lane_kind],
             )
             .map_err(|error| HarnessError::new(error.to_string()))?;
 
