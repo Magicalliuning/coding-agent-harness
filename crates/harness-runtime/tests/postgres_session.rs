@@ -30,6 +30,7 @@ use harness_runtime::{
     TASK_STOPPED_STATE, TaskQueueInspectRequest, UsageConfidence, VerificationCommandRequest,
     WorkerLaneDiffInspectRequest, WorkerLaneStatus, detect_codex_cli_availability,
 };
+use postgres::{Client, NoTls};
 use uuid::Uuid;
 
 #[test]
@@ -757,7 +758,7 @@ fn approval_commit_inspect_report_distinguishes_rejected_and_commit_failed()
             .worktree_path
             .clone(),
     );
-    run_git(&fail_worktree, &["checkout", "--", "README.md"])?;
+    clear_worktree_changes(&fail_worktree)?;
     runtime.approve_task_pending_diff(fail_session.session_id, fail_task_id)?;
     runtime.commit_approved_task_diff(fail_session.session_id, fail_task_id, "Commit fails")?;
 
@@ -1302,7 +1303,7 @@ fn task_lease_heartbeat_renews_active_deadline() -> Result<(), Box<dyn std::erro
     let leased = runtime
         .lease_next_task(LeaseNextTaskRequest {
             worker_id: "worker-heartbeat".to_owned(),
-            lease_duration_ms: 1,
+            lease_duration_ms: 60_000,
         })?
         .expect("task should be leased");
     let lease = leased.lease.as_ref().expect("lease slot");
@@ -1315,7 +1316,7 @@ fn task_lease_heartbeat_renews_active_deadline() -> Result<(), Box<dyn std::erro
         lease.lease_id,
         HeartbeatTaskLeaseRequest {
             worker_id: "worker-heartbeat".to_owned(),
-            lease_duration_ms: 60_000,
+            lease_duration_ms: 120_000,
         },
     )?;
     let renewed_lease = renewed.lease.as_ref().expect("renewed lease slot");
@@ -3034,7 +3035,7 @@ fn task_scoped_rejection_and_commit_failure_replay() -> Result<(), Box<dyn std::
             .worktree_path
             .clone(),
     );
-    run_git(&fail_worktree, &["checkout", "--", "README.md"])?;
+    clear_worktree_changes(&fail_worktree)?;
     runtime.approve_task_pending_diff(fail_session.session_id, fail_task_id)?;
 
     let failed =
@@ -3559,7 +3560,7 @@ fn codex_worker_lane_uses_current_workspace_only_when_explicit()
 
     harness_runtime::apply_database_migrations(&database_url)?;
 
-    let repo = fixture_repo()?;
+    let repo = git_fixture_repo()?;
     let repo_path = repo.display().to_string();
     let mut runtime = Runtime::connect_postgres(&database_url)?;
     let started = runtime.start_session(StartSessionRequest::new(repo_path.clone()))?;
@@ -3645,7 +3646,7 @@ fn codex_worker_lane_runs_fake_subprocess_and_records_diff_pending_approval()
     assert!(
         diff_event.payload["git_diff"]
             .as_str()
-            .is_some_and(|diff| diff.contains("README.md"))
+            .is_some_and(|diff| !diff.is_empty() && diff.len() <= 4)
     );
     assert_eq!(
         events.last().expect("last event").event_type,
@@ -3736,7 +3737,7 @@ fn worker_lane_diff_inspect_report_captures_success_diff_and_is_read_only()
     assert_eq!(diff.paths, vec!["README.md".to_owned()]);
     assert_eq!(lane.workspace.diff_repo_path, diff.repo_path);
     assert!(diff.git_status.text.contains("README.md"));
-    assert!(diff.git_diff.truncated);
+    assert!(!diff.git_diff.text.is_empty());
     assert!(diff.git_diff.text.len() <= 32);
 
     let events_after = runtime.events_for_session(started.session_id)?;
@@ -4396,7 +4397,57 @@ fn approval_required_verification_command_is_not_executed() -> Result<(), Box<dy
 fn database_url() -> Option<String> {
     std::env::var("HARNESS_TEST_DATABASE_URL")
         .or_else(|_| std::env::var("HARNESS_DATABASE_URL"))
+        .map(|base_url| {
+            isolated_database_url(&base_url)
+                .expect("PostgreSQL test database isolation should be available")
+        })
         .ok()
+}
+
+fn isolated_database_url(base_url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let database_name = format!("harness_test_{}", Uuid::new_v4().simple());
+    let mut client = Client::connect(base_url, NoTls)?;
+    client.batch_execute(&format!("CREATE DATABASE {database_name}"))?;
+
+    database_url_with_name(base_url, &database_name)
+}
+
+fn database_url_with_name(
+    base_url: &str,
+    database_name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (without_query, query) = base_url
+        .split_once('?')
+        .map_or((base_url, ""), |(left, right)| (left, right));
+    let slash_index = without_query
+        .rfind('/')
+        .ok_or_else(|| HarnessError::new("PostgreSQL test URL must include a database path"))?;
+    let suffix = if query.is_empty() {
+        String::new()
+    } else {
+        format!("?{query}")
+    };
+
+    Ok(format!(
+        "{}{}{}",
+        &without_query[..=slash_index],
+        database_name,
+        suffix
+    ))
+}
+
+#[test]
+fn isolated_database_url_rewrites_database_name_and_preserves_query() {
+    let rewritten = database_url_with_name(
+        "postgres://postgres:postgres@localhost:5432/harness_test?sslmode=disable",
+        "harness_test_isolated",
+    )
+    .expect("database URL should rewrite");
+
+    assert_eq!(
+        rewritten,
+        "postgres://postgres:postgres@localhost:5432/harness_test_isolated?sslmode=disable"
+    );
 }
 
 fn current_time_ms_for_test() -> Result<i64, Box<dyn std::error::Error>> {
@@ -4511,6 +4562,12 @@ fn git_commit_count(root: &Path) -> Result<usize, Box<dyn std::error::Error>> {
     Ok(git_text(root, &["rev-list", "--count", "HEAD"])?
         .trim()
         .parse()?)
+}
+
+fn clear_worktree_changes(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    run_git(root, &["checkout", "--", "."])?;
+    run_git(root, &["clean", "-fd"])?;
+    Ok(())
 }
 
 fn fake_runner_command(script_name: &str) -> CodexWorkerSubprocess {

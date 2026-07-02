@@ -47,6 +47,11 @@ jobs:
           cargo test -p harness-runtime task_queue_successful_transitions_keep_eventlog_replay_and_queue_status_aligned -- --exact --nocapture
           cargo test -p harness-runtime expired_lease_owner_cannot_terminal_transition_task -- --exact --nocapture
 
+      - name: Run PostgreSQL integration test suite
+        env:
+          HARNESS_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/harness_test
+        run: cargo test -p harness-runtime --test postgres_session -- --test-threads=1
+
       - name: Build workspace
         run: cargo build --workspace
 

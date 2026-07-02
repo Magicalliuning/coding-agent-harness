@@ -250,6 +250,7 @@ dependencies = [
  "harness-models",
  "harness-policy",
  "harness-tools",
+ "postgres",
  "serde",
  "serde_json",
  "uuid",
