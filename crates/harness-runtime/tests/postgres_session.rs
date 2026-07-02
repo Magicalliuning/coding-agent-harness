@@ -2494,6 +2494,7 @@ fn codex_worker_lane_runs_fake_subprocess_and_records_diff_pending_approval()
     assert!(env_file.contains("subprocess env task"));
     assert!(env_file.contains("custom-env"));
     assert_eq!(git_text(&repo, &["status", "--short"])?, "");
+    assert_eq!(diff_event.payload["repo_path"], worktree_path);
     assert_eq!(diff_event.payload["files_changed"], 1);
     assert_eq!(diff_event.payload["paths"][0], "README.md");
     assert!(
@@ -2509,6 +2510,85 @@ fn codex_worker_lane_runs_fake_subprocess_and_records_diff_pending_approval()
     assert_eq!(
         events.last().expect("last event").event_type,
         EventType::CommitApprovalPending
+    );
+
+    Ok(())
+}
+
+#[test]
+fn task_scoped_commit_uses_existing_worktree_diff_repo() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let (script_name, script) = fake_success_runner_script();
+    let task_repo = git_fixture_repo()?;
+    let existing_worktree = git_fixture_repo_with_files(&[(script_name, script)])?;
+    let task_repo_commits_before = git_commit_count(&task_repo)?;
+    let existing_commits_before = git_commit_count(&existing_worktree)?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started =
+        runtime.start_session(StartSessionRequest::new(task_repo.display().to_string()))?;
+    let task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "write a task diff in an explicit existing worktree",
+    )?;
+
+    let mut worker =
+        CodexWorkerLaneRequest::new_subprocess("placeholder", fake_runner_command(script_name));
+    worker.workspace =
+        CodexWorkerLaneWorkspace::existing_worktree(existing_worktree.display().to_string());
+
+    let result = runtime
+        .run_next_leased_codex_worker_task(LeasedCodexWorkerTaskRequest::new(
+            "existing-worktree-worker",
+            worker,
+        ))?
+        .expect("queued task should run in existing worktree");
+    assert_eq!(result.task.status, PENDING_COMMIT_APPROVAL_STATE);
+
+    runtime.approve_task_pending_diff(started.session_id, task_id)?;
+    let committed = runtime.commit_approved_task_diff(
+        started.session_id,
+        task_id,
+        "Commit explicit existing worktree diff",
+    )?;
+    let events = runtime.events_for_session(started.session_id)?;
+    let diff_event = events
+        .iter()
+        .find(|event| event.event_type == EventType::DiffRecorded)
+        .expect("diff event");
+    let commit_started = events
+        .iter()
+        .find(|event| event.event_type == EventType::CommitStarted)
+        .expect("commit started event");
+    let commit_succeeded = events
+        .iter()
+        .find(|event| event.event_type == EventType::CommitSucceeded)
+        .expect("commit succeeded event");
+
+    assert_eq!(committed.status, COMMITTED_STATE);
+    assert_eq!(
+        git_commit_count(&existing_worktree)?,
+        existing_commits_before + 1
+    );
+    assert_eq!(git_commit_count(&task_repo)?, task_repo_commits_before);
+    assert_eq!(git_text(&existing_worktree, &["status", "--short"])?, "");
+    assert_eq!(git_text(&task_repo, &["status", "--short"])?, "");
+    assert_eq!(
+        diff_event.payload["repo_path"],
+        existing_worktree.display().to_string()
+    );
+    assert_eq!(
+        commit_started.payload["repo_path"],
+        existing_worktree.display().to_string()
+    );
+    assert_eq!(
+        commit_succeeded.payload["repo_path"],
+        existing_worktree.display().to_string()
     );
 
     Ok(())

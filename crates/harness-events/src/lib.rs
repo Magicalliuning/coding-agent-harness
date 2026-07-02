@@ -577,6 +577,8 @@ impl ModelDecisionPayload {
 pub struct DiffSummaryPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_path: Option<String>,
     pub files_changed: usize,
     pub insertions: usize,
     pub deletions: usize,
@@ -595,6 +597,7 @@ impl DiffSummaryPayload {
     ) -> Self {
         Self {
             task_id: None,
+            repo_path: None,
             files_changed,
             insertions,
             deletions,
@@ -612,6 +615,12 @@ impl DiffSummaryPayload {
     ) -> Self {
         self.git_status = git_status.into();
         self.git_diff = git_diff.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_repo_path(mut self, repo_path: impl Into<String>) -> Self {
+        self.repo_path = Some(repo_path.into());
         self
     }
 
@@ -1523,6 +1532,12 @@ mod tests {
             DiffSummaryPayload::new(1, 4, 0, vec![".harness/fake-agent-turn.md".to_owned()]),
         )
         .expect("diff event");
+        let diff_with_repo = NewEvent::diff_recorded(
+            session_id,
+            DiffSummaryPayload::new(1, 4, 0, vec![".harness/fake-agent-turn.md".to_owned()])
+                .with_repo_path("C:/workspace"),
+        )
+        .expect("diff event with repo path");
         let pending = NewEvent::commit_approval_pending(
             session_id,
             CommitApprovalPendingPayload::new(
@@ -1569,8 +1584,10 @@ mod tests {
 
         assert_eq!(diff.event_type.as_str(), "diff.recorded");
         assert!(diff.payload.get("task_id").is_none());
+        assert!(diff.payload.get("repo_path").is_none());
         assert_eq!(diff.payload["files_changed"], 1);
         assert_eq!(diff.payload["paths"][0], ".harness/fake-agent-turn.md");
+        assert_eq!(diff_with_repo.payload["repo_path"], "C:/workspace");
         assert_eq!(pending.event_type.as_str(), "commit.approval_pending");
         assert_eq!(pending.payload["state"], "pending_commit_approval");
         assert_eq!(approved.event_type.as_str(), "commit.approved");
