@@ -18,14 +18,15 @@ use harness_runtime::{
     COMMIT_APPROVED_STATE, COMMIT_FAILED_STATE, COMMIT_REJECTED_STATE, COMMITTED_STATE,
     CodexCliAvailabilityRequest, CodexWorkerLaneBudget, CodexWorkerLaneFixture,
     CodexWorkerLaneRequest, CodexWorkerLaneWorkspace, CodexWorkerSubprocess, CodexWorkerUsage,
-    ContextBudget, CreateTaskRequest, DEFAULT_TASK_WORKER_LANE_KIND, FakeModelTurnRequest,
-    HeartbeatTaskLeaseRequest, LeaseNextTaskRequest, LeasedCodexWorkerTaskRequest,
-    PENDING_COMMIT_APPROVAL_STATE, RECOVERY_FAILED_STATE, RecoveryStopReason, Runtime,
-    SelfRecoveryLoopRequest, SessionContextCompileRequest, SessionStatus, SmallCodingTaskRequest,
-    StartSessionRequest, TASK_CANCELLED_STATE, TASK_COMPLETED_STATE, TASK_FAILED_STATE,
-    TASK_LEASED_STATE, TASK_QUEUED_STATE, TASK_RETRY_QUEUED_STATE, TASK_STOP_REASON_LEASE_EXPIRED,
-    TASK_STOP_REASON_MAX_RETRIES_EXCEEDED, TASK_STOPPED_STATE, UsageConfidence,
-    VerificationCommandRequest, WorkerLaneStatus, detect_codex_cli_availability,
+    ContextBudget, CreateTaskRequest, DEFAULT_TASK_WORKER_LANE_KIND, EventTimelineInspectRequest,
+    FakeModelTurnRequest, HeartbeatTaskLeaseRequest, LeaseNextTaskRequest,
+    LeasedCodexWorkerTaskRequest, PENDING_COMMIT_APPROVAL_STATE, RECOVERY_FAILED_STATE,
+    RecoveryStopReason, Runtime, SelfRecoveryLoopRequest, SessionContextCompileRequest,
+    SessionStatus, SmallCodingTaskRequest, StartSessionRequest, TASK_CANCELLED_STATE,
+    TASK_COMPLETED_STATE, TASK_FAILED_STATE, TASK_LEASED_STATE, TASK_QUEUED_STATE,
+    TASK_RETRY_QUEUED_STATE, TASK_STOP_REASON_LEASE_EXPIRED, TASK_STOP_REASON_MAX_RETRIES_EXCEEDED,
+    TASK_STOPPED_STATE, UsageConfidence, VerificationCommandRequest, WorkerLaneStatus,
+    detect_codex_cli_availability,
 };
 use uuid::Uuid;
 
@@ -179,6 +180,113 @@ fn session_inspect_report_summarizes_session_without_mutating_state()
             .status,
         "created"
     );
+
+    Ok(())
+}
+
+#[test]
+fn event_timeline_report_filters_task_scope_and_bounds_payloads()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new("timeline-fixture-repo"))?;
+    let first = runtime.create_task(
+        started.session_id,
+        CreateTaskRequest::new("write the first timeline task"),
+    )?;
+    let second = runtime.create_task(
+        started.session_id,
+        CreateTaskRequest::new("write the second timeline task"),
+    )?;
+    runtime.enqueue_task(started.session_id, first.task_id)?;
+    PostgresEventStore::connect(&database_url)?.append_event(NewEvent::diff_recorded(
+        started.session_id,
+        DiffSummaryPayload::new(1, 1, 0, vec!["README.md".to_owned()])
+            .with_task_id(first.task_id)
+            .with_git_evidence(
+                " M README.md",
+                format!("diff --git a/README.md b/README.md\n{}", "x".repeat(512)),
+            ),
+    )?)?;
+
+    let events_before = runtime.events_for_session(started.session_id)?;
+    let session_timeline = runtime.inspect_event_timeline(
+        EventTimelineInspectRequest::new(started.session_id).with_payload_limit_bytes(64),
+    )?;
+    let task_timeline = runtime.inspect_event_timeline(
+        EventTimelineInspectRequest::new(started.session_id)
+            .with_task_id(first.task_id)
+            .with_payload_limit_bytes(64),
+    )?;
+    let events_after = runtime.events_for_session(started.session_id)?;
+
+    assert_eq!(session_timeline.session_id, started.session_id);
+    assert_eq!(session_timeline.task_id, None);
+    assert_eq!(session_timeline.event_count, events_before.len());
+    assert_eq!(session_timeline.payload_limit_bytes, 64);
+    assert_eq!(session_timeline.events[0].sequence, 1);
+    assert_eq!(session_timeline.events[0].event_type, "session.started");
+    assert_eq!(session_timeline.events[0].schema_version, 1);
+    assert_eq!(session_timeline.events[0].task_id, None);
+    assert_eq!(session_timeline.source_of_truth, "EventLog");
+    assert_eq!(
+        session_timeline.projection_kind,
+        "bounded_eventlog_timeline"
+    );
+    assert!(
+        session_timeline
+            .events
+            .iter()
+            .any(|event| event.payload.truncated)
+    );
+    assert!(
+        session_timeline
+            .events
+            .iter()
+            .all(|event| event.payload.text.len() <= 64)
+    );
+
+    assert_eq!(task_timeline.task_id, Some(first.task_id));
+    assert_eq!(task_timeline.event_count, 3);
+    assert_eq!(
+        task_timeline
+            .events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![2, 4, 5]
+    );
+    assert!(
+        task_timeline
+            .events
+            .iter()
+            .all(|event| event.task_id == Some(first.task_id))
+    );
+    assert!(
+        !task_timeline
+            .events
+            .iter()
+            .any(|event| event.task_id == Some(second.task_id))
+    );
+    assert!(
+        task_timeline
+            .events
+            .iter()
+            .any(|event| event.event_type == "diff.recorded" && event.payload.truncated)
+    );
+    assert_eq!(events_after.len(), events_before.len());
+
+    let missing = runtime
+        .inspect_event_timeline(
+            EventTimelineInspectRequest::new(started.session_id).with_task_id(Uuid::new_v4()),
+        )
+        .expect_err("missing task scope should fail");
+    assert!(missing.message().contains("task not found"));
 
     Ok(())
 }
