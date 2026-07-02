@@ -1014,6 +1014,68 @@ impl Runtime {
         self.show_approval(session_id)
     }
 
+    pub fn approve_task_pending_diff(
+        &mut self,
+        session_id: Uuid,
+        task_id: Uuid,
+    ) -> HarnessResult<TaskProjection> {
+        let task = self.show_task(session_id, task_id)?;
+        let approval = task
+            .approval
+            .as_ref()
+            .ok_or_else(|| HarnessError::new("task pending approval was not recorded"))?;
+        if approval.state != PENDING_COMMIT_APPROVAL_STATE {
+            return Err(HarnessError::new(format!(
+                "task pending diff is already {}",
+                approval.state
+            )));
+        }
+
+        self.event_store.append_event(NewEvent::commit_approved(
+            session_id,
+            CommitApprovalDecisionPayload::new(
+                COMMIT_APPROVED_STATE,
+                "approved by runtime approval state machine",
+                "runtime",
+            )
+            .with_task_id(task_id),
+        )?)?;
+
+        self.show_task(session_id, task_id)
+    }
+
+    pub fn reject_task_pending_diff(
+        &mut self,
+        session_id: Uuid,
+        task_id: Uuid,
+        reason: impl Into<String>,
+    ) -> HarnessResult<TaskProjection> {
+        let reason = reason.into();
+        if reason.trim().is_empty() {
+            return Err(HarnessError::new("rejection reason is required"));
+        }
+
+        let task = self.show_task(session_id, task_id)?;
+        let approval = task
+            .approval
+            .as_ref()
+            .ok_or_else(|| HarnessError::new("task pending approval was not recorded"))?;
+        if approval.state != PENDING_COMMIT_APPROVAL_STATE {
+            return Err(HarnessError::new(format!(
+                "task pending diff is already {}",
+                approval.state
+            )));
+        }
+
+        self.event_store.append_event(NewEvent::commit_rejected(
+            session_id,
+            CommitApprovalDecisionPayload::new(COMMIT_REJECTED_STATE, reason.trim(), "runtime")
+                .with_task_id(task_id),
+        )?)?;
+
+        self.show_task(session_id, task_id)
+    }
+
     pub fn commit_approved_diff(
         &mut self,
         session_id: Uuid,
@@ -1072,6 +1134,75 @@ impl Runtime {
 
         let events = self.event_store.events_for_session(session_id)?;
         commit_handoff_projection_from_events(session_id, &events)
+    }
+
+    pub fn commit_approved_task_diff(
+        &mut self,
+        session_id: Uuid,
+        task_id: Uuid,
+        message: impl Into<String>,
+    ) -> HarnessResult<TaskProjection> {
+        let message = message.into();
+        if message.trim().is_empty() {
+            return Err(HarnessError::new("commit message is required"));
+        }
+
+        let task = self.show_task(session_id, task_id)?;
+        let approval = task
+            .approval
+            .as_ref()
+            .ok_or_else(|| HarnessError::new("task approval was not recorded"))?;
+        if approval.state != COMMIT_APPROVED_STATE {
+            return Err(HarnessError::new(format!(
+                "approved task diff is required before commit; current state is {}",
+                approval.state
+            )));
+        }
+
+        let events = self.event_store.events_for_session(session_id)?;
+        if let Some(state) =
+            existing_commit_handoff_state_from_events_scoped(&events, Some(task_id))?
+        {
+            return Err(HarnessError::new(format!(
+                "task commit handoff is already {state}"
+            )));
+        }
+
+        let repo_path = commit_repo_path_from_events_scoped(&events, Some(task_id))?;
+        self.event_store.append_event(NewEvent::commit_started(
+            session_id,
+            CommitHandoffPayload::started(&repo_path, message.trim(), "runtime")
+                .with_task_id(task_id),
+        )?)?;
+
+        match run_harness_commit(&repo_path, message.trim()) {
+            Ok(commit_sha) => {
+                self.event_store.append_event(NewEvent::commit_succeeded(
+                    session_id,
+                    CommitHandoffPayload::succeeded(
+                        &repo_path,
+                        message.trim(),
+                        "runtime",
+                        commit_sha,
+                    )
+                    .with_task_id(task_id),
+                )?)?;
+            }
+            Err(error) => {
+                self.event_store.append_event(NewEvent::commit_failed(
+                    session_id,
+                    CommitHandoffPayload::failed(
+                        &repo_path,
+                        message.trim(),
+                        "runtime",
+                        error.to_string(),
+                    )
+                    .with_task_id(task_id),
+                )?)?;
+            }
+        }
+
+        self.show_task(session_id, task_id)
     }
 
     pub fn run_verification_command(
@@ -2267,12 +2398,24 @@ fn approval_projection_from_events(
     session_id: Uuid,
     events: &[EventEnvelope],
 ) -> HarnessResult<ApprovalProjection> {
+    approval_projection_from_events_scoped(session_id, events, None)
+}
+
+fn approval_projection_from_events_scoped(
+    session_id: Uuid,
+    events: &[EventEnvelope],
+    task_id: Option<Uuid>,
+) -> HarnessResult<ApprovalProjection> {
     let mut diff = None;
     let mut state = None;
     let mut summary = String::new();
     let mut rejection_reason = None;
 
     for event in events {
+        if !event_matches_task_scope(event, task_id)? {
+            continue;
+        }
+
         match event.event_type {
             EventType::DiffRecorded => {
                 diff = Some(diff_summary_from_payload(&event.payload)?);
@@ -2329,9 +2472,21 @@ fn commit_handoff_projection_from_events(
     session_id: Uuid,
     events: &[EventEnvelope],
 ) -> HarnessResult<CommitHandoffProjection> {
+    commit_handoff_projection_from_events_scoped(session_id, events, None)
+}
+
+fn commit_handoff_projection_from_events_scoped(
+    session_id: Uuid,
+    events: &[EventEnvelope],
+    task_id: Option<Uuid>,
+) -> HarnessResult<CommitHandoffProjection> {
     let mut projection = None;
 
     for event in events {
+        if !event_matches_task_scope(event, task_id)? {
+            continue;
+        }
+
         match event.event_type {
             EventType::CommitStarted | EventType::CommitSucceeded | EventType::CommitFailed => {
                 projection = Some(CommitHandoffProjection {
@@ -2362,9 +2517,20 @@ fn commit_handoff_projection_from_events(
 fn existing_commit_handoff_state_from_events(
     events: &[EventEnvelope],
 ) -> HarnessResult<Option<String>> {
+    existing_commit_handoff_state_from_events_scoped(events, None)
+}
+
+fn existing_commit_handoff_state_from_events_scoped(
+    events: &[EventEnvelope],
+    task_id: Option<Uuid>,
+) -> HarnessResult<Option<String>> {
     let mut state = None;
 
     for event in events {
+        if !event_matches_task_scope(event, task_id)? {
+            continue;
+        }
+
         match event.event_type {
             EventType::CommitStarted | EventType::CommitSucceeded | EventType::CommitFailed => {
                 state = Some(payload_string(&event.payload, "state")?);
@@ -2377,21 +2543,39 @@ fn existing_commit_handoff_state_from_events(
 }
 
 fn commit_repo_path_from_events(events: &[EventEnvelope]) -> HarnessResult<String> {
+    commit_repo_path_from_events_scoped(events, None)
+}
+
+fn commit_repo_path_from_events_scoped(
+    events: &[EventEnvelope],
+    task_id: Option<Uuid>,
+) -> HarnessResult<String> {
     let mut session_repo_path = None;
+    let mut task_repo_path = None;
     let mut latest_worktree_path = None;
     let mut diff_repo_path = None;
 
     for event in events {
         match event.event_type {
             EventType::SessionStarted => {
-                session_repo_path = Some(payload_string(&event.payload, "repo_path")?);
+                if task_id.is_none() {
+                    session_repo_path = Some(payload_string(&event.payload, "repo_path")?);
+                }
+            }
+            EventType::TaskCreated => {
+                if event_matches_task_scope(event, task_id)? {
+                    task_repo_path = Some(payload_string(&event.payload, "repo_path")?);
+                }
             }
             EventType::WorkerLaneWorktreeAllocated => {
-                latest_worktree_path = Some(payload_string(&event.payload, "worktree_path")?);
+                if event_matches_task_scope(event, task_id)? {
+                    latest_worktree_path = Some(payload_string(&event.payload, "worktree_path")?);
+                }
             }
-            EventType::DiffRecorded => {
+            EventType::DiffRecorded if event_matches_task_scope(event, task_id)? => {
                 diff_repo_path = latest_worktree_path
                     .clone()
+                    .or_else(|| task_repo_path.clone())
                     .or_else(|| session_repo_path.clone());
             }
             _ => {}
@@ -2399,6 +2583,10 @@ fn commit_repo_path_from_events(events: &[EventEnvelope]) -> HarnessResult<Strin
     }
 
     diff_repo_path.ok_or_else(|| HarnessError::new("diff repository path was not recorded"))
+}
+
+fn event_matches_task_scope(event: &EventEnvelope, task_id: Option<Uuid>) -> HarnessResult<bool> {
+    payload_task_id(&event.payload).map(|payload_task_id| payload_task_id == task_id)
 }
 
 fn payload_string(payload: &serde_json::Value, key: &str) -> HarnessResult<String> {
