@@ -276,6 +276,80 @@ pub struct TaskInspectReport {
     pub projection_kind: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskQueueInspectRequest {
+    pub session_id: Option<Uuid>,
+    pub now_ms: Option<i64>,
+}
+
+impl TaskQueueInspectRequest {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            session_id: None,
+            now_ms: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_session_id(mut self, session_id: Uuid) -> Self {
+        self.session_id = Some(session_id);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_now_ms(mut self, now_ms: i64) -> Self {
+        self.now_ms = Some(now_ms);
+        self
+    }
+}
+
+impl Default for TaskQueueInspectRequest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskQueueInspectStatusCount {
+    pub status: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskQueueInspectTaskReport {
+    pub session_id: Uuid,
+    pub task_id: Uuid,
+    pub task_status: Option<String>,
+    pub queue_status: String,
+    pub status_class: String,
+    pub lease_state: String,
+    pub worker_id: Option<String>,
+    pub lease_id: Option<Uuid>,
+    pub lease_deadline_ms: Option<i64>,
+    pub retry_count: i32,
+    pub max_retries: i32,
+    pub stop_reason: Option<String>,
+    pub last_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskQueueInspectReport {
+    pub session_id: Option<Uuid>,
+    pub now_ms: i64,
+    pub empty: bool,
+    pub total_count: usize,
+    pub active_leased_count: usize,
+    pub expired_looking_leased_count: usize,
+    pub queue_status_counts: Vec<TaskQueueInspectStatusCount>,
+    pub status_class_counts: Vec<TaskQueueInspectStatusCount>,
+    pub task_status_counts: Vec<TaskQueueInspectStatusCount>,
+    pub lease_state_counts: Vec<TaskQueueInspectStatusCount>,
+    pub tasks: Vec<TaskQueueInspectTaskReport>,
+    pub source_of_truth: String,
+    pub projection_kind: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateTaskRequest {
     pub input: String,
@@ -933,6 +1007,40 @@ impl Runtime {
         let queue = self.event_store.task_queue_record(task_id)?;
 
         task_inspect_report_from_projection(task, queue.as_ref(), &events)
+    }
+
+    pub fn inspect_task_queue(
+        &self,
+        request: TaskQueueInspectRequest,
+    ) -> HarnessResult<TaskQueueInspectReport> {
+        let now_ms = request.now_ms.map_or_else(current_time_ms, Ok)?;
+        if let Some(session_id) = request.session_id {
+            let events = self.event_store.events_for_session(session_id)?;
+            project_session(session_id, &events)?;
+        }
+
+        let records = self.event_store.task_queue_records(request.session_id)?;
+        let mut session_ids = records
+            .iter()
+            .map(|record| record.session_id)
+            .collect::<Vec<_>>();
+        session_ids.sort_unstable();
+        session_ids.dedup();
+
+        let mut task_statuses = BTreeMap::new();
+        for session_id in session_ids {
+            let events = self.event_store.events_for_session(session_id)?;
+            for task in task_projections_from_events(session_id, &events)? {
+                task_statuses.insert(task.task_id, task.status);
+            }
+        }
+
+        Ok(task_queue_inspect_report_from_records(
+            request.session_id,
+            now_ms,
+            records,
+            &task_statuses,
+        ))
     }
 
     pub fn enqueue_task(
@@ -2652,6 +2760,98 @@ fn task_inspect_queue_from_projection(queue: &TaskQueueProjection) -> TaskInspec
         stop_reason: queue.stop_reason.clone(),
         last_reason: queue.reason.clone(),
     }
+}
+
+fn task_queue_inspect_report_from_records(
+    session_id: Option<Uuid>,
+    now_ms: i64,
+    records: Vec<TaskQueueRecord>,
+    task_statuses: &BTreeMap<Uuid, String>,
+) -> TaskQueueInspectReport {
+    let mut queue_status_counts = BTreeMap::new();
+    let mut status_class_counts = BTreeMap::new();
+    let mut task_status_counts = BTreeMap::new();
+    let mut lease_state_counts = BTreeMap::new();
+    let mut active_leased_count = 0;
+    let mut expired_looking_leased_count = 0;
+    let mut tasks = Vec::new();
+
+    for record in records {
+        let (lease_state, status_class) = queue_lease_state_and_class(&record, now_ms);
+        if lease_state == "active" {
+            active_leased_count += 1;
+        } else if lease_state == "expired_looking" {
+            expired_looking_leased_count += 1;
+        }
+
+        increment_count(&mut queue_status_counts, record.status.clone());
+        increment_count(&mut status_class_counts, status_class.clone());
+        increment_count(&mut lease_state_counts, lease_state.clone());
+        if let Some(task_status) = task_statuses.get(&record.task_id) {
+            increment_count(&mut task_status_counts, task_status.clone());
+        }
+
+        tasks.push(TaskQueueInspectTaskReport {
+            session_id: record.session_id,
+            task_id: record.task_id,
+            task_status: task_statuses.get(&record.task_id).cloned(),
+            queue_status: record.status,
+            status_class,
+            lease_state,
+            worker_id: record.worker_id,
+            lease_id: record.lease_id,
+            lease_deadline_ms: record.lease_deadline_ms,
+            retry_count: record.retry_count,
+            max_retries: record.max_retries,
+            stop_reason: record.stop_reason,
+            last_reason: record.last_reason,
+        });
+    }
+
+    TaskQueueInspectReport {
+        session_id,
+        now_ms,
+        empty: tasks.is_empty(),
+        total_count: tasks.len(),
+        active_leased_count,
+        expired_looking_leased_count,
+        queue_status_counts: status_counts_from_map(queue_status_counts),
+        status_class_counts: status_counts_from_map(status_class_counts),
+        task_status_counts: status_counts_from_map(task_status_counts),
+        lease_state_counts: status_counts_from_map(lease_state_counts),
+        tasks,
+        source_of_truth: "task_queue+EventLog".to_owned(),
+        projection_kind: "task_queue_inspect_report".to_owned(),
+    }
+}
+
+fn queue_lease_state_and_class(record: &TaskQueueRecord, now_ms: i64) -> (String, String) {
+    if record.status != TASK_LEASED_STATE {
+        return ("none".to_owned(), record.status.clone());
+    }
+
+    match record.lease_deadline_ms {
+        Some(deadline) if deadline <= now_ms => (
+            "expired_looking".to_owned(),
+            "expired_looking_leased".to_owned(),
+        ),
+        Some(_) => ("active".to_owned(), "active_leased".to_owned()),
+        None => (
+            "missing_deadline".to_owned(),
+            "leased_missing_deadline".to_owned(),
+        ),
+    }
+}
+
+fn increment_count(counts: &mut BTreeMap<String, usize>, key: String) {
+    *counts.entry(key).or_insert(0) += 1;
+}
+
+fn status_counts_from_map(counts: BTreeMap<String, usize>) -> Vec<TaskQueueInspectStatusCount> {
+    counts
+        .into_iter()
+        .map(|(status, count)| TaskQueueInspectStatusCount { status, count })
+        .collect()
 }
 
 fn task_projections_from_events(
