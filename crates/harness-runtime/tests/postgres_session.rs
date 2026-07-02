@@ -3894,6 +3894,97 @@ fn task_scoped_commit_uses_existing_worktree_diff_repo() -> Result<(), Box<dyn s
 }
 
 #[test]
+fn task_scoped_commit_failure_uses_existing_worktree_diff_repo()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let (script_name, script) = fake_success_runner_script();
+    let task_repo = git_fixture_repo()?;
+    let existing_worktree = git_fixture_repo_with_files(&[(script_name, script)])?;
+    let task_repo_commits_before = git_commit_count(&task_repo)?;
+    let existing_commits_before = git_commit_count(&existing_worktree)?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started =
+        runtime.start_session(StartSessionRequest::new(task_repo.display().to_string()))?;
+    let task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "write a task diff in an explicit existing worktree that later disappears",
+    )?;
+
+    let mut worker =
+        CodexWorkerLaneRequest::new_subprocess("placeholder", fake_runner_command(script_name));
+    worker.workspace =
+        CodexWorkerLaneWorkspace::existing_worktree(existing_worktree.display().to_string());
+
+    let result = runtime
+        .run_next_leased_codex_worker_task(LeasedCodexWorkerTaskRequest::new(
+            "existing-worktree-failing-commit-worker",
+            worker,
+        ))?
+        .expect("queued task should run in existing worktree");
+    assert_eq!(result.task.status, PENDING_COMMIT_APPROVAL_STATE);
+
+    run_git(&existing_worktree, &["checkout", "--", "."])?;
+    run_git(&existing_worktree, &["clean", "-fd"])?;
+    runtime.approve_task_pending_diff(started.session_id, task_id)?;
+    let failed = runtime.commit_approved_task_diff(
+        started.session_id,
+        task_id,
+        "Commit missing explicit existing worktree diff",
+    )?;
+    let events = runtime.events_for_session(started.session_id)?;
+    let diff_event = events
+        .iter()
+        .find(|event| event.event_type == EventType::DiffRecorded)
+        .expect("diff event");
+    let commit_started = events
+        .iter()
+        .find(|event| event.event_type == EventType::CommitStarted)
+        .expect("commit started event");
+    let commit_failed = events
+        .iter()
+        .find(|event| event.event_type == EventType::CommitFailed)
+        .expect("commit failed event");
+
+    assert_eq!(failed.status, COMMIT_FAILED_STATE);
+    assert_eq!(
+        git_commit_count(&existing_worktree)?,
+        existing_commits_before
+    );
+    assert_eq!(git_commit_count(&task_repo)?, task_repo_commits_before);
+    assert_eq!(git_text(&existing_worktree, &["status", "--short"])?, "");
+    assert_eq!(git_text(&task_repo, &["status", "--short"])?, "");
+    assert!(
+        failed
+            .commit
+            .as_ref()
+            .expect("commit slot")
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("approved diff has no local changes"))
+    );
+    assert_eq!(
+        diff_event.payload["repo_path"],
+        existing_worktree.display().to_string()
+    );
+    assert_eq!(
+        commit_started.payload["repo_path"],
+        existing_worktree.display().to_string()
+    );
+    assert_eq!(
+        commit_failed.payload["repo_path"],
+        existing_worktree.display().to_string()
+    );
+
+    Ok(())
+}
+
+#[test]
 fn codex_worker_lane_fake_subprocess_reports_non_zero_exit()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
