@@ -506,7 +506,7 @@ fn cli_runs_next_queued_task_through_codex_worker() -> Result<(), Box<dyn std::e
 
     let bin = env!("CARGO_BIN_EXE_harness-cli");
     let repo = fixture_repo()?;
-    let (script_name, script) = fake_success_runner_script();
+    let (script_name, script) = fake_arg_check_runner_script();
     write_file(&repo, "AGENTS.md", "Use deterministic agent fixtures.")?;
     write_file(&repo, "README.md", "fixture repository\n")?;
     write_file(&repo, script_name, script)?;
@@ -567,8 +567,6 @@ fn cli_runs_next_queued_task_through_codex_worker() -> Result<(), Box<dyn std::e
         "session".to_owned(),
         "task".to_owned(),
         "run-next-codex-worker".to_owned(),
-        "--database-url".to_owned(),
-        database_url.clone(),
         "--worker-id".to_owned(),
         "cli-queue-worker".to_owned(),
         "--timeout-ms".to_owned(),
@@ -578,8 +576,17 @@ fn cli_runs_next_queued_task_through_codex_worker() -> Result<(), Box<dyn std::e
         "--".to_owned(),
     ];
     args.extend(fake_runner_cli_command(script_name));
+    args.extend([
+        "--database-url".to_owned(),
+        "postgres://child.invalid/harness".to_owned(),
+        "--child-flag".to_owned(),
+        "passed".to_owned(),
+    ]);
     let before_ms = current_time_ms_for_test()?;
-    let run = Command::new(bin).args(args).output()?;
+    let run = Command::new(bin)
+        .args(args)
+        .env("HARNESS_DATABASE_URL", &database_url)
+        .output()?;
     assert!(run.status.success());
 
     let run_stdout = String::from_utf8(run.stdout)?;
@@ -1424,6 +1431,22 @@ fn fake_success_runner_script() -> (&'static str, &'static str) {
     (
         "fake-success-runner.sh",
         "#!/bin/sh\nprintf '0123456789\\n'\nprintf 'changed by CLI fake runner\\n' >> README.md\nexit 0\n",
+    )
+}
+
+#[cfg(windows)]
+fn fake_arg_check_runner_script() -> (&'static str, &'static str) {
+    (
+        "fake-arg-check-runner.cmd",
+        "@echo off\r\nif NOT \"%~1\"==\"--database-url\" exit /B 2\r\nif NOT \"%~2\"==\"postgres://child.invalid/harness\" exit /B 3\r\nif NOT \"%~3\"==\"--child-flag\" exit /B 4\r\nif NOT \"%~4\"==\"passed\" exit /B 5\r\necho 0123456789\r\necho changed by CLI fake runner>> README.md\r\nexit /B 0\r\n",
+    )
+}
+
+#[cfg(not(windows))]
+fn fake_arg_check_runner_script() -> (&'static str, &'static str) {
+    (
+        "fake-arg-check-runner.sh",
+        "#!/bin/sh\n[ \"$1\" = \"--database-url\" ] || exit 2\n[ \"$2\" = \"postgres://child.invalid/harness\" ] || exit 3\n[ \"$3\" = \"--child-flag\" ] || exit 4\n[ \"$4\" = \"passed\" ] || exit 5\nprintf '0123456789\\n'\nprintf 'changed by CLI fake runner\\n' >> README.md\nexit 0\n",
     )
 }
 

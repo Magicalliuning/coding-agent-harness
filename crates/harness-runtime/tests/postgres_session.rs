@@ -1648,6 +1648,76 @@ fn queued_worker_lease_deadline_covers_worker_timeout() -> Result<(), Box<dyn st
 }
 
 #[test]
+fn invalid_queued_worker_config_is_rejected_before_lease() -> Result<(), Box<dyn std::error::Error>>
+{
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = git_fixture_repo()?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo.display().to_string()))?;
+
+    let timeout_task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "keep queued when timeout is invalid",
+    )?;
+    let mut timeout_worker = CodexWorkerLaneRequest::new(
+        "placeholder",
+        CodexWorkerLaneFixture::succeeded("invalid timeout worker"),
+    );
+    timeout_worker.timeout_ms = 0;
+
+    let timeout_error = runtime
+        .run_next_leased_codex_worker_task(LeasedCodexWorkerTaskRequest::new(
+            "invalid-timeout-worker",
+            timeout_worker,
+        ))
+        .expect_err("invalid timeout should fail before leasing");
+    assert!(timeout_error.to_string().contains("timeout"));
+
+    let timeout_task = runtime.show_task(started.session_id, timeout_task_id)?;
+    assert_eq!(timeout_task.status, TASK_QUEUED_STATE);
+    assert_eq!(
+        timeout_task.queue.as_ref().expect("queue slot").status,
+        TASK_QUEUED_STATE
+    );
+    assert!(timeout_task.lease.is_none());
+
+    let stdout_task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "keep queued when stdout budget is invalid",
+    )?;
+    let mut stdout_worker = CodexWorkerLaneRequest::new(
+        "placeholder",
+        CodexWorkerLaneFixture::succeeded("invalid stdout worker"),
+    );
+    stdout_worker.budget.max_stdout_bytes = 0;
+
+    let stdout_error = runtime
+        .run_next_leased_codex_worker_task(LeasedCodexWorkerTaskRequest::new(
+            "invalid-stdout-worker",
+            stdout_worker,
+        ))
+        .expect_err("invalid stdout budget should fail before leasing");
+    assert!(stdout_error.to_string().contains("stdout budget"));
+
+    let stdout_task = runtime.show_task(started.session_id, stdout_task_id)?;
+    assert_eq!(stdout_task.status, TASK_QUEUED_STATE);
+    assert_eq!(
+        stdout_task.queue.as_ref().expect("queue slot").status,
+        TASK_QUEUED_STATE
+    );
+    assert!(stdout_task.lease.is_none());
+
+    Ok(())
+}
+
+#[test]
 fn leased_task_worker_failure_timeout_and_cancellation_update_task_state()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
