@@ -1906,11 +1906,26 @@ fn task_queue_successful_transitions_keep_eventlog_replay_and_queue_status_align
     runtime.enqueue_task_with_max_retries(started.session_id, retry_task.task_id, 1)?;
     let mut retry_lease_request = LeaseNextTaskRequest::new("retry-expire-worker");
     retry_lease_request.lease_duration_ms = 1;
-    runtime
+    let retry_lease = runtime
         .lease_next_task(retry_lease_request)?
         .expect("retry expiration task should lease");
+    assert_eq!(retry_lease.task_id, retry_task.task_id);
     runtime.expire_task_leases(current_time_ms_for_test()?.saturating_add(60_000))?;
     assert_replay_and_queue_status(&runtime, retry_task.task_id, TASK_RETRY_QUEUED_STATE)?;
+    let retry_cleanup_lease = runtime
+        .lease_next_task(LeaseNextTaskRequest::new("retry-cleanup-worker"))?
+        .expect("retry task should lease for cleanup before stopped path");
+    assert_eq!(retry_cleanup_lease.task_id, retry_task.task_id);
+    let retry_cleanup_lease_id = retry_cleanup_lease
+        .lease
+        .as_ref()
+        .expect("retry cleanup lease slot")
+        .lease_id;
+    runtime.complete_task_lease(
+        retry_task.task_id,
+        retry_cleanup_lease_id,
+        "cleanup retry task before stopped expiration path",
+    )?;
 
     let stopped_task = runtime.create_task(
         started.session_id,
@@ -1919,9 +1934,10 @@ fn task_queue_successful_transitions_keep_eventlog_replay_and_queue_status_align
     runtime.enqueue_task_with_max_retries(started.session_id, stopped_task.task_id, 0)?;
     let mut stopped_lease_request = LeaseNextTaskRequest::new("stopped-expire-worker");
     stopped_lease_request.lease_duration_ms = 1;
-    runtime
+    let stopped_lease = runtime
         .lease_next_task(stopped_lease_request)?
         .expect("stopped expiration task should lease");
+    assert_eq!(stopped_lease.task_id, stopped_task.task_id);
     runtime.expire_task_leases(current_time_ms_for_test()?.saturating_add(60_000))?;
     assert_replay_and_queue_status(&runtime, stopped_task.task_id, TASK_STOPPED_STATE)?;
 
@@ -2010,9 +2026,10 @@ fn expired_lease_owner_cannot_terminal_transition_task() -> Result<(), Box<dyn s
     )?;
     let mut wrong_lease_request = LeaseNextTaskRequest::new("wrong-lease-worker");
     wrong_lease_request.lease_duration_ms = 600_000;
-    runtime
+    let wrong_lease = runtime
         .lease_next_task(wrong_lease_request)?
         .expect("wrong lease id task should lease");
+    assert_eq!(wrong_lease.task_id, wrong_lease_task_id);
 
     let complete_error = runtime
         .complete_task_lease(
