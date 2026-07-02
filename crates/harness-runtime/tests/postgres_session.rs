@@ -11,7 +11,8 @@ use harness_db::PostgresEventStore;
 use harness_events::{
     CommitApprovalDecisionPayload, CommitApprovalPendingPayload, CommitHandoffPayload,
     DiffSummaryPayload, EventType, NewEvent, TaskLeasePayload, TaskQueuePayload,
-    ToolCallIntentPayload, WorkerLaneObservationPayload, WorkerLaneWorktreeAllocatedPayload,
+    ToolCallIntentPayload, WorkerLaneBudgetPayload, WorkerLaneObservationPayload,
+    WorkerLaneRequestPayload, WorkerLaneWorktreeAllocatedPayload,
 };
 use harness_policy::PolicyDecision;
 use harness_runtime::{
@@ -287,6 +288,306 @@ fn event_timeline_report_filters_task_scope_and_bounds_payloads()
         )
         .expect_err("missing task scope should fail");
     assert!(missing.message().contains("task not found"));
+
+    Ok(())
+}
+
+#[test]
+fn task_inspect_report_combines_projection_queue_and_task_scoped_evidence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new("task-inspect-fixture-repo"))?;
+    let first = runtime.create_task(
+        started.session_id,
+        CreateTaskRequest {
+            input: "write the inspect task".to_owned(),
+            repo_path: None,
+            worker_lane_kind: DEFAULT_TASK_WORKER_LANE_KIND.to_owned(),
+            context: SessionContextCompileRequest {
+                budget: ContextBudget {
+                    max_bytes: 4096,
+                    max_files: 8,
+                    max_skill_files: 2,
+                },
+                focus_terms: vec!["inspect".to_owned()],
+            },
+            max_output_tokens: 384,
+        },
+    )?;
+    let unrelated = runtime.create_task(
+        started.session_id,
+        CreateTaskRequest::new("write the unrelated inspect task"),
+    )?;
+    runtime.enqueue_task_with_max_retries(started.session_id, first.task_id, 2)?;
+    runtime
+        .lease_next_task(LeaseNextTaskRequest {
+            worker_id: "inspect-worker".to_owned(),
+            lease_duration_ms: 30_000,
+        })?
+        .expect("leased task");
+
+    let store = PostgresEventStore::connect(&database_url)?;
+    store.append_event(NewEvent::worker_lane_requested(
+        started.session_id,
+        WorkerLaneRequestPayload {
+            task_id: Some(first.task_id),
+            lane_id: "lane-inspect".to_owned(),
+            lane_kind: DEFAULT_TASK_WORKER_LANE_KIND.to_owned(),
+            task: "write the inspect task".to_owned(),
+            workspace_path: "C:/workspace".to_owned(),
+            worktree_path: Some("C:/requested-worktree".to_owned()),
+            timeout_ms: 30_000,
+            cancellation_requested: false,
+            budget: WorkerLaneBudgetPayload::new(8192, 2048, 65536),
+        },
+    )?)?;
+    store.append_event(NewEvent::worker_lane_worktree_allocated(
+        started.session_id,
+        WorkerLaneWorktreeAllocatedPayload::new(
+            "lane-inspect",
+            DEFAULT_TASK_WORKER_LANE_KIND,
+            "C:/repo",
+            "C:/allocated-worktree",
+            "HEAD",
+        )
+        .with_task_id(first.task_id),
+    )?)?;
+    store.append_event(NewEvent::diff_recorded(
+        started.session_id,
+        DiffSummaryPayload::new(1, 2, 0, vec!["README.md".to_owned()])
+            .with_task_id(first.task_id)
+            .with_repo_path("C:/diff-repo"),
+    )?)?;
+    store.append_event(NewEvent::commit_approval_pending(
+        started.session_id,
+        CommitApprovalPendingPayload::new(
+            PENDING_COMMIT_APPROVAL_STATE,
+            "worker produced reviewable diff",
+        )
+        .with_task_id(first.task_id),
+    )?)?;
+    store.append_event(NewEvent::commit_approved(
+        started.session_id,
+        CommitApprovalDecisionPayload::new(
+            COMMIT_APPROVED_STATE,
+            "approved for inspect",
+            "runtime",
+        )
+        .with_task_id(first.task_id),
+    )?)?;
+    store.append_event(NewEvent::commit_succeeded(
+        started.session_id,
+        CommitHandoffPayload::succeeded(
+            "C:/diff-repo",
+            "Commit inspect task",
+            "runtime",
+            "0123456789abcdef0123456789abcdef01234567",
+        )
+        .with_task_id(first.task_id),
+    )?)?;
+
+    let events_before = runtime.events_for_session(started.session_id)?;
+    let queue_before = PostgresEventStore::connect(&database_url)?
+        .task_queue_record(first.task_id)?
+        .expect("task queue record");
+    let report = runtime.inspect_task(started.session_id, first.task_id)?;
+    let events_after = runtime.events_for_session(started.session_id)?;
+    let queue_after = PostgresEventStore::connect(&database_url)?
+        .task_queue_record(first.task_id)?
+        .expect("task queue record after inspect");
+
+    assert_eq!(report.session_id, started.session_id);
+    assert_eq!(report.task_id, first.task_id);
+    assert_eq!(report.status, COMMITTED_STATE);
+    assert_eq!(report.worker_lane_kind, DEFAULT_TASK_WORKER_LANE_KIND);
+    assert_eq!(report.context_budget.max_bytes, 4096);
+    assert_eq!(report.context_budget.max_files, 8);
+    assert_eq!(report.context_budget.max_skill_files, 2);
+    assert_eq!(report.focus_terms, vec!["inspect"]);
+    assert_eq!(report.max_output_tokens, 384);
+    assert_eq!(
+        report.queue.as_ref().expect("queue").status,
+        TASK_LEASED_STATE
+    );
+    assert_eq!(
+        report.queue.as_ref().expect("queue").worker_id.as_deref(),
+        Some("inspect-worker")
+    );
+    assert_eq!(report.queue.as_ref().expect("queue").max_retries, Some(2));
+    assert_eq!(
+        report.lease.as_ref().expect("lease").worker_id,
+        "inspect-worker"
+    );
+    assert_eq!(
+        report.approval.as_ref().expect("approval").actor.as_deref(),
+        Some("runtime")
+    );
+    assert_eq!(
+        report
+            .approval
+            .as_ref()
+            .expect("approval")
+            .reason
+            .as_deref(),
+        Some("approved for inspect")
+    );
+    assert_eq!(
+        report.commit.as_ref().expect("commit").repo_path.as_deref(),
+        Some("C:/diff-repo")
+    );
+    assert_eq!(
+        report
+            .commit
+            .as_ref()
+            .expect("commit")
+            .commit_sha
+            .as_deref(),
+        Some("0123456789abcdef0123456789abcdef01234567")
+    );
+    assert_eq!(
+        report.workspace.worker_workspace_path.as_deref(),
+        Some("C:/workspace")
+    );
+    assert_eq!(
+        report.workspace.worker_worktree_path.as_deref(),
+        Some("C:/requested-worktree")
+    );
+    assert_eq!(
+        report.workspace.allocated_worktree_path.as_deref(),
+        Some("C:/allocated-worktree")
+    );
+    assert_eq!(
+        report.workspace.diff_repo_path.as_deref(),
+        Some("C:/diff-repo")
+    );
+    assert_eq!(
+        report.diff.as_ref().expect("diff").repo_path.as_deref(),
+        Some("C:/diff-repo")
+    );
+    assert_eq!(report.diff.as_ref().expect("diff").files_changed, 1);
+    assert_eq!(report.event_summary.first_sequence, Some(2));
+    assert_eq!(
+        report.event_summary.latest_event_type.as_deref(),
+        Some("commit.succeeded")
+    );
+    assert!(report.event_summary.event_count < events_before.len());
+    assert_eq!(report.source_of_truth, "EventLog");
+    assert_eq!(report.projection_kind, "task_inspect_report");
+    assert_eq!(events_after.len(), events_before.len());
+    assert_eq!(queue_after, queue_before);
+
+    let other_session =
+        runtime.start_session(StartSessionRequest::new("other-task-inspect-repo"))?;
+    let missing = runtime
+        .inspect_task(other_session.session_id, unrelated.task_id)
+        .expect_err("task from another session should not inspect");
+    assert!(missing.message().contains("task not found"));
+
+    Ok(())
+}
+
+#[test]
+fn task_inspect_report_exposes_rejected_and_commit_failed_terminal_evidence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new("task-inspect-terminal-repo"))?;
+    let rejected = runtime.create_task(
+        started.session_id,
+        CreateTaskRequest::new("write the rejected inspect task"),
+    )?;
+    let failed = runtime.create_task(
+        started.session_id,
+        CreateTaskRequest::new("write the commit failed inspect task"),
+    )?;
+    let store = PostgresEventStore::connect(&database_url)?;
+
+    store.append_event(NewEvent::diff_recorded(
+        started.session_id,
+        DiffSummaryPayload::new(1, 1, 0, vec!["rejected.md".to_owned()])
+            .with_task_id(rejected.task_id),
+    )?)?;
+    store.append_event(NewEvent::commit_approval_pending(
+        started.session_id,
+        CommitApprovalPendingPayload::new(PENDING_COMMIT_APPROVAL_STATE, "rejected task diff")
+            .with_task_id(rejected.task_id),
+    )?)?;
+    store.append_event(NewEvent::commit_rejected(
+        started.session_id,
+        CommitApprovalDecisionPayload::new(
+            COMMIT_REJECTED_STATE,
+            "not the intended inspect change",
+            "runtime",
+        )
+        .with_task_id(rejected.task_id),
+    )?)?;
+
+    store.append_event(NewEvent::diff_recorded(
+        started.session_id,
+        DiffSummaryPayload::new(1, 1, 0, vec!["failed.md".to_owned()]).with_task_id(failed.task_id),
+    )?)?;
+    store.append_event(NewEvent::commit_approval_pending(
+        started.session_id,
+        CommitApprovalPendingPayload::new(PENDING_COMMIT_APPROVAL_STATE, "failed task diff")
+            .with_task_id(failed.task_id),
+    )?)?;
+    store.append_event(NewEvent::commit_approved(
+        started.session_id,
+        CommitApprovalDecisionPayload::new(
+            COMMIT_APPROVED_STATE,
+            "approved for failure",
+            "runtime",
+        )
+        .with_task_id(failed.task_id),
+    )?)?;
+    store.append_event(NewEvent::commit_failed(
+        started.session_id,
+        CommitHandoffPayload::failed(
+            "C:/failed-repo",
+            "Commit failed inspect task",
+            "runtime",
+            "git failed",
+        )
+        .with_task_id(failed.task_id),
+    )?)?;
+
+    let rejected_report = runtime.inspect_task(started.session_id, rejected.task_id)?;
+    let failed_report = runtime.inspect_task(started.session_id, failed.task_id)?;
+
+    let rejected_approval = rejected_report
+        .approval
+        .as_ref()
+        .expect("rejected approval");
+    assert_eq!(rejected_report.status, COMMIT_REJECTED_STATE);
+    assert_eq!(rejected_approval.actor.as_deref(), Some("runtime"));
+    assert_eq!(
+        rejected_approval.rejection_reason.as_deref(),
+        Some("not the intended inspect change")
+    );
+    assert_eq!(rejected_report.commit, None);
+
+    let failed_approval = failed_report.approval.as_ref().expect("failed approval");
+    let failed_commit = failed_report.commit.as_ref().expect("failed commit");
+    assert_eq!(failed_report.status, COMMIT_FAILED_STATE);
+    assert_eq!(failed_approval.actor.as_deref(), Some("runtime"));
+    assert_eq!(
+        failed_approval.reason.as_deref(),
+        Some("approved for failure")
+    );
+    assert_eq!(failed_commit.repo_path.as_deref(), Some("C:/failed-repo"));
+    assert_eq!(failed_commit.actor.as_deref(), Some("runtime"));
+    assert_eq!(failed_commit.failure_reason.as_deref(), Some("git failed"));
 
     Ok(())
 }

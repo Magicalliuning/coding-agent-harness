@@ -14,7 +14,7 @@ use harness_runtime::{
     LeasedCodexWorkerTaskResult, Runtime, SelfRecoveryLoopRequest, SelfRecoveryLoopResult,
     SessionContextCompileRequest, SessionContextCompileResult, SessionInspectReport,
     SessionProjection, SmallCodingTaskRequest, SmallCodingTaskResult, StartSessionRequest,
-    TaskProjection, VerificationCommandRequest, VerificationCommandResult,
+    TaskInspectReport, TaskProjection, VerificationCommandRequest, VerificationCommandResult,
 };
 use uuid::Uuid;
 
@@ -181,6 +181,19 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
                         .map_err(|error| HarnessError::new(error.to_string()))?;
                     let task = runtime.show_task(session_id, task_id)?;
                     print_task_projection(&task);
+                    Ok(())
+                }
+                "inspect" => {
+                    let session_id = session_id_arg(&args, 2)?;
+                    let task_id = task_id_arg(&args, 3)?;
+                    let report = runtime.inspect_task(session_id, task_id)?;
+
+                    if has_flag(&args, "--json") {
+                        print_task_inspect_json(&report)?;
+                    } else {
+                        print_task_inspect_report(&report);
+                    }
+
                     Ok(())
                 }
                 "enqueue" => {
@@ -988,6 +1001,240 @@ fn print_task_projection(task: &TaskProjection) {
     }
 
     println!("event_count={}", task.event_count);
+}
+
+fn print_task_inspect_report(report: &TaskInspectReport) {
+    println!("session_id={}", report.session_id);
+    println!("task_id={}", report.task_id);
+    println!("task_status={}", report.status);
+    println!("task_repo_path={}", report.repo_path);
+    println!("task_input_summary={}", report.input_summary.text);
+    println!(
+        "task_input_original_bytes={}",
+        report.input_summary.original_bytes
+    );
+    println!("task_input_truncated={}", report.input_summary.truncated);
+    println!("task_worker_lane_kind={}", report.worker_lane_kind);
+    println!("task_context_max_bytes={}", report.context_budget.max_bytes);
+    println!("task_context_max_files={}", report.context_budget.max_files);
+    println!(
+        "task_context_max_skill_files={}",
+        report.context_budget.max_skill_files
+    );
+    println!("task_focus_terms={}", report.focus_terms.join(","));
+    println!("task_max_output_tokens={}", report.max_output_tokens);
+
+    if let Some(queue) = &report.queue {
+        println!("task_queue_status={}", queue.status);
+        println!(
+            "task_queue_worker_id={}",
+            queue.worker_id.as_deref().unwrap_or_default()
+        );
+        println!(
+            "task_queue_lease_id={}",
+            queue
+                .lease_id
+                .map_or_else(String::new, |lease_id| lease_id.to_string())
+        );
+        println!(
+            "task_queue_lease_deadline_ms={}",
+            queue
+                .lease_deadline_ms
+                .map_or_else(String::new, |deadline| deadline.to_string())
+        );
+        println!(
+            "task_queue_retry_count={}",
+            queue
+                .retry_count
+                .map_or_else(String::new, |count| count.to_string())
+        );
+        println!(
+            "task_queue_max_retries={}",
+            queue
+                .max_retries
+                .map_or_else(String::new, |retries| retries.to_string())
+        );
+        println!(
+            "task_queue_stop_reason={}",
+            queue.stop_reason.as_deref().unwrap_or_default()
+        );
+        println!(
+            "task_queue_last_reason={}",
+            queue.last_reason.as_deref().unwrap_or_default()
+        );
+    } else {
+        println!("task_queue_status=");
+        println!("task_queue_worker_id=");
+        println!("task_queue_lease_id=");
+        println!("task_queue_lease_deadline_ms=");
+        println!("task_queue_retry_count=");
+        println!("task_queue_max_retries=");
+        println!("task_queue_stop_reason=");
+        println!("task_queue_last_reason=");
+    }
+
+    if let Some(lease) = &report.lease {
+        println!("task_lease_id={}", lease.lease_id);
+        println!("task_lease_worker_id={}", lease.worker_id);
+        println!("task_lease_status={}", lease.status);
+        println!(
+            "task_lease_deadline_ms={}",
+            lease
+                .lease_deadline_ms
+                .map_or_else(String::new, |deadline| deadline.to_string())
+        );
+        println!(
+            "task_lease_reason={}",
+            lease.reason.as_deref().unwrap_or_default()
+        );
+    } else {
+        println!("task_lease_id=");
+        println!("task_lease_worker_id=");
+        println!("task_lease_status=");
+        println!("task_lease_deadline_ms=");
+        println!("task_lease_reason=");
+    }
+
+    if let Some(approval) = &report.approval {
+        println!("task_approval_state={}", approval.state);
+        println!("task_approval_summary={}", approval.summary);
+        println!(
+            "task_approval_actor={}",
+            approval.actor.as_deref().unwrap_or_default()
+        );
+        println!(
+            "task_approval_reason={}",
+            approval.reason.as_deref().unwrap_or_default()
+        );
+        println!(
+            "task_approval_rejection_reason={}",
+            approval.rejection_reason.as_deref().unwrap_or_default()
+        );
+    } else {
+        println!("task_approval_state=");
+        println!("task_approval_summary=");
+        println!("task_approval_actor=");
+        println!("task_approval_reason=");
+        println!("task_approval_rejection_reason=");
+    }
+
+    if let Some(commit) = &report.commit {
+        println!("task_commit_state={}", commit.state);
+        println!(
+            "task_commit_repo_path={}",
+            commit.repo_path.as_deref().unwrap_or_default()
+        );
+        println!("task_commit_message={}", commit.message);
+        println!(
+            "task_commit_actor={}",
+            commit.actor.as_deref().unwrap_or_default()
+        );
+        println!(
+            "task_commit_sha={}",
+            commit.commit_sha.as_deref().unwrap_or_default()
+        );
+        println!(
+            "task_commit_failure_reason={}",
+            commit.failure_reason.as_deref().unwrap_or_default()
+        );
+    } else {
+        println!("task_commit_state=");
+        println!("task_commit_repo_path=");
+        println!("task_commit_message=");
+        println!("task_commit_actor=");
+        println!("task_commit_sha=");
+        println!("task_commit_failure_reason=");
+    }
+
+    println!(
+        "task_worker_workspace_path={}",
+        report
+            .workspace
+            .worker_workspace_path
+            .as_deref()
+            .unwrap_or_default()
+    );
+    println!(
+        "task_worker_worktree_path={}",
+        report
+            .workspace
+            .worker_worktree_path
+            .as_deref()
+            .unwrap_or_default()
+    );
+    println!(
+        "task_allocated_worktree_path={}",
+        report
+            .workspace
+            .allocated_worktree_path
+            .as_deref()
+            .unwrap_or_default()
+    );
+    println!(
+        "task_session_repo_path={}",
+        report
+            .workspace
+            .session_repo_path
+            .as_deref()
+            .unwrap_or_default()
+    );
+    println!(
+        "task_workspace_diff_repo_path={}",
+        report
+            .workspace
+            .diff_repo_path
+            .as_deref()
+            .unwrap_or_default()
+    );
+
+    if let Some(diff) = &report.diff {
+        println!(
+            "task_diff_repo_path={}",
+            diff.repo_path.as_deref().unwrap_or_default()
+        );
+        println!("task_diff_files_changed={}", diff.files_changed);
+        println!("task_diff_insertions={}", diff.insertions);
+        println!("task_diff_deletions={}", diff.deletions);
+        println!("task_diff_paths={}", diff.paths.join(","));
+    } else {
+        println!("task_diff_files_changed=");
+        println!("task_diff_insertions=");
+        println!("task_diff_deletions=");
+        println!("task_diff_paths=");
+    }
+
+    println!("task_event_count={}", report.event_summary.event_count);
+    println!(
+        "task_event_first_sequence={}",
+        report
+            .event_summary
+            .first_sequence
+            .map_or_else(String::new, |sequence| sequence.to_string())
+    );
+    println!(
+        "task_event_latest_sequence={}",
+        report
+            .event_summary
+            .latest_sequence
+            .map_or_else(String::new, |sequence| sequence.to_string())
+    );
+    println!(
+        "task_event_latest_type={}",
+        report
+            .event_summary
+            .latest_event_type
+            .as_deref()
+            .unwrap_or_default()
+    );
+    println!("source_of_truth={}", report.source_of_truth);
+    println!("projection_kind={}", report.projection_kind);
+}
+
+fn print_task_inspect_json(report: &TaskInspectReport) -> HarnessResult<()> {
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|error| HarnessError::new(error.to_string()))?;
+    println!("{json}");
+    Ok(())
 }
 
 fn print_verification_result(result: &VerificationCommandResult) {

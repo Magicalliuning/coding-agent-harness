@@ -181,6 +181,101 @@ pub struct EventTimelineReport {
     pub projection_kind: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskContextBudgetReport {
+    pub max_bytes: usize,
+    pub max_files: usize,
+    pub max_skill_files: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskInspectQueueReport {
+    pub status: String,
+    pub worker_id: Option<String>,
+    pub lease_id: Option<Uuid>,
+    pub lease_deadline_ms: Option<i64>,
+    pub retry_count: Option<i32>,
+    pub max_retries: Option<i32>,
+    pub stop_reason: Option<String>,
+    pub last_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskInspectLeaseReport {
+    pub lease_id: Uuid,
+    pub worker_id: String,
+    pub status: String,
+    pub lease_deadline_ms: Option<i64>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskInspectApprovalReport {
+    pub state: String,
+    pub summary: String,
+    pub actor: Option<String>,
+    pub reason: Option<String>,
+    pub rejection_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskInspectCommitReport {
+    pub state: String,
+    pub repo_path: Option<String>,
+    pub message: String,
+    pub actor: Option<String>,
+    pub commit_sha: Option<String>,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskInspectWorkspaceReport {
+    pub worker_workspace_path: Option<String>,
+    pub worker_worktree_path: Option<String>,
+    pub allocated_worktree_path: Option<String>,
+    pub session_repo_path: Option<String>,
+    pub diff_repo_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskInspectDiffReport {
+    pub repo_path: Option<String>,
+    pub files_changed: usize,
+    pub insertions: usize,
+    pub deletions: usize,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskInspectEventSummary {
+    pub event_count: usize,
+    pub first_sequence: Option<i64>,
+    pub latest_sequence: Option<i64>,
+    pub latest_event_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskInspectReport {
+    pub session_id: Uuid,
+    pub task_id: Uuid,
+    pub repo_path: String,
+    pub status: String,
+    pub input_summary: BoundedPayloadSummary,
+    pub worker_lane_kind: String,
+    pub context_budget: TaskContextBudgetReport,
+    pub focus_terms: Vec<String>,
+    pub max_output_tokens: usize,
+    pub queue: Option<TaskInspectQueueReport>,
+    pub lease: Option<TaskInspectLeaseReport>,
+    pub approval: Option<TaskInspectApprovalReport>,
+    pub commit: Option<TaskInspectCommitReport>,
+    pub workspace: TaskInspectWorkspaceReport,
+    pub diff: Option<TaskInspectDiffReport>,
+    pub event_summary: TaskInspectEventSummary,
+    pub source_of_truth: String,
+    pub projection_kind: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateTaskRequest {
     pub input: String,
@@ -821,6 +916,23 @@ impl Runtime {
             .into_iter()
             .find(|task| task.task_id == task_id)
             .ok_or_else(|| HarnessError::new(format!("task not found: {task_id}")))
+    }
+
+    pub fn inspect_task(
+        &self,
+        session_id: Uuid,
+        task_id: Uuid,
+    ) -> HarnessResult<TaskInspectReport> {
+        let events = self.event_store.events_for_session(session_id)?;
+        project_session(session_id, &events)?;
+        let tasks = task_projections_from_events(session_id, &events)?;
+        let task = tasks
+            .into_iter()
+            .find(|task| task.task_id == task_id)
+            .ok_or_else(|| HarnessError::new(format!("task not found: {task_id}")))?;
+        let queue = self.event_store.task_queue_record(task_id)?;
+
+        task_inspect_report_from_projection(task, queue.as_ref(), &events)
     }
 
     pub fn enqueue_task(
@@ -2362,25 +2474,184 @@ fn bounded_payload_summary(
 ) -> HarnessResult<BoundedPayloadSummary> {
     let serialized =
         serde_json::to_string(payload).map_err(|error| HarnessError::new(error.to_string()))?;
-    let original_bytes = serialized.len();
+    Ok(bounded_text_summary(serialized, limit_bytes))
+}
+
+fn bounded_text_summary(text: String, limit_bytes: usize) -> BoundedPayloadSummary {
+    let original_bytes = text.len();
     if original_bytes <= limit_bytes {
-        return Ok(BoundedPayloadSummary {
-            text: serialized,
+        return BoundedPayloadSummary {
+            text,
             original_bytes,
             truncated: false,
-        });
+        };
     }
 
     let mut end = limit_bytes;
-    while !serialized.is_char_boundary(end) {
+    while !text.is_char_boundary(end) {
         end = end.saturating_sub(1);
     }
 
-    Ok(BoundedPayloadSummary {
-        text: serialized[..end].to_owned(),
+    BoundedPayloadSummary {
+        text: text[..end].to_owned(),
         original_bytes,
         truncated: true,
+    }
+}
+
+fn task_inspect_report_from_projection(
+    task: TaskProjection,
+    queue_record: Option<&TaskQueueRecord>,
+    events: &[EventEnvelope],
+) -> HarnessResult<TaskInspectReport> {
+    let mut approval_actor = None;
+    let mut approval_reason = None;
+    let mut commit_actor = None;
+    let mut commit_repo_path = None;
+    let mut worker_workspace_path = None;
+    let mut worker_worktree_path = None;
+    let mut allocated_worktree_path = task
+        .worktree
+        .as_ref()
+        .map(|worktree| worktree.worktree_path.clone());
+    let mut session_repo_path = None;
+    let mut diff_repo_path = None;
+    let mut task_event_count = 0;
+    let mut first_sequence = None;
+    let mut latest_sequence = None;
+    let mut latest_event_type = None;
+
+    for event in events {
+        if payload_task_id(&event.payload)? != Some(task.task_id) {
+            continue;
+        }
+
+        task_event_count += 1;
+        first_sequence.get_or_insert(event.sequence);
+        latest_sequence = Some(event.sequence);
+        latest_event_type = Some(event.event_type.as_str().to_owned());
+
+        match event.event_type {
+            EventType::WorkerLaneRequested => {
+                worker_workspace_path = payload_optional_string(&event.payload, "workspace_path");
+                worker_worktree_path = payload_optional_string(&event.payload, "worktree_path");
+            }
+            EventType::WorkerLaneWorktreeAllocated => {
+                allocated_worktree_path = Some(payload_string(&event.payload, "worktree_path")?);
+                session_repo_path = Some(payload_string(&event.payload, "session_repo_path")?);
+            }
+            EventType::DiffRecorded => {
+                diff_repo_path = payload_optional_string(&event.payload, "repo_path");
+            }
+            EventType::CommitApproved | EventType::CommitRejected => {
+                approval_actor = payload_optional_string(&event.payload, "actor");
+                approval_reason = payload_optional_string(&event.payload, "reason");
+            }
+            EventType::CommitStarted | EventType::CommitSucceeded | EventType::CommitFailed => {
+                commit_actor = payload_optional_string(&event.payload, "actor");
+                commit_repo_path = payload_optional_string(&event.payload, "repo_path");
+            }
+            _ => {}
+        }
+    }
+
+    let queue = queue_record
+        .map(task_inspect_queue_from_record)
+        .or_else(|| task.queue.as_ref().map(task_inspect_queue_from_projection));
+    let lease = task.lease.as_ref().map(|lease| TaskInspectLeaseReport {
+        lease_id: lease.lease_id,
+        worker_id: lease.worker_id.clone(),
+        status: lease.status.clone(),
+        lease_deadline_ms: lease.lease_deadline_ms,
+        reason: lease.reason.clone(),
+    });
+    let approval = task
+        .approval
+        .as_ref()
+        .map(|approval| TaskInspectApprovalReport {
+            state: approval.state.clone(),
+            summary: approval.summary.clone(),
+            actor: approval_actor.clone(),
+            reason: approval_reason.clone(),
+            rejection_reason: approval.rejection_reason.clone(),
+        });
+    let commit = task.commit.as_ref().map(|commit| TaskInspectCommitReport {
+        state: commit.state.clone(),
+        repo_path: commit_repo_path.clone(),
+        message: commit.message.clone(),
+        actor: commit_actor.clone(),
+        commit_sha: commit.commit_sha.clone(),
+        failure_reason: commit.failure_reason.clone(),
+    });
+    let diff = task.diff.as_ref().map(|diff| TaskInspectDiffReport {
+        repo_path: diff_repo_path.clone(),
+        files_changed: diff.files_changed,
+        insertions: diff.insertions,
+        deletions: diff.deletions,
+        paths: diff.paths.clone(),
+    });
+
+    Ok(TaskInspectReport {
+        session_id: task.session_id,
+        task_id: task.task_id,
+        repo_path: task.repo_path,
+        status: task.status,
+        input_summary: bounded_text_summary(task.input, 256),
+        worker_lane_kind: task.worker_lane_kind,
+        context_budget: TaskContextBudgetReport {
+            max_bytes: task.context_budget.max_bytes,
+            max_files: task.context_budget.max_files,
+            max_skill_files: task.context_budget.max_skill_files,
+        },
+        focus_terms: task.focus_terms,
+        max_output_tokens: task.max_output_tokens,
+        queue,
+        lease,
+        approval,
+        commit,
+        workspace: TaskInspectWorkspaceReport {
+            worker_workspace_path,
+            worker_worktree_path,
+            allocated_worktree_path,
+            session_repo_path,
+            diff_repo_path,
+        },
+        diff,
+        event_summary: TaskInspectEventSummary {
+            event_count: task_event_count,
+            first_sequence,
+            latest_sequence,
+            latest_event_type,
+        },
+        source_of_truth: "EventLog".to_owned(),
+        projection_kind: "task_inspect_report".to_owned(),
     })
+}
+
+fn task_inspect_queue_from_record(record: &TaskQueueRecord) -> TaskInspectQueueReport {
+    TaskInspectQueueReport {
+        status: record.status.clone(),
+        worker_id: record.worker_id.clone(),
+        lease_id: record.lease_id,
+        lease_deadline_ms: record.lease_deadline_ms,
+        retry_count: Some(record.retry_count),
+        max_retries: Some(record.max_retries),
+        stop_reason: record.stop_reason.clone(),
+        last_reason: record.last_reason.clone(),
+    }
+}
+
+fn task_inspect_queue_from_projection(queue: &TaskQueueProjection) -> TaskInspectQueueReport {
+    TaskInspectQueueReport {
+        status: queue.status.clone(),
+        worker_id: None,
+        lease_id: None,
+        lease_deadline_ms: None,
+        retry_count: queue.retry_count,
+        max_retries: queue.max_retries,
+        stop_reason: queue.stop_reason.clone(),
+        last_reason: queue.reason.clone(),
+    }
 }
 
 fn task_projections_from_events(
