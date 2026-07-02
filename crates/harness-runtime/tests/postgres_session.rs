@@ -17,10 +17,12 @@ use harness_runtime::{
     COMMIT_APPROVED_STATE, COMMITTED_STATE, CodexCliAvailabilityRequest, CodexWorkerLaneBudget,
     CodexWorkerLaneFixture, CodexWorkerLaneRequest, CodexWorkerLaneWorkspace,
     CodexWorkerSubprocess, CodexWorkerUsage, ContextBudget, CreateTaskRequest,
-    DEFAULT_TASK_WORKER_LANE_KIND, FakeModelTurnRequest, PENDING_COMMIT_APPROVAL_STATE,
-    RECOVERY_FAILED_STATE, RecoveryStopReason, Runtime, SelfRecoveryLoopRequest,
-    SessionContextCompileRequest, SessionStatus, SmallCodingTaskRequest, StartSessionRequest,
-    UsageConfidence, VerificationCommandRequest, WorkerLaneStatus, detect_codex_cli_availability,
+    DEFAULT_TASK_WORKER_LANE_KIND, FakeModelTurnRequest, LeaseNextTaskRequest,
+    PENDING_COMMIT_APPROVAL_STATE, RECOVERY_FAILED_STATE, RecoveryStopReason, Runtime,
+    SelfRecoveryLoopRequest, SessionContextCompileRequest, SessionStatus, SmallCodingTaskRequest,
+    StartSessionRequest, TASK_CANCELLED_STATE, TASK_COMPLETED_STATE, TASK_FAILED_STATE,
+    TASK_LEASED_STATE, TASK_QUEUED_STATE, UsageConfidence, VerificationCommandRequest,
+    WorkerLaneStatus, detect_codex_cli_availability,
 };
 use uuid::Uuid;
 
@@ -105,6 +107,205 @@ fn task_create_list_show_projects_first_class_tasks() -> Result<(), Box<dyn std:
     assert_eq!(shown.approval, None);
     assert_eq!(shown.commit, None);
     assert_eq!(shown.event_count, 3);
+
+    Ok(())
+}
+
+#[test]
+fn task_queue_lease_and_terminal_transitions_are_projected()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new("task-queue-fixture"))?;
+
+    let task_id =
+        create_and_enqueue_task(&mut runtime, started.session_id, "write the queued task")?;
+    let enqueued = runtime.show_task(started.session_id, task_id)?;
+    assert_eq!(enqueued.status, TASK_QUEUED_STATE);
+    assert_eq!(
+        enqueued.queue.as_ref().expect("queue slot").status,
+        TASK_QUEUED_STATE
+    );
+
+    let leased = runtime
+        .lease_next_task(LeaseNextTaskRequest {
+            worker_id: "worker-complete".to_owned(),
+            lease_duration_ms: 30_000,
+        })?
+        .expect("queued task should be leased");
+    assert_eq!(leased.task_id, task_id);
+    assert_eq!(leased.status, TASK_LEASED_STATE);
+    assert_eq!(
+        leased.queue.as_ref().expect("queue slot").status,
+        TASK_LEASED_STATE
+    );
+    let lease = leased.lease.as_ref().expect("lease slot");
+    assert_eq!(lease.worker_id, "worker-complete");
+    assert_eq!(lease.status, TASK_LEASED_STATE);
+    assert!(lease.lease_deadline_ms.is_some());
+
+    let completed =
+        runtime.complete_task_lease(task_id, lease.lease_id, "worker completed task")?;
+    assert_eq!(completed.status, TASK_COMPLETED_STATE);
+    assert_eq!(
+        completed.queue.as_ref().expect("queue slot").status,
+        TASK_COMPLETED_STATE
+    );
+    assert_eq!(
+        completed
+            .lease
+            .as_ref()
+            .expect("lease slot")
+            .reason
+            .as_deref(),
+        Some("worker completed task")
+    );
+
+    let failed_task_id =
+        create_and_enqueue_task(&mut runtime, started.session_id, "write the failed task")?;
+    let failed_lease = runtime
+        .lease_next_task(LeaseNextTaskRequest::new("worker-fail"))?
+        .expect("failed task should be leased")
+        .lease
+        .expect("failed lease");
+    let failed =
+        runtime.fail_task_lease(failed_task_id, failed_lease.lease_id, "worker failed task")?;
+    assert_eq!(failed.status, TASK_FAILED_STATE);
+    assert_eq!(
+        failed.lease.as_ref().expect("lease slot").reason.as_deref(),
+        Some("worker failed task")
+    );
+
+    let cancelled_task_id =
+        create_and_enqueue_task(&mut runtime, started.session_id, "write the cancelled task")?;
+    let cancelled_lease = runtime
+        .lease_next_task(LeaseNextTaskRequest::new("worker-cancel"))?
+        .expect("cancelled task should be leased")
+        .lease
+        .expect("cancelled lease");
+    let cancelled = runtime.cancel_task_lease(
+        cancelled_task_id,
+        cancelled_lease.lease_id,
+        "worker cancelled task",
+    )?;
+    assert_eq!(cancelled.status, TASK_CANCELLED_STATE);
+    assert_eq!(
+        cancelled
+            .lease
+            .as_ref()
+            .expect("lease slot")
+            .reason
+            .as_deref(),
+        Some("worker cancelled task")
+    );
+
+    let events = runtime.events_for_session(started.session_id)?;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == EventType::TaskEnqueued)
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == EventType::TaskLeaseAcquired)
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == EventType::TaskLeaseCompleted)
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == EventType::TaskLeaseFailed)
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == EventType::TaskLeaseCancelled)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn concurrent_task_lease_attempts_have_single_winner() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started =
+        runtime.start_session(StartSessionRequest::new("concurrent-task-lease-fixture"))?;
+    let task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "write the concurrently leased task",
+    )?;
+    let worker_count = 8;
+    let barrier = Arc::new(Barrier::new(worker_count));
+    let mut handles = Vec::new();
+
+    for index in 0..worker_count {
+        let barrier = Arc::clone(&barrier);
+        let database_url = database_url.clone();
+
+        handles.push(thread::spawn(
+            move || -> Result<Option<(Uuid, Uuid, String)>, String> {
+                let mut runtime =
+                    Runtime::connect_postgres(&database_url).map_err(|error| error.to_string())?;
+                barrier.wait();
+                let leased = runtime
+                    .lease_next_task(LeaseNextTaskRequest {
+                        worker_id: format!("worker-{index}"),
+                        lease_duration_ms: 30_000,
+                    })
+                    .map_err(|error| error.to_string())?;
+
+                Ok(leased.map(|task| {
+                    let lease = task.lease.expect("leased projection should include lease");
+                    (task.task_id, lease.lease_id, lease.worker_id)
+                }))
+            },
+        ));
+    }
+
+    let mut winners = Vec::new();
+    for handle in handles {
+        let result = handle
+            .join()
+            .map_err(|_| std::io::Error::other("lease thread panicked"))?
+            .map_err(std::io::Error::other)?;
+        if let Some(winner) = result {
+            winners.push(winner);
+        }
+    }
+
+    assert_eq!(winners.len(), 1);
+    assert_eq!(winners[0].0, task_id);
+    let shown = runtime.show_task(started.session_id, task_id)?;
+    assert_eq!(shown.status, TASK_LEASED_STATE);
+    assert_eq!(
+        shown.lease.as_ref().expect("lease slot").lease_id,
+        winners[0].1
+    );
+    assert_eq!(
+        shown.lease.as_ref().expect("lease slot").worker_id,
+        winners[0].2
+    );
+    assert!(
+        runtime
+            .lease_next_task(LeaseNextTaskRequest::new("late-worker"))?
+            .is_none()
+    );
 
     Ok(())
 }
@@ -1614,6 +1815,20 @@ fn database_url() -> Option<String> {
     std::env::var("HARNESS_TEST_DATABASE_URL")
         .or_else(|_| std::env::var("HARNESS_DATABASE_URL"))
         .ok()
+}
+
+fn create_and_enqueue_task(
+    runtime: &mut Runtime,
+    session_id: Uuid,
+    input: &str,
+) -> Result<Uuid, Box<dyn std::error::Error>> {
+    let task = runtime.create_task(session_id, CreateTaskRequest::new(input))?;
+    let enqueued = runtime.enqueue_task(session_id, task.task_id)?;
+
+    assert_eq!(enqueued.task_id, task.task_id);
+    assert_eq!(enqueued.status, TASK_QUEUED_STATE);
+
+    Ok(task.task_id)
 }
 
 fn workspace_root() -> Result<String, Box<dyn std::error::Error>> {

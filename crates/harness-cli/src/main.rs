@@ -7,10 +7,10 @@ use harness_runtime::{
     CodexCliAvailabilityRequest, CommitHandoffProjection, ContextBudget, CreateTaskRequest,
     DEFAULT_CODEX_CLI_ACCEPTANCE_TASK, DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS,
     DEFAULT_CODEX_CLI_PROGRAM, DEFAULT_TASK_WORKER_LANE_KIND, FakeModelTurnRequest,
-    FakeModelTurnResult, Runtime, SelfRecoveryLoopRequest, SelfRecoveryLoopResult,
-    SessionContextCompileRequest, SessionContextCompileResult, SessionProjection,
-    SmallCodingTaskRequest, SmallCodingTaskResult, StartSessionRequest, TaskProjection,
-    VerificationCommandRequest, VerificationCommandResult,
+    FakeModelTurnResult, LeaseNextTaskRequest, Runtime, SelfRecoveryLoopRequest,
+    SelfRecoveryLoopResult, SessionContextCompileRequest, SessionContextCompileResult,
+    SessionProjection, SmallCodingTaskRequest, SmallCodingTaskResult, StartSessionRequest,
+    TaskProjection, VerificationCommandRequest, VerificationCommandResult,
 };
 use uuid::Uuid;
 
@@ -83,16 +83,12 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
             let action = args
                 .get(1)
                 .ok_or_else(|| HarnessError::new("task action is required"))?;
-            let session_id = args
-                .get(2)
-                .ok_or_else(|| HarnessError::new("session id is required"))?;
-            let session_id = Uuid::parse_str(session_id)
-                .map_err(|error| HarnessError::new(error.to_string()))?;
             let database_url = database_url_from_args(args.clone())?;
             let mut runtime = Runtime::connect_postgres(&database_url)?;
 
             match action.as_str() {
                 "create" => {
+                    let session_id = session_id_arg(&args, 2)?;
                     let input = required_arg_value(&args, "--task")?;
                     let repo_path = optional_arg_value(&args, "--repo")
                         .map(canonical_repo_path)
@@ -118,17 +114,70 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
                     Ok(())
                 }
                 "list" => {
+                    let session_id = session_id_arg(&args, 2)?;
                     let tasks = runtime.list_tasks(session_id)?;
                     print_task_list(&tasks);
                     Ok(())
                 }
                 "show" => {
+                    let session_id = session_id_arg(&args, 2)?;
                     let task_id = args
                         .get(3)
                         .ok_or_else(|| HarnessError::new("task id is required"))?;
                     let task_id = Uuid::parse_str(task_id)
                         .map_err(|error| HarnessError::new(error.to_string()))?;
                     let task = runtime.show_task(session_id, task_id)?;
+                    print_task_projection(&task);
+                    Ok(())
+                }
+                "enqueue" => {
+                    let session_id = session_id_arg(&args, 2)?;
+                    let task_id = task_id_arg(&args, 3)?;
+                    let task = runtime.enqueue_task(session_id, task_id)?;
+                    print_task_projection(&task);
+                    Ok(())
+                }
+                "lease-next" => {
+                    let worker_id = required_arg_value(&args, "--worker-id")?;
+                    let lease_duration_ms = optional_arg_value(&args, "--lease-ms")
+                        .map(|value| parse_u64_arg("--lease-ms", value))
+                        .transpose()?
+                        .unwrap_or(60_000);
+                    let task = runtime.lease_next_task(LeaseNextTaskRequest {
+                        worker_id: worker_id.to_owned(),
+                        lease_duration_ms,
+                    })?;
+
+                    if let Some(task) = task {
+                        println!("task_leased=true");
+                        print_task_projection(&task);
+                    } else {
+                        println!("task_leased=false");
+                    }
+
+                    Ok(())
+                }
+                "complete" => {
+                    let task_id = task_id_arg(&args, 2)?;
+                    let lease_id = lease_id_arg(&args)?;
+                    let reason = required_arg_value(&args, "--reason")?;
+                    let task = runtime.complete_task_lease(task_id, lease_id, reason)?;
+                    print_task_projection(&task);
+                    Ok(())
+                }
+                "fail" => {
+                    let task_id = task_id_arg(&args, 2)?;
+                    let lease_id = lease_id_arg(&args)?;
+                    let reason = required_arg_value(&args, "--reason")?;
+                    let task = runtime.fail_task_lease(task_id, lease_id, reason)?;
+                    print_task_projection(&task);
+                    Ok(())
+                }
+                "cancel" => {
+                    let task_id = task_id_arg(&args, 2)?;
+                    let lease_id = lease_id_arg(&args)?;
+                    let reason = required_arg_value(&args, "--reason")?;
+                    let task = runtime.cancel_task_lease(task_id, lease_id, reason)?;
                     print_task_projection(&task);
                     Ok(())
                 }
@@ -470,6 +519,25 @@ fn canonical_repo_path(repo_path: &str) -> HarnessResult<String> {
     Ok(canonical.display().to_string())
 }
 
+fn session_id_arg(args: &[String], index: usize) -> HarnessResult<Uuid> {
+    let session_id = args
+        .get(index)
+        .ok_or_else(|| HarnessError::new("session id is required"))?;
+    Uuid::parse_str(session_id).map_err(|error| HarnessError::new(error.to_string()))
+}
+
+fn task_id_arg(args: &[String], index: usize) -> HarnessResult<Uuid> {
+    let task_id = args
+        .get(index)
+        .ok_or_else(|| HarnessError::new("task id is required"))?;
+    Uuid::parse_str(task_id).map_err(|error| HarnessError::new(error.to_string()))
+}
+
+fn lease_id_arg(args: &[String]) -> HarnessResult<Uuid> {
+    let lease_id = required_arg_value(args, "--lease-id")?;
+    Uuid::parse_str(lease_id).map_err(|error| HarnessError::new(error.to_string()))
+}
+
 fn print_projection(projection: &SessionProjection) {
     println!("session_id={}", projection.session_id);
     println!("status={}", projection.status.as_str());
@@ -546,6 +614,39 @@ fn print_task_projection(task: &TaskProjection) {
         println!("task_worker_stdout=");
         println!("task_worker_stderr=");
         println!("task_worker_duration_ms=");
+    }
+
+    if let Some(queue) = &task.queue {
+        println!("task_queue_status={}", queue.status);
+        println!(
+            "task_queue_reason={}",
+            queue.reason.as_deref().unwrap_or("")
+        );
+    } else {
+        println!("task_queue_status=");
+        println!("task_queue_reason=");
+    }
+
+    if let Some(lease) = &task.lease {
+        println!("task_lease_id={}", lease.lease_id);
+        println!("task_lease_worker_id={}", lease.worker_id);
+        println!("task_lease_status={}", lease.status);
+        println!(
+            "task_lease_deadline_ms={}",
+            lease
+                .lease_deadline_ms
+                .map_or_else(String::new, |deadline| deadline.to_string())
+        );
+        println!(
+            "task_lease_reason={}",
+            lease.reason.as_deref().unwrap_or("")
+        );
+    } else {
+        println!("task_lease_id=");
+        println!("task_lease_worker_id=");
+        println!("task_lease_status=");
+        println!("task_lease_deadline_ms=");
+        println!("task_lease_reason=");
     }
 
     if let Some(diff) = &task.diff {

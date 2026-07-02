@@ -11,9 +11,21 @@ pub const MIGRATIONS_DIR: &str = "migrations";
 
 const RUNTIME_BASELINE_MIGRATION: &str =
     include_str!("../../../migrations/0001_runtime_baseline.sql");
+const TASK_QUEUE_MIGRATION: &str = include_str!("../../../migrations/0002_task_queue.sql");
 
 pub struct PostgresEventStore {
     client: Mutex<Client>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskQueueRecord {
+    pub session_id: Uuid,
+    pub task_id: Uuid,
+    pub status: String,
+    pub worker_id: Option<String>,
+    pub lease_id: Option<Uuid>,
+    pub lease_deadline_ms: Option<i64>,
+    pub last_reason: Option<String>,
 }
 
 impl PostgresEventStore {
@@ -29,7 +41,9 @@ impl PostgresEventStore {
     pub fn apply_migrations(&self) -> HarnessResult<()> {
         let mut client = self.client()?;
         client
-            .batch_execute(RUNTIME_BASELINE_MIGRATION)
+            .batch_execute(&format!(
+                "{RUNTIME_BASELINE_MIGRATION}\n{TASK_QUEUE_MIGRATION}"
+            ))
             .map_err(|error| HarnessError::new(error.to_string()))
     }
 
@@ -106,6 +120,102 @@ impl PostgresEventStore {
         rows.into_iter().map(event_from_row).collect()
     }
 
+    pub fn enqueue_task(&self, session_id: Uuid, task_id: Uuid) -> HarnessResult<TaskQueueRecord> {
+        let mut client = self.client()?;
+        let row = client
+            .query_one(
+                "
+                INSERT INTO harness_runtime.task_queue (
+                    task_id,
+                    session_id,
+                    status,
+                    last_reason
+                )
+                VALUES ($1, $2, 'queued', 'task enqueued for worker execution')
+                RETURNING session_id, task_id, status, worker_id, lease_id, lease_deadline_ms, last_reason
+                ",
+                &[&task_id, &session_id],
+            )
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+
+        Ok(task_queue_record_from_row(row))
+    }
+
+    pub fn lease_next_queued_task(
+        &self,
+        worker_id: &str,
+        lease_id: Uuid,
+        lease_deadline_ms: i64,
+    ) -> HarnessResult<Option<TaskQueueRecord>> {
+        let mut client = self.client()?;
+        let mut transaction = client
+            .transaction()
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+        let row = transaction
+            .query_opt(
+                "
+                WITH candidate AS (
+                    SELECT task_id
+                    FROM harness_runtime.task_queue
+                    WHERE status = 'queued'
+                    ORDER BY created_at ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE harness_runtime.task_queue task_queue
+                SET
+                    status = 'leased',
+                    worker_id = $1,
+                    lease_id = $2,
+                    lease_deadline_ms = $3,
+                    last_reason = 'task lease acquired',
+                    updated_at = now()
+                FROM candidate
+                WHERE task_queue.task_id = candidate.task_id
+                RETURNING task_queue.session_id, task_queue.task_id, task_queue.status,
+                    task_queue.worker_id, task_queue.lease_id, task_queue.lease_deadline_ms,
+                    task_queue.last_reason
+                ",
+                &[&worker_id, &lease_id, &lease_deadline_ms],
+            )
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+
+        transaction
+            .commit()
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+
+        Ok(row.map(task_queue_record_from_row))
+    }
+
+    pub fn transition_leased_task(
+        &self,
+        task_id: Uuid,
+        lease_id: Uuid,
+        status: &str,
+        reason: &str,
+    ) -> HarnessResult<TaskQueueRecord> {
+        let mut client = self.client()?;
+        let row = client
+            .query_opt(
+                "
+                UPDATE harness_runtime.task_queue
+                SET
+                    status = $3,
+                    last_reason = $4,
+                    updated_at = now()
+                WHERE task_id = $1
+                    AND lease_id = $2
+                    AND status = 'leased'
+                RETURNING session_id, task_id, status, worker_id, lease_id, lease_deadline_ms, last_reason
+                ",
+                &[&task_id, &lease_id, &status, &reason],
+            )
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+
+        row.map(task_queue_record_from_row)
+            .ok_or_else(|| HarnessError::new("active task lease was not found"))
+    }
+
     fn client(&self) -> HarnessResult<std::sync::MutexGuard<'_, Client>> {
         self.client
             .lock()
@@ -139,6 +249,18 @@ fn event_from_row(row: postgres::Row) -> HarnessResult<EventEnvelope> {
     })
 }
 
+fn task_queue_record_from_row(row: postgres::Row) -> TaskQueueRecord {
+    TaskQueueRecord {
+        session_id: row.get("session_id"),
+        task_id: row.get("task_id"),
+        status: row.get("status"),
+        worker_id: row.get("worker_id"),
+        lease_id: row.get("lease_id"),
+        lease_deadline_ms: row.get("lease_deadline_ms"),
+        last_reason: row.get("last_reason"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +275,6 @@ mod tests {
     #[test]
     fn baseline_migration_creates_event_log_table() {
         assert!(RUNTIME_BASELINE_MIGRATION.contains("harness_runtime.event_log"));
+        assert!(TASK_QUEUE_MIGRATION.contains("harness_runtime.task_queue"));
     }
 }
