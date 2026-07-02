@@ -66,6 +66,108 @@ pub struct Runtime {
     event_store: PostgresEventStore,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuntimeReportSection {
+    pub id: String,
+    pub title: String,
+    pub summary: String,
+    pub key_points: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuntimeReportNode {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+    pub summary: String,
+    pub glossary_terms: Vec<String>,
+    pub adr_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuntimeReportEdge {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub label: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuntimeReportNonGoal {
+    pub id: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuntimeArchitectureReport {
+    pub report_id: String,
+    pub title: String,
+    pub summary: String,
+    pub boundary_adrs: Vec<String>,
+    pub sections: Vec<RuntimeReportSection>,
+    pub nodes: Vec<RuntimeReportNode>,
+    pub edges: Vec<RuntimeReportEdge>,
+    pub non_goals: Vec<RuntimeReportNonGoal>,
+    pub source_of_truth: String,
+    pub projection_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuntimeDataFlowStep {
+    pub id: String,
+    pub order: usize,
+    pub label: String,
+    pub component_id: String,
+    pub event_types: Vec<String>,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuntimeDataFlowReport {
+    pub report_id: String,
+    pub title: String,
+    pub summary: String,
+    pub boundary_adrs: Vec<String>,
+    pub steps: Vec<RuntimeDataFlowStep>,
+    pub edges: Vec<RuntimeReportEdge>,
+    pub non_goals: Vec<RuntimeReportNonGoal>,
+    pub source_of_truth: String,
+    pub projection_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuntimeStorageTableReport {
+    pub id: String,
+    pub table_name: String,
+    pub role: String,
+    pub ownership_boundary: String,
+    pub key_fields: Vec<String>,
+    pub derived_from: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuntimeStorageProjectionReport {
+    pub id: String,
+    pub name: String,
+    pub source: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuntimeStorageReport {
+    pub report_id: String,
+    pub title: String,
+    pub summary: String,
+    pub boundary_adrs: Vec<String>,
+    pub sections: Vec<RuntimeReportSection>,
+    pub tables: Vec<RuntimeStorageTableReport>,
+    pub projections: Vec<RuntimeStorageProjectionReport>,
+    pub non_goals: Vec<RuntimeReportNonGoal>,
+    pub source_of_truth: String,
+    pub projection_kind: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartSessionRequest {
     pub repo_path: String,
@@ -897,6 +999,21 @@ impl Runtime {
     #[must_use]
     pub fn new(event_store: PostgresEventStore) -> Self {
         Self { event_store }
+    }
+
+    #[must_use]
+    pub fn architecture_report() -> RuntimeArchitectureReport {
+        runtime_architecture_report()
+    }
+
+    #[must_use]
+    pub fn data_flow_report() -> RuntimeDataFlowReport {
+        runtime_data_flow_report()
+    }
+
+    #[must_use]
+    pub fn storage_report() -> RuntimeStorageReport {
+        runtime_storage_report()
     }
 
     pub fn connect_postgres(database_url: &str) -> HarnessResult<Self> {
@@ -2468,6 +2585,536 @@ struct RecoveryFinish {
     final_state: &'static str,
 }
 
+fn runtime_architecture_report() -> RuntimeArchitectureReport {
+    RuntimeArchitectureReport {
+        report_id: "runtime_architecture".to_owned(),
+        title: "Runtime Architecture Report".to_owned(),
+        summary:
+            "Deterministic topology for the current v0.1-v0.3 Rust coding-agent harness runtime."
+                .to_owned(),
+        boundary_adrs: runtime_boundary_adrs(),
+        sections: vec![
+            report_section(
+                "control_surfaces",
+                "Control Surfaces",
+                "CLI/API requests enter the harness through Runtime-owned commands and report APIs.",
+                &["CLI/API is a client surface, not the source of truth."],
+            ),
+            report_section(
+                "governance",
+                "Governance",
+                "Policy Gate authorizes mutating intents before Tool Runtime or worker lanes can execute.",
+                &["Policy Gate authorizes; Tool Runtime executes allowed calls."],
+            ),
+            report_section(
+                "execution",
+                "Execution",
+                "Tasks run through internal turns or governed worker lanes in Task Worktrees.",
+                &["Local Governed Codex CLI Worker is evidence-producing, not authoritative."],
+            ),
+            report_section(
+                "storage_and_replay",
+                "Storage And Replay",
+                "EventLog records meaningful runtime facts and PostgreSQL task_queue supports scheduling state.",
+                &["EventLog remains the source of truth; projections are derived."],
+            ),
+            report_section(
+                "acceptance",
+                "Acceptance",
+                "Vertical Acceptance Path proves one observable path through CLI, EventLog, policy, worker execution, approval, and replay.",
+                &["Acceptance is end-to-end evidence, not a dashboard-only milestone."],
+            ),
+        ],
+        nodes: vec![
+            report_node(
+                "cli_api",
+                "CLI/API",
+                "control_surface",
+                "Client entry points for sessions, tasks, approvals, commits, and inspect reports.",
+                &["Session", "Task"],
+                &[],
+            ),
+            report_node(
+                "runtime",
+                "Runtime",
+                "orchestrator",
+                "Harness-owned coordinator for tasks, EventLog appends, policy checks, worker lanes, approvals, and projections.",
+                &["Session", "Task", "Vertical Acceptance Path"],
+                &["ADR-0001", "ADR-0004"],
+            ),
+            report_node(
+                "policy_gate",
+                "Policy Gate",
+                "authorization",
+                "The only authorization surface for mutating tool and lane intents.",
+                &["Lane-Level Governance"],
+                &["ADR-0002", "ADR-0007"],
+            ),
+            report_node(
+                "tool_runtime",
+                "Tool Runtime",
+                "execution_surface",
+                "Executes allowed file patch, verification command, and worker lane calls and records observations.",
+                &["Lane-Level Governance"],
+                &["ADR-0002"],
+            ),
+            report_node(
+                "eventlog",
+                "EventLog",
+                "source_of_truth",
+                "Append-only PostgreSQL-backed event stream used for replay, audit, and derived projections.",
+                &["Session", "Task", "Approval State Machine"],
+                &["ADR-0001", "ADR-0004"],
+            ),
+            report_node(
+                "postgres_task_queue",
+                "PostgreSQL task_queue",
+                "runtime_scheduling_state",
+                "PostgreSQL-backed queue and lease table for queued, leased, retry, and terminal task scheduling state.",
+                &["Task Lease", "Task"],
+                &["ADR-0004"],
+            ),
+            report_node(
+                "local_governed_codex_cli_worker",
+                "Local Governed Codex CLI Worker",
+                "worker_lane",
+                "First governed external agent lane; produces captured output, usage evidence, and diffs under Runtime control.",
+                &[
+                    "Local Governed Codex CLI Worker",
+                    "One-Shot Worker Run",
+                    "First Real Lane",
+                ],
+                &["ADR-0007"],
+            ),
+            report_node(
+                "task_worktree",
+                "Task Worktree",
+                "workspace_boundary",
+                "Per-task git worktree used to isolate worker edits from the user's current working tree and other tasks.",
+                &["Task Worktree"],
+                &["ADR-0007"],
+            ),
+            report_node(
+                "approval_state_machine",
+                "Approval State Machine",
+                "approval_boundary",
+                "Runtime-owned pending approval, approval, rejection, and final approval outcome state.",
+                &["Approval State Machine"],
+                &["ADR-0001", "ADR-0007"],
+            ),
+            report_node(
+                "commit_handoff",
+                "Commit Handoff",
+                "git_boundary",
+                "Harness-owned step that turns an approved Task Worktree diff into durable git history without auto-push.",
+                &["Commit Handoff"],
+                &["ADR-0007"],
+            ),
+            report_node(
+                "task_lease",
+                "Task Lease",
+                "ownership_claim",
+                "Temporary PostgreSQL-backed worker ownership claim for one queued task.",
+                &["Task Lease"],
+                &["ADR-0004"],
+            ),
+            report_node(
+                "vertical_acceptance_path",
+                "Vertical Acceptance Path",
+                "release_slice",
+                "Observable end-to-end path through CLI, PostgreSQL EventLog, policy, worker execution, approval, and replayable evidence.",
+                &["Vertical Acceptance Path"],
+                &["ADR-0001", "ADR-0002", "ADR-0004", "ADR-0007"],
+            ),
+        ],
+        edges: vec![
+            report_edge(
+                "cli_to_runtime",
+                "cli_api",
+                "runtime",
+                "invokes",
+                "CLI/API calls Runtime-owned commands and inspect reports.",
+            ),
+            report_edge(
+                "runtime_to_eventlog",
+                "runtime",
+                "eventlog",
+                "appends",
+                "Runtime appends meaningful facts before deriving projections.",
+            ),
+            report_edge(
+                "runtime_to_queue",
+                "runtime",
+                "postgres_task_queue",
+                "schedules",
+                "Runtime mirrors queue and lease state in PostgreSQL task_queue.",
+            ),
+            report_edge(
+                "runtime_to_policy",
+                "runtime",
+                "policy_gate",
+                "requests_authorization",
+                "Runtime asks Policy Gate before mutating tool or worker execution.",
+            ),
+            report_edge(
+                "policy_to_tool_runtime",
+                "policy_gate",
+                "tool_runtime",
+                "allows_execution",
+                "Tool Runtime executes only allowed policy decisions.",
+            ),
+            report_edge(
+                "runtime_to_worktree",
+                "runtime",
+                "task_worktree",
+                "allocates",
+                "Runtime allocates per-task worktrees for governed worker edits.",
+            ),
+            report_edge(
+                "lease_to_worker",
+                "task_lease",
+                "local_governed_codex_cli_worker",
+                "grants_temporary_ownership",
+                "A lease gives one worker temporary ownership of a queued task.",
+            ),
+            report_edge(
+                "worker_to_eventlog",
+                "local_governed_codex_cli_worker",
+                "eventlog",
+                "produces_evidence",
+                "Worker output, status, usage, and diff evidence are captured through Runtime into EventLog.",
+            ),
+            report_edge(
+                "approval_to_commit",
+                "approval_state_machine",
+                "commit_handoff",
+                "gates",
+                "Only approved diffs enter commit handoff.",
+            ),
+            report_edge(
+                "acceptance_covers_runtime",
+                "vertical_acceptance_path",
+                "runtime",
+                "proves",
+                "Acceptance validates the observable runtime path end to end.",
+            ),
+        ],
+        non_goals: runtime_report_non_goals(),
+        source_of_truth: "CONTEXT.md + accepted ADRs + runtime contract".to_owned(),
+        projection_kind: "runtime_architecture_report".to_owned(),
+    }
+}
+
+fn runtime_data_flow_report() -> RuntimeDataFlowReport {
+    let steps = vec![
+        data_flow_step(
+            "task_creation",
+            1,
+            "Task creation",
+            "runtime",
+            &["task.created"],
+            "Runtime creates a schedulable Task inside a Session.",
+        ),
+        data_flow_step(
+            "context_compile",
+            2,
+            "Context compile",
+            "runtime",
+            &["context.compiled"],
+            "Runtime compiles bounded repository context for the task or session.",
+        ),
+        data_flow_step(
+            "enqueue",
+            3,
+            "Enqueue",
+            "postgres_task_queue",
+            &["task.enqueued"],
+            "Task enters PostgreSQL task_queue as queued scheduling state.",
+        ),
+        data_flow_step(
+            "lease",
+            4,
+            "Lease acquisition",
+            "task_lease",
+            &["task.lease_acquired"],
+            "One worker receives a temporary Task Lease.",
+        ),
+        data_flow_step(
+            "worker_lane_request",
+            5,
+            "Worker lane request",
+            "local_governed_codex_cli_worker",
+            &["worker_lane.requested"],
+            "Runtime records the governed worker lane request and budget.",
+        ),
+        data_flow_step(
+            "policy_decision",
+            6,
+            "Policy decision",
+            "policy_gate",
+            &["policy.decision"],
+            "Policy Gate allows, asks, or denies the worker/tool intent.",
+        ),
+        data_flow_step(
+            "worktree_allocation",
+            7,
+            "Worktree allocation",
+            "task_worktree",
+            &["worker_lane.worktree_allocated"],
+            "Runtime allocates a Task Worktree for isolated edits.",
+        ),
+        data_flow_step(
+            "worker_observation",
+            8,
+            "Worker observation",
+            "local_governed_codex_cli_worker",
+            &["worker_lane.observation_recorded"],
+            "Worker output, exit status, duration, and usage evidence are captured.",
+        ),
+        data_flow_step(
+            "diff_recorded",
+            9,
+            "Diff recorded",
+            "runtime",
+            &["diff.recorded"],
+            "Runtime records changed files, insertions, deletions, and git evidence.",
+        ),
+        data_flow_step(
+            "pending_approval",
+            10,
+            "Pending approval",
+            "approval_state_machine",
+            &["commit.approval_pending"],
+            "A reviewable diff enters pending commit approval.",
+        ),
+        data_flow_step(
+            "approval_decision",
+            11,
+            "Approval or rejection",
+            "approval_state_machine",
+            &["commit.approved", "commit.rejected"],
+            "Human or harness approval state moves the task forward or rejects it.",
+        ),
+        data_flow_step(
+            "commit_started",
+            12,
+            "Commit started",
+            "commit_handoff",
+            &["commit.started"],
+            "Commit Handoff starts only after approval.",
+        ),
+        data_flow_step(
+            "commit_finished",
+            13,
+            "Commit succeeded or failed",
+            "commit_handoff",
+            &["commit.succeeded", "commit.failed"],
+            "Runtime records the durable commit outcome or failure reason.",
+        ),
+    ];
+
+    RuntimeDataFlowReport {
+        report_id: "runtime_data_flow".to_owned(),
+        title: "Runtime Data-Flow Report".to_owned(),
+        summary: "Ordered task data flow from creation through context, queue, lease, governed worker execution, approval, and commit handoff.".to_owned(),
+        boundary_adrs: runtime_boundary_adrs(),
+        edges: data_flow_edges(&steps),
+        steps,
+        non_goals: runtime_report_non_goals(),
+        source_of_truth: "EventLog event contract + PostgreSQL task_queue scheduling state".to_owned(),
+        projection_kind: "runtime_data_flow_report".to_owned(),
+    }
+}
+
+fn runtime_storage_report() -> RuntimeStorageReport {
+    RuntimeStorageReport {
+        report_id: "runtime_storage".to_owned(),
+        title: "Runtime Storage Report".to_owned(),
+        summary: "Storage boundaries for EventLog source-of-truth data, PostgreSQL task_queue scheduling state, and rebuildable projections.".to_owned(),
+        boundary_adrs: runtime_boundary_adrs(),
+        sections: vec![
+            report_section(
+                "eventlog_boundary",
+                "EventLog Boundary",
+                "EventLog is the source of truth for sessions, tasks, approvals, policy decisions, observations, recovery, and commit outcomes.",
+                &["Runtime facts must be appended before projections or client views rely on them."],
+            ),
+            report_section(
+                "task_queue_boundary",
+                "Task Queue Boundary",
+                "task_queue is PostgreSQL runtime scheduling state for leases, retry counters, worker ownership, and stop reasons.",
+                &["task_queue does not replace EventLog; queue mutations are paired with EventLog evidence."],
+            ),
+            report_section(
+                "projection_boundary",
+                "Projection Boundary",
+                "Session, Task, approval, commit, timeline, and inspect reports are derived views.",
+                &["Derived projections are rebuildable and must not become independent truths."],
+            ),
+        ],
+        tables: vec![
+            RuntimeStorageTableReport {
+                id: "event_log".to_owned(),
+                table_name: "harness_runtime.event_log".to_owned(),
+                role: "append_only_source_of_truth".to_owned(),
+                ownership_boundary: "Runtime appends meaningful events; clients and workers do not mutate state directly.".to_owned(),
+                key_fields: strings(&["event_id", "session_id", "sequence", "event_type", "schema_version", "payload"]),
+                derived_from: None,
+            },
+            RuntimeStorageTableReport {
+                id: "task_queue".to_owned(),
+                table_name: "harness_runtime.task_queue".to_owned(),
+                role: "runtime_scheduling_state".to_owned(),
+                ownership_boundary: "Runtime owns queue, lease, retry, and terminal scheduling transitions inside PostgreSQL.".to_owned(),
+                key_fields: strings(&["task_id", "session_id", "status", "worker_id", "lease_id", "lease_deadline_ms", "retry_count", "max_retries", "stop_reason"]),
+                derived_from: Some("EventLog task events plus transactional queue mutations".to_owned()),
+            },
+        ],
+        projections: vec![
+            storage_projection("session_projection", "SessionProjection", "EventLog replay", "Session status, repo path, and event count are derived from session events."),
+            storage_projection("task_projection", "TaskProjection", "EventLog replay + task_queue evidence where needed", "Task status, worker output, diff, approval, commit, and lease evidence are derived views."),
+            storage_projection("inspect_reports", "Inspect Reports", "EventLog + task_queue read-only queries", "Session, timeline, task, and queue inspect reports expose state without mutating it."),
+            storage_projection("approval_commit_projection", "Approval and Commit Projection", "EventLog replay", "Approval State Machine and Commit Handoff state are reconstructed from approval and commit events."),
+        ],
+        non_goals: runtime_report_non_goals(),
+        source_of_truth: "ADR-0001 EventLog discipline inside ADR-0004 PostgreSQL runtime storage".to_owned(),
+        projection_kind: "runtime_storage_report".to_owned(),
+    }
+}
+
+fn runtime_boundary_adrs() -> Vec<String> {
+    strings(&["ADR-0001", "ADR-0002", "ADR-0004", "ADR-0007"])
+}
+
+fn runtime_report_non_goals() -> Vec<RuntimeReportNonGoal> {
+    vec![
+        report_non_goal(
+            "web_ui",
+            "Do not build a visual Web UI or dashboard in this report slice.",
+        ),
+        report_non_goal(
+            "server_sse",
+            "Do not add server, SSE, WebSocket, or remote API surfaces.",
+        ),
+        report_non_goal(
+            "distributed_scheduling",
+            "Do not add k3s, remote workers, distributed scheduling, or production deployment scope.",
+        ),
+        report_non_goal(
+            "new_lanes",
+            "Do not add new worker lanes beyond the current Local Governed Codex CLI Worker contract.",
+        ),
+        report_non_goal(
+            "automatic_push",
+            "Do not automatically push user code as part of Commit Handoff.",
+        ),
+        report_non_goal(
+            "replace_eventlog",
+            "Do not replace EventLog or make derived projections authoritative.",
+        ),
+    ]
+}
+
+fn data_flow_edges(steps: &[RuntimeDataFlowStep]) -> Vec<RuntimeReportEdge> {
+    steps
+        .windows(2)
+        .map(|pair| {
+            report_edge(
+                &format!("{}_to_{}", pair[0].id, pair[1].id),
+                &pair[0].id,
+                &pair[1].id,
+                "then",
+                "Next ordered step in the task data flow.",
+            )
+        })
+        .collect()
+}
+
+fn report_section(
+    id: &str,
+    title: &str,
+    summary: &str,
+    key_points: &[&str],
+) -> RuntimeReportSection {
+    RuntimeReportSection {
+        id: id.to_owned(),
+        title: title.to_owned(),
+        summary: summary.to_owned(),
+        key_points: strings(key_points),
+    }
+}
+
+fn report_node(
+    id: &str,
+    label: &str,
+    kind: &str,
+    summary: &str,
+    glossary_terms: &[&str],
+    adr_refs: &[&str],
+) -> RuntimeReportNode {
+    RuntimeReportNode {
+        id: id.to_owned(),
+        label: label.to_owned(),
+        kind: kind.to_owned(),
+        summary: summary.to_owned(),
+        glossary_terms: strings(glossary_terms),
+        adr_refs: strings(adr_refs),
+    }
+}
+
+fn report_edge(id: &str, from: &str, to: &str, label: &str, summary: &str) -> RuntimeReportEdge {
+    RuntimeReportEdge {
+        id: id.to_owned(),
+        from: from.to_owned(),
+        to: to.to_owned(),
+        label: label.to_owned(),
+        summary: summary.to_owned(),
+    }
+}
+
+fn report_non_goal(id: &str, summary: &str) -> RuntimeReportNonGoal {
+    RuntimeReportNonGoal {
+        id: id.to_owned(),
+        summary: summary.to_owned(),
+    }
+}
+
+fn data_flow_step(
+    id: &str,
+    order: usize,
+    label: &str,
+    component_id: &str,
+    event_types: &[&str],
+    summary: &str,
+) -> RuntimeDataFlowStep {
+    RuntimeDataFlowStep {
+        id: id.to_owned(),
+        order,
+        label: label.to_owned(),
+        component_id: component_id.to_owned(),
+        event_types: strings(event_types),
+        summary: summary.to_owned(),
+    }
+}
+
+fn storage_projection(
+    id: &str,
+    name: &str,
+    source: &str,
+    summary: &str,
+) -> RuntimeStorageProjectionReport {
+    RuntimeStorageProjectionReport {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        source: source.to_owned(),
+        summary: summary.to_owned(),
+    }
+}
+
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_owned()).collect()
+}
+
 pub fn apply_database_migrations(database_url: &str) -> HarnessResult<()> {
     let store = PostgresEventStore::connect(database_url)?;
     store.apply_migrations()
@@ -3878,6 +4525,162 @@ mod tests {
         assert!(report.contains("Coding Agent Harness bootstrap"));
         assert!(report.contains("HARNESS_DATABASE_URL"));
         assert!(report.to_ascii_lowercase().contains("eventlog"));
+    }
+
+    #[test]
+    fn architecture_report_contains_required_nodes_and_boundaries() {
+        let report = Runtime::architecture_report();
+        let node_ids = report
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<Vec<_>>();
+        let section_ids = report
+            .sections
+            .iter()
+            .map(|section| section.id.as_str())
+            .collect::<Vec<_>>();
+        let edge_ids = report
+            .edges
+            .iter()
+            .map(|edge| edge.id.as_str())
+            .collect::<Vec<_>>();
+        let non_goal_ids = report
+            .non_goals
+            .iter()
+            .map(|non_goal| non_goal.id.as_str())
+            .collect::<Vec<_>>();
+
+        for required in [
+            "cli_api",
+            "runtime",
+            "policy_gate",
+            "tool_runtime",
+            "eventlog",
+            "postgres_task_queue",
+            "local_governed_codex_cli_worker",
+            "task_worktree",
+            "approval_state_machine",
+            "commit_handoff",
+            "task_lease",
+            "vertical_acceptance_path",
+        ] {
+            assert!(node_ids.contains(&required), "missing node {required}");
+        }
+
+        assert_eq!(
+            report.boundary_adrs,
+            vec!["ADR-0001", "ADR-0002", "ADR-0004", "ADR-0007"]
+        );
+        assert!(section_ids.contains(&"governance"));
+        assert!(edge_ids.contains(&"runtime_to_eventlog"));
+        assert!(edge_ids.contains(&"policy_to_tool_runtime"));
+        assert!(non_goal_ids.contains(&"web_ui"));
+        assert!(non_goal_ids.contains(&"replace_eventlog"));
+        assert!(
+            report
+                .nodes
+                .iter()
+                .any(|node| node.glossary_terms.iter().any(|term| term == "Task Lease"))
+        );
+        assert!(report.nodes.iter().any(|node| {
+            node.glossary_terms
+                .iter()
+                .any(|term| term == "Commit Handoff")
+        }));
+        assert_eq!(report.projection_kind, "runtime_architecture_report");
+    }
+
+    #[test]
+    fn data_flow_report_lists_required_steps_in_order() {
+        let report = Runtime::data_flow_report();
+        let step_ids = report
+            .steps
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            step_ids,
+            vec![
+                "task_creation",
+                "context_compile",
+                "enqueue",
+                "lease",
+                "worker_lane_request",
+                "policy_decision",
+                "worktree_allocation",
+                "worker_observation",
+                "diff_recorded",
+                "pending_approval",
+                "approval_decision",
+                "commit_started",
+                "commit_finished",
+            ]
+        );
+        assert_eq!(report.steps[0].event_types, vec!["task.created"]);
+        assert_eq!(report.steps[5].component_id, "policy_gate");
+        assert_eq!(
+            report.steps[10].event_types,
+            vec!["commit.approved", "commit.rejected"]
+        );
+        assert_eq!(
+            report.steps.last().expect("last step").event_types,
+            vec!["commit.succeeded", "commit.failed"]
+        );
+        assert_eq!(report.edges.len(), report.steps.len() - 1);
+        assert_eq!(report.edges[0].from, "task_creation");
+        assert_eq!(report.edges[0].to, "context_compile");
+        assert_eq!(report.projection_kind, "runtime_data_flow_report");
+    }
+
+    #[test]
+    fn storage_report_explains_eventlog_queue_and_projection_boundaries() {
+        let report = Runtime::storage_report();
+        let table_ids = report
+            .tables
+            .iter()
+            .map(|table| table.id.as_str())
+            .collect::<Vec<_>>();
+        let projection_ids = report
+            .projections
+            .iter()
+            .map(|projection| projection.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(table_ids.contains(&"event_log"));
+        assert!(table_ids.contains(&"task_queue"));
+        let event_log = report
+            .tables
+            .iter()
+            .find(|table| table.id == "event_log")
+            .expect("event_log table report");
+        assert_eq!(event_log.table_name, "harness_runtime.event_log");
+        assert_eq!(event_log.role, "append_only_source_of_truth");
+        assert!(event_log.ownership_boundary.contains("Runtime appends"));
+
+        let task_queue = report
+            .tables
+            .iter()
+            .find(|table| table.id == "task_queue")
+            .expect("task_queue table report");
+        assert_eq!(task_queue.table_name, "harness_runtime.task_queue");
+        assert_eq!(task_queue.role, "runtime_scheduling_state");
+        assert!(
+            task_queue
+                .derived_from
+                .as_deref()
+                .is_some_and(|source| source.contains("EventLog"))
+        );
+        assert!(projection_ids.contains(&"task_projection"));
+        assert!(projection_ids.contains(&"approval_commit_projection"));
+        assert!(
+            report
+                .non_goals
+                .iter()
+                .any(|non_goal| non_goal.id == "distributed_scheduling")
+        );
+        assert_eq!(report.projection_kind, "runtime_storage_report");
     }
 
     #[test]

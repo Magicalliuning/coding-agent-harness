@@ -11,7 +11,10 @@ use harness_runtime::{
     DEFAULT_TASK_WORKER_LANE_KIND, DEFAULT_TIMELINE_PAYLOAD_LIMIT_BYTES,
     EventTimelineInspectRequest, EventTimelineReport, FakeModelTurnRequest, FakeModelTurnResult,
     HeartbeatTaskLeaseRequest, LeaseNextTaskRequest, LeasedCodexWorkerTaskRequest,
-    LeasedCodexWorkerTaskResult, Runtime, SelfRecoveryLoopRequest, SelfRecoveryLoopResult,
+    LeasedCodexWorkerTaskResult, Runtime, RuntimeArchitectureReport, RuntimeDataFlowReport,
+    RuntimeDataFlowStep, RuntimeReportEdge, RuntimeReportNode, RuntimeReportNonGoal,
+    RuntimeReportSection, RuntimeStorageProjectionReport, RuntimeStorageReport,
+    RuntimeStorageTableReport, SelfRecoveryLoopRequest, SelfRecoveryLoopResult,
     SessionContextCompileRequest, SessionContextCompileResult, SessionInspectReport,
     SessionProjection, SmallCodingTaskRequest, SmallCodingTaskResult, StartSessionRequest,
     TaskInspectReport, TaskProjection, TaskQueueInspectReport, TaskQueueInspectRequest,
@@ -48,9 +51,49 @@ fn run() -> HarnessResult<()> {
             println!("migrations=applied");
             Ok(())
         }
+        Some("report") => run_report_command(args.collect()),
         Some("session") => run_session_command(args.collect()),
         Some(other) => Err(HarnessError::new(format!(
-            "unknown command: {other}; usage: harness-cli [--version|doctor|migrate|session]"
+            "unknown command: {other}; usage: harness-cli [--version|doctor|migrate|report|session]"
+        ))),
+    }
+}
+
+fn run_report_command(args: Vec<String>) -> HarnessResult<()> {
+    let Some(command) = args.first() else {
+        return Err(HarnessError::new("report command is required"));
+    };
+
+    match command.as_str() {
+        "architecture" => {
+            let report = Runtime::architecture_report();
+            if has_flag(&args, "--json") {
+                print_architecture_report_json(&report)
+            } else {
+                print_architecture_report(&report);
+                Ok(())
+            }
+        }
+        "data-flow" => {
+            let report = Runtime::data_flow_report();
+            if has_flag(&args, "--json") {
+                print_data_flow_report_json(&report)
+            } else {
+                print_data_flow_report(&report);
+                Ok(())
+            }
+        }
+        "storage" => {
+            let report = Runtime::storage_report();
+            if has_flag(&args, "--json") {
+                print_storage_report_json(&report)
+            } else {
+                print_storage_report(&report);
+                Ok(())
+            }
+        }
+        other => Err(HarnessError::new(format!(
+            "unknown report command: {other}; usage: harness-cli report [architecture|data-flow|storage] [--json]"
         ))),
     }
 }
@@ -773,6 +816,174 @@ fn print_projection(projection: &SessionProjection) {
     println!("status={}", projection.status.as_str());
     println!("repo_path={}", projection.repo_path);
     println!("event_count={}", projection.event_count);
+}
+
+fn print_architecture_report(report: &RuntimeArchitectureReport) {
+    print_report_header(
+        &report.report_id,
+        &report.title,
+        &report.summary,
+        &report.boundary_adrs,
+        &report.source_of_truth,
+        &report.projection_kind,
+    );
+    print_report_sections(&report.sections);
+    print_report_nodes(&report.nodes);
+    print_report_edges(&report.edges);
+    print_report_non_goals(&report.non_goals);
+}
+
+fn print_architecture_report_json(report: &RuntimeArchitectureReport) -> HarnessResult<()> {
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|error| HarnessError::new(error.to_string()))?;
+    println!("{json}");
+    Ok(())
+}
+
+fn print_data_flow_report(report: &RuntimeDataFlowReport) {
+    print_report_header(
+        &report.report_id,
+        &report.title,
+        &report.summary,
+        &report.boundary_adrs,
+        &report.source_of_truth,
+        &report.projection_kind,
+    );
+    println!("step_count={}", report.steps.len());
+    for (index, step) in report.steps.iter().enumerate() {
+        print_data_flow_step(index, step);
+    }
+    print_report_edges(&report.edges);
+    print_report_non_goals(&report.non_goals);
+}
+
+fn print_data_flow_report_json(report: &RuntimeDataFlowReport) -> HarnessResult<()> {
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|error| HarnessError::new(error.to_string()))?;
+    println!("{json}");
+    Ok(())
+}
+
+fn print_storage_report(report: &RuntimeStorageReport) {
+    print_report_header(
+        &report.report_id,
+        &report.title,
+        &report.summary,
+        &report.boundary_adrs,
+        &report.source_of_truth,
+        &report.projection_kind,
+    );
+    print_report_sections(&report.sections);
+    println!("table_count={}", report.tables.len());
+    for (index, table) in report.tables.iter().enumerate() {
+        print_storage_table(index, table);
+    }
+    println!("projection_count={}", report.projections.len());
+    for (index, projection) in report.projections.iter().enumerate() {
+        print_storage_projection(index, projection);
+    }
+    print_report_non_goals(&report.non_goals);
+}
+
+fn print_storage_report_json(report: &RuntimeStorageReport) -> HarnessResult<()> {
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|error| HarnessError::new(error.to_string()))?;
+    println!("{json}");
+    Ok(())
+}
+
+fn print_report_header(
+    report_id: &str,
+    title: &str,
+    summary: &str,
+    boundary_adrs: &[String],
+    source_of_truth: &str,
+    projection_kind: &str,
+) {
+    println!("report_id={report_id}");
+    println!("title={title}");
+    println!("summary={summary}");
+    println!("boundary_adrs={}", boundary_adrs.join(","));
+    println!("source_of_truth={source_of_truth}");
+    println!("projection_kind={projection_kind}");
+}
+
+fn print_report_sections(sections: &[RuntimeReportSection]) {
+    println!("section_count={}", sections.len());
+    for (index, section) in sections.iter().enumerate() {
+        println!("section_{index}_id={}", section.id);
+        println!("section_{index}_title={}", section.title);
+        println!("section_{index}_summary={}", section.summary);
+        println!(
+            "section_{index}_key_points={}",
+            section.key_points.join("|")
+        );
+    }
+}
+
+fn print_report_nodes(nodes: &[RuntimeReportNode]) {
+    println!("node_count={}", nodes.len());
+    for (index, node) in nodes.iter().enumerate() {
+        println!("node_{index}_id={}", node.id);
+        println!("node_{index}_label={}", node.label);
+        println!("node_{index}_kind={}", node.kind);
+        println!("node_{index}_summary={}", node.summary);
+        println!(
+            "node_{index}_glossary_terms={}",
+            node.glossary_terms.join("|")
+        );
+        println!("node_{index}_adr_refs={}", node.adr_refs.join(","));
+    }
+}
+
+fn print_report_edges(edges: &[RuntimeReportEdge]) {
+    println!("edge_count={}", edges.len());
+    for (index, edge) in edges.iter().enumerate() {
+        println!("edge_{index}_id={}", edge.id);
+        println!("edge_{index}_from={}", edge.from);
+        println!("edge_{index}_to={}", edge.to);
+        println!("edge_{index}_label={}", edge.label);
+        println!("edge_{index}_summary={}", edge.summary);
+    }
+}
+
+fn print_report_non_goals(non_goals: &[RuntimeReportNonGoal]) {
+    println!("non_goal_count={}", non_goals.len());
+    for (index, non_goal) in non_goals.iter().enumerate() {
+        println!("non_goal_{index}_id={}", non_goal.id);
+        println!("non_goal_{index}_summary={}", non_goal.summary);
+    }
+}
+
+fn print_data_flow_step(index: usize, step: &RuntimeDataFlowStep) {
+    println!("step_{index}_id={}", step.id);
+    println!("step_{index}_order={}", step.order);
+    println!("step_{index}_label={}", step.label);
+    println!("step_{index}_component_id={}", step.component_id);
+    println!("step_{index}_event_types={}", step.event_types.join(","));
+    println!("step_{index}_summary={}", step.summary);
+}
+
+fn print_storage_table(index: usize, table: &RuntimeStorageTableReport) {
+    println!("table_{index}_id={}", table.id);
+    println!("table_{index}_name={}", table.table_name);
+    println!("table_{index}_role={}", table.role);
+    println!(
+        "table_{index}_ownership_boundary={}",
+        table.ownership_boundary
+    );
+    println!("table_{index}_key_fields={}", table.key_fields.join(","));
+    println!(
+        "table_{index}_derived_from={}",
+        table.derived_from.as_deref().unwrap_or_default()
+    );
+}
+
+fn print_storage_projection(index: usize, projection: &RuntimeStorageProjectionReport) {
+    println!("projection_{index}_id={}", projection.id);
+    println!("projection_{index}_name={}", projection.name);
+    println!("projection_{index}_source={}", projection.source);
+    println!("projection_{index}_summary={}", projection.summary);
 }
 
 fn print_session_inspect_report(report: &SessionInspectReport) {
