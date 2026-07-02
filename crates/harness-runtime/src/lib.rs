@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,6 +33,7 @@ use harness_tools::{
     CodexWorkerLaneFixtureAdapter, CodexWorkerLaneIntent, CommandObservation, CommandToolRuntime,
     FilePatchIntent, FilePatchObservation, OneShotWorkerRunner, VerifyCommandIntent,
 };
+use serde::Serialize;
 use uuid::Uuid;
 
 pub const PENDING_COMMIT_APPROVAL_STATE: &str = "pending_commit_approval";
@@ -97,6 +99,26 @@ pub struct SessionProjection {
     pub repo_path: String,
     pub status: SessionStatus,
     pub event_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionTaskStatusCount {
+    pub status: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionInspectReport {
+    pub session_id: Uuid,
+    pub repo_path: String,
+    pub status: String,
+    pub event_count: usize,
+    pub latest_event_sequence: Option<i64>,
+    pub latest_event_type: Option<String>,
+    pub task_count: usize,
+    pub task_status_counts: Vec<SessionTaskStatusCount>,
+    pub source_of_truth: String,
+    pub projection_kind: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -671,6 +693,11 @@ impl Runtime {
     pub fn show_session(&self, session_id: Uuid) -> HarnessResult<SessionProjection> {
         let events = self.event_store.events_for_session(session_id)?;
         project_session(session_id, &events)
+    }
+
+    pub fn inspect_session(&self, session_id: Uuid) -> HarnessResult<SessionInspectReport> {
+        let events = self.event_store.events_for_session(session_id)?;
+        session_inspect_report_from_events(session_id, &events)
     }
 
     pub fn create_task(
@@ -2182,6 +2209,37 @@ pub fn project_session(
         repo_path: payload.repo_path,
         status: SessionStatus::Started,
         event_count: events.len(),
+    })
+}
+
+fn session_inspect_report_from_events(
+    session_id: Uuid,
+    events: &[EventEnvelope],
+) -> HarnessResult<SessionInspectReport> {
+    let projection = project_session(session_id, events)?;
+    let tasks = task_projections_from_events(session_id, events)?;
+    let mut counts = BTreeMap::new();
+
+    for task in &tasks {
+        *counts.entry(task.status.clone()).or_insert(0) += 1;
+    }
+
+    Ok(SessionInspectReport {
+        session_id: projection.session_id,
+        repo_path: projection.repo_path,
+        status: projection.status.as_str().to_owned(),
+        event_count: projection.event_count,
+        latest_event_sequence: events.last().map(|event| event.sequence),
+        latest_event_type: events
+            .last()
+            .map(|event| event.event_type.as_str().to_owned()),
+        task_count: tasks.len(),
+        task_status_counts: counts
+            .into_iter()
+            .map(|(status, count)| SessionTaskStatusCount { status, count })
+            .collect(),
+        source_of_truth: "EventLog".to_owned(),
+        projection_kind: "derived_from_eventlog".to_owned(),
     })
 }
 

@@ -10,6 +10,7 @@ repository.workspace = true
 harness-runtime = { path = "../harness-runtime" }
 harness-core = { path = "../harness-core" }
 harness-db = { path = "../harness-db" }
+serde_json.workspace = true
 uuid.workspace = true
 
 [lints]
