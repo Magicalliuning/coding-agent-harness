@@ -953,6 +953,7 @@ impl Runtime {
             lease_id,
             status,
             reason.trim(),
+            current_time_ms()?,
             |record| {
                 let payload = task_lease_payload_from_record(record)?;
                 match status {

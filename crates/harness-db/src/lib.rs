@@ -396,6 +396,7 @@ impl PostgresEventStore {
         lease_id: Uuid,
         status: &str,
         reason: &str,
+        now_ms: i64,
         make_event: impl FnOnce(&TaskQueueRecord) -> HarnessResult<NewEvent>,
     ) -> HarnessResult<TaskQueueRecord> {
         let mut client = self.client()?;
@@ -413,16 +414,37 @@ impl PostgresEventStore {
                 WHERE task_id = $1
                     AND lease_id = $2
                     AND status = 'leased'
+                    AND lease_deadline_ms > $5
                 RETURNING session_id, task_id, status, worker_id, lease_id, lease_deadline_ms,
                     last_reason, retry_count, max_retries, stop_reason
                 ",
-                &[&task_id, &lease_id, &status, &reason],
+                &[&task_id, &lease_id, &status, &reason, &now_ms],
             )
             .map_err(|error| HarnessError::new(error.to_string()))?;
 
-        let record = row
-            .map(task_queue_record_from_row)
-            .ok_or_else(|| HarnessError::new("active task lease was not found"))?;
+        let record = if let Some(row) = row {
+            task_queue_record_from_row(row)
+        } else {
+            let expired = transaction
+                .query_opt(
+                    "
+                    SELECT 1
+                    FROM harness_runtime.task_queue
+                    WHERE task_id = $1
+                        AND lease_id = $2
+                        AND status = 'leased'
+                        AND lease_deadline_ms <= $3
+                    ",
+                    &[&task_id, &lease_id, &now_ms],
+                )
+                .map_err(|error| HarnessError::new(error.to_string()))?;
+
+            if expired.is_some() {
+                return Err(HarnessError::new("task lease expired"));
+            }
+
+            return Err(HarnessError::new("active task lease was not found"));
+        };
         append_event_in_transaction(&mut transaction, make_event(&record)?)?;
 
         transaction
