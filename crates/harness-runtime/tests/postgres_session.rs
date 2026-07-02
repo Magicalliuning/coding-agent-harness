@@ -1602,6 +1602,52 @@ fn task_scoped_rejection_and_commit_failure_replay() -> Result<(), Box<dyn std::
 }
 
 #[test]
+fn queued_worker_lease_deadline_covers_worker_timeout() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = git_fixture_repo()?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo.display().to_string()))?;
+    create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "write the long timeout leased task",
+    )?;
+    let mut worker = CodexWorkerLaneRequest::new(
+        "placeholder",
+        CodexWorkerLaneFixture::succeeded("long timeout worker"),
+    );
+    worker.timeout_ms = 120_000;
+    let before_ms = current_time_ms_for_test()?;
+
+    let result = runtime
+        .run_next_leased_codex_worker_task(LeasedCodexWorkerTaskRequest::new(
+            "queue-worker-long-timeout",
+            worker,
+        ))?
+        .expect("long timeout task should run");
+    let lease_deadline_ms = result
+        .task
+        .lease
+        .as_ref()
+        .expect("lease slot")
+        .lease_deadline_ms
+        .expect("lease deadline");
+
+    assert!(
+        lease_deadline_ms >= before_ms + 121_000,
+        "lease deadline {lease_deadline_ms} should cover timeout plus margin from {before_ms}"
+    );
+    assert!(runtime.expire_task_leases(before_ms + 60_500)?.is_empty());
+
+    Ok(())
+}
+
+#[test]
 fn leased_task_worker_failure_timeout_and_cancellation_update_task_state()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
@@ -2472,6 +2518,12 @@ fn database_url() -> Option<String> {
     std::env::var("HARNESS_TEST_DATABASE_URL")
         .or_else(|_| std::env::var("HARNESS_DATABASE_URL"))
         .ok()
+}
+
+fn current_time_ms_for_test() -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+    )?)
 }
 
 fn create_and_enqueue_task(
