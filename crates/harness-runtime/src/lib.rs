@@ -6,7 +6,7 @@ use std::{env, fs};
 pub use harness_context::ContextBudget;
 use harness_context::{CompiledContextBundle, ContextCompileRequest, compile_repository_context};
 use harness_core::{HarnessError, HarnessResult};
-use harness_db::{PostgresEventStore, TaskQueueRecord};
+use harness_db::{PostgresEventStore, TaskLeaseExpirationRecord, TaskQueueRecord};
 use harness_events::{
     CommitApprovalDecisionPayload, CommitApprovalPendingPayload, CommitHandoffPayload,
     ContextCompiledPayload, ContextSourcePayload, DiffSummaryPayload, EventEnvelope, EventType,
@@ -43,9 +43,14 @@ pub const COMMIT_FAILED_STATE: &str = "commit_failed";
 pub const TASK_CREATED_STATE: &str = "created";
 pub const TASK_QUEUED_STATE: &str = "queued";
 pub const TASK_LEASED_STATE: &str = "leased";
+pub const TASK_LEASE_EXPIRED_STATE: &str = "expired";
+pub const TASK_RETRY_QUEUED_STATE: &str = "retry_queued";
 pub const TASK_COMPLETED_STATE: &str = "completed";
 pub const TASK_FAILED_STATE: &str = "failed";
 pub const TASK_CANCELLED_STATE: &str = "cancelled";
+pub const TASK_STOPPED_STATE: &str = "stopped";
+pub const TASK_STOP_REASON_LEASE_EXPIRED: &str = "lease_expired";
+pub const TASK_STOP_REASON_MAX_RETRIES_EXCEEDED: &str = "max_retries_exceeded";
 pub const DEFAULT_TASK_WORKER_LANE_KIND: &str = "codex_cli_worker_lane";
 pub const RECOVERY_FAILED_STATE: &str = "recovery_failed";
 pub const SELF_RECOVERY_MAX_ROUNDS: usize = 2;
@@ -122,6 +127,22 @@ pub struct LeaseNextTaskRequest {
 }
 
 impl LeaseNextTaskRequest {
+    #[must_use]
+    pub fn new(worker_id: impl Into<String>) -> Self {
+        Self {
+            worker_id: worker_id.into(),
+            lease_duration_ms: 60_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeartbeatTaskLeaseRequest {
+    pub worker_id: String,
+    pub lease_duration_ms: u64,
+}
+
+impl HeartbeatTaskLeaseRequest {
     #[must_use]
     pub fn new(worker_id: impl Into<String>) -> Self {
         Self {
@@ -304,6 +325,9 @@ pub struct TaskCommitProjection {
 pub struct TaskQueueProjection {
     pub status: String,
     pub reason: Option<String>,
+    pub retry_count: Option<i32>,
+    pub max_retries: Option<i32>,
+    pub stop_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -683,8 +707,23 @@ impl Runtime {
         session_id: Uuid,
         task_id: Uuid,
     ) -> HarnessResult<TaskProjection> {
+        self.enqueue_task_with_max_retries(session_id, task_id, 1)
+    }
+
+    pub fn enqueue_task_with_max_retries(
+        &mut self,
+        session_id: Uuid,
+        task_id: Uuid,
+        max_retries: i32,
+    ) -> HarnessResult<TaskProjection> {
+        if max_retries < 0 {
+            return Err(HarnessError::new("max retries cannot be negative"));
+        }
+
         self.show_task(session_id, task_id)?;
-        let record = self.event_store.enqueue_task(session_id, task_id)?;
+        let record = self
+            .event_store
+            .enqueue_task(session_id, task_id, max_retries)?;
         self.event_store.append_event(NewEvent::task_enqueued(
             session_id,
             TaskQueuePayload::new(
@@ -694,6 +733,11 @@ impl Runtime {
                     .last_reason
                     .as_deref()
                     .unwrap_or("task enqueued for worker execution"),
+            )
+            .with_retry_state(
+                record.retry_count,
+                record.max_retries,
+                record.stop_reason,
             ),
         )?)?;
 
@@ -733,6 +777,70 @@ impl Runtime {
             )?)?;
 
         self.show_task(record.session_id, record.task_id).map(Some)
+    }
+
+    pub fn heartbeat_task_lease(
+        &mut self,
+        task_id: Uuid,
+        lease_id: Uuid,
+        request: HeartbeatTaskLeaseRequest,
+    ) -> HarnessResult<TaskProjection> {
+        if request.worker_id.trim().is_empty() {
+            return Err(HarnessError::new("worker id cannot be empty"));
+        }
+
+        if request.lease_duration_ms == 0 {
+            return Err(HarnessError::new("lease duration must be positive"));
+        }
+
+        let now_ms = current_time_ms()?;
+        let lease_deadline_ms = now_ms.saturating_add(
+            i64::try_from(request.lease_duration_ms)
+                .map_err(|_| HarnessError::new("lease duration is out of range"))?,
+        );
+        let record = self.event_store.renew_task_lease(
+            task_id,
+            lease_id,
+            request.worker_id.trim(),
+            now_ms,
+            lease_deadline_ms,
+        )?;
+
+        self.event_store.append_event(NewEvent::task_lease_renewed(
+            record.session_id,
+            task_lease_payload_from_record(&record)?,
+        )?)?;
+
+        self.show_task(record.session_id, task_id)
+    }
+
+    pub fn expire_task_leases(&mut self, now_ms: i64) -> HarnessResult<Vec<TaskProjection>> {
+        let expired = self.event_store.expire_due_task_leases(now_ms)?;
+        let mut projections = Vec::new();
+
+        for record in expired {
+            self.event_store.append_event(NewEvent::task_lease_expired(
+                record.queue.session_id,
+                expired_lease_payload_from_record(&record)?,
+            )?)?;
+
+            let queue_event = if record.queue.status == TASK_RETRY_QUEUED_STATE {
+                NewEvent::task_retry_queued(
+                    record.queue.session_id,
+                    task_queue_payload_from_record(&record.queue)?,
+                )?
+            } else {
+                NewEvent::task_retry_stopped(
+                    record.queue.session_id,
+                    task_queue_payload_from_record(&record.queue)?,
+                )?
+            };
+            self.event_store.append_event(queue_event)?;
+
+            projections.push(self.show_task(record.queue.session_id, record.queue.task_id)?);
+        }
+
+        Ok(projections)
     }
 
     pub fn complete_task_lease(
@@ -1801,25 +1909,35 @@ fn task_projections_from_events(
         };
 
         match event.event_type {
-            EventType::TaskEnqueued => {
+            EventType::TaskEnqueued | EventType::TaskRetryQueued | EventType::TaskRetryStopped => {
                 let status = payload_string(&event.payload, "status")?;
                 task.status = status.clone();
                 task.queue = Some(TaskQueueProjection {
                     status,
                     reason: payload_optional_string(&event.payload, "reason"),
+                    retry_count: payload_i32_optional(&event.payload, "retry_count")?,
+                    max_retries: payload_i32_optional(&event.payload, "max_retries")?,
+                    stop_reason: payload_optional_string(&event.payload, "stop_reason"),
                 });
             }
             EventType::TaskLeaseAcquired
+            | EventType::TaskLeaseRenewed
+            | EventType::TaskLeaseExpired
             | EventType::TaskLeaseCompleted
             | EventType::TaskLeaseFailed
             | EventType::TaskLeaseCancelled => {
                 let status = payload_string(&event.payload, "status")?;
                 let reason = payload_optional_string(&event.payload, "reason");
                 task.status = status.clone();
-                task.queue = Some(TaskQueueProjection {
-                    status: status.clone(),
-                    reason: reason.clone(),
-                });
+                if event.event_type != EventType::TaskLeaseExpired {
+                    task.queue = Some(TaskQueueProjection {
+                        status: status.clone(),
+                        reason: reason.clone(),
+                        retry_count: payload_i32_optional(&event.payload, "retry_count")?,
+                        max_retries: payload_i32_optional(&event.payload, "max_retries")?,
+                        stop_reason: payload_optional_string(&event.payload, "stop_reason"),
+                    });
+                }
                 task.lease = Some(TaskLeaseProjection {
                     lease_id: payload_uuid(&event.payload, "lease_id")?,
                     worker_id: payload_string(&event.payload, "worker_id")?,
@@ -2213,6 +2331,57 @@ fn task_lease_payload_from_record(record: &TaskQueueRecord) -> HarnessResult<Tas
             .last_reason
             .as_deref()
             .unwrap_or("task lease updated"),
+    ))
+    .map(|payload| {
+        payload.with_retry_state(
+            record.retry_count,
+            record.max_retries,
+            record.stop_reason.clone(),
+        )
+    })
+}
+
+fn expired_lease_payload_from_record(
+    record: &TaskLeaseExpirationRecord,
+) -> HarnessResult<TaskLeasePayload> {
+    let status = if record.queue.status == TASK_STOPPED_STATE {
+        TASK_STOPPED_STATE
+    } else {
+        TASK_LEASE_EXPIRED_STATE
+    };
+
+    Ok(TaskLeasePayload::new(
+        record.queue.task_id,
+        record.expired_lease_id,
+        record.expired_worker_id.clone(),
+        status,
+        Some(record.expired_deadline_ms),
+        record
+            .queue
+            .last_reason
+            .as_deref()
+            .unwrap_or("task lease expired"),
+    )
+    .with_retry_state(
+        record.queue.retry_count,
+        record.queue.max_retries,
+        record.queue.stop_reason.clone(),
+    ))
+}
+
+fn task_queue_payload_from_record(record: &TaskQueueRecord) -> HarnessResult<TaskQueuePayload> {
+    Ok(TaskQueuePayload::new(
+        record.task_id,
+        record.status.as_str(),
+        record
+            .last_reason
+            .as_deref()
+            .unwrap_or("task queue updated"),
+    )
+    .with_retry_state(
+        record.retry_count,
+        record.max_retries,
+        record.stop_reason.clone(),
     ))
 }
 
@@ -2859,6 +3028,163 @@ mod tests {
             Some("0123456789abcdef0123456789abcdef01234567")
         );
         assert_eq!(tasks[0].event_count, 8);
+    }
+
+    #[test]
+    fn task_projection_replays_lease_recovery_without_database() {
+        let session_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let first_lease_id = Uuid::new_v4();
+        let second_lease_id = Uuid::new_v4();
+        let task_created = NewEvent::task_created(
+            session_id,
+            TaskCreatedPayload::new(
+                task_id,
+                "C:/repo",
+                "draft a recoverable task",
+                TASK_CREATED_STATE,
+                DEFAULT_TASK_WORKER_LANE_KIND,
+                4096,
+                8,
+                2,
+                vec!["agent".to_owned()],
+                256,
+            ),
+        )
+        .expect("task created event");
+        let enqueued = NewEvent::task_enqueued(
+            session_id,
+            TaskQueuePayload::new(
+                task_id,
+                TASK_QUEUED_STATE,
+                "task enqueued for worker execution",
+            )
+            .with_retry_state(0, 1, None),
+        )
+        .expect("task enqueued event");
+        let first_lease = NewEvent::task_lease_acquired(
+            session_id,
+            TaskLeasePayload::new(
+                task_id,
+                first_lease_id,
+                "worker-1",
+                TASK_LEASED_STATE,
+                Some(100),
+                "task lease acquired",
+            )
+            .with_retry_state(0, 1, None),
+        )
+        .expect("first lease event");
+        let renewed = NewEvent::task_lease_renewed(
+            session_id,
+            TaskLeasePayload::new(
+                task_id,
+                first_lease_id,
+                "worker-1",
+                TASK_LEASED_STATE,
+                Some(200),
+                "task lease renewed",
+            )
+            .with_retry_state(0, 1, None),
+        )
+        .expect("renewed event");
+        let expired = NewEvent::task_lease_expired(
+            session_id,
+            TaskLeasePayload::new(
+                task_id,
+                first_lease_id,
+                "worker-1",
+                TASK_LEASE_EXPIRED_STATE,
+                Some(200),
+                "task lease expired; task released for retry",
+            )
+            .with_retry_state(1, 1, Some(TASK_STOP_REASON_LEASE_EXPIRED.to_owned())),
+        )
+        .expect("expired event");
+        let retry_queued = NewEvent::task_retry_queued(
+            session_id,
+            TaskQueuePayload::new(
+                task_id,
+                TASK_RETRY_QUEUED_STATE,
+                "task lease expired; task released for retry",
+            )
+            .with_retry_state(1, 1, Some(TASK_STOP_REASON_LEASE_EXPIRED.to_owned())),
+        )
+        .expect("retry queued event");
+        let second_lease = NewEvent::task_lease_acquired(
+            session_id,
+            TaskLeasePayload::new(
+                task_id,
+                second_lease_id,
+                "worker-2",
+                TASK_LEASED_STATE,
+                Some(300),
+                "task lease acquired",
+            )
+            .with_retry_state(1, 1, None),
+        )
+        .expect("second lease event");
+        let stopped_lease = NewEvent::task_lease_expired(
+            session_id,
+            TaskLeasePayload::new(
+                task_id,
+                second_lease_id,
+                "worker-2",
+                TASK_STOPPED_STATE,
+                Some(300),
+                "task lease expired; max retries exceeded",
+            )
+            .with_retry_state(
+                1,
+                1,
+                Some(TASK_STOP_REASON_MAX_RETRIES_EXCEEDED.to_owned()),
+            ),
+        )
+        .expect("stopped lease event");
+        let retry_stopped = NewEvent::task_retry_stopped(
+            session_id,
+            TaskQueuePayload::new(
+                task_id,
+                TASK_STOPPED_STATE,
+                "task lease expired; max retries exceeded",
+            )
+            .with_retry_state(
+                1,
+                1,
+                Some(TASK_STOP_REASON_MAX_RETRIES_EXCEEDED.to_owned()),
+            ),
+        )
+        .expect("retry stopped event");
+        let events = vec![
+            event_envelope(1, task_created),
+            event_envelope(2, enqueued),
+            event_envelope(3, first_lease),
+            event_envelope(4, renewed),
+            event_envelope(5, expired),
+            event_envelope(6, retry_queued),
+            event_envelope(7, second_lease),
+            event_envelope(8, stopped_lease),
+            event_envelope(9, retry_stopped),
+        ];
+
+        let tasks = task_projections_from_events(session_id, &events).expect("task projection");
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].status, TASK_STOPPED_STATE);
+        let queue = tasks[0].queue.as_ref().expect("queue slot");
+        assert_eq!(queue.status, TASK_STOPPED_STATE);
+        assert_eq!(queue.retry_count, Some(1));
+        assert_eq!(queue.max_retries, Some(1));
+        assert_eq!(
+            queue.stop_reason.as_deref(),
+            Some(TASK_STOP_REASON_MAX_RETRIES_EXCEEDED)
+        );
+        let lease = tasks[0].lease.as_ref().expect("lease slot");
+        assert_eq!(lease.lease_id, second_lease_id);
+        assert_eq!(lease.worker_id, "worker-2");
+        assert_eq!(lease.status, TASK_STOPPED_STATE);
+        assert_eq!(lease.lease_deadline_ms, Some(300));
+        assert_eq!(tasks[0].event_count, 9);
     }
 
     #[test]

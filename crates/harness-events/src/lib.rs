@@ -9,9 +9,13 @@ pub const SESSION_STARTED_EVENT: &str = "session.started";
 pub const TASK_CREATED_EVENT: &str = "task.created";
 pub const TASK_ENQUEUED_EVENT: &str = "task.enqueued";
 pub const TASK_LEASE_ACQUIRED_EVENT: &str = "task.lease_acquired";
+pub const TASK_LEASE_RENEWED_EVENT: &str = "task.lease_renewed";
+pub const TASK_LEASE_EXPIRED_EVENT: &str = "task.lease_expired";
 pub const TASK_LEASE_COMPLETED_EVENT: &str = "task.lease_completed";
 pub const TASK_LEASE_FAILED_EVENT: &str = "task.lease_failed";
 pub const TASK_LEASE_CANCELLED_EVENT: &str = "task.lease_cancelled";
+pub const TASK_RETRY_QUEUED_EVENT: &str = "task.retry_queued";
+pub const TASK_RETRY_STOPPED_EVENT: &str = "task.retry_stopped";
 pub const TOOL_CALL_INTENDED_EVENT: &str = "tool.call_intended";
 pub const POLICY_DECIDED_EVENT: &str = "policy.decided";
 pub const TOOL_OBSERVATION_RECORDED_EVENT: &str = "tool.observation_recorded";
@@ -40,9 +44,13 @@ pub enum EventType {
     TaskCreated,
     TaskEnqueued,
     TaskLeaseAcquired,
+    TaskLeaseRenewed,
+    TaskLeaseExpired,
     TaskLeaseCompleted,
     TaskLeaseFailed,
     TaskLeaseCancelled,
+    TaskRetryQueued,
+    TaskRetryStopped,
     ToolCallIntended,
     PolicyDecided,
     ToolObservationRecorded,
@@ -74,9 +82,13 @@ impl EventType {
             Self::TaskCreated => TASK_CREATED_EVENT,
             Self::TaskEnqueued => TASK_ENQUEUED_EVENT,
             Self::TaskLeaseAcquired => TASK_LEASE_ACQUIRED_EVENT,
+            Self::TaskLeaseRenewed => TASK_LEASE_RENEWED_EVENT,
+            Self::TaskLeaseExpired => TASK_LEASE_EXPIRED_EVENT,
             Self::TaskLeaseCompleted => TASK_LEASE_COMPLETED_EVENT,
             Self::TaskLeaseFailed => TASK_LEASE_FAILED_EVENT,
             Self::TaskLeaseCancelled => TASK_LEASE_CANCELLED_EVENT,
+            Self::TaskRetryQueued => TASK_RETRY_QUEUED_EVENT,
+            Self::TaskRetryStopped => TASK_RETRY_STOPPED_EVENT,
             Self::ToolCallIntended => TOOL_CALL_INTENDED_EVENT,
             Self::PolicyDecided => POLICY_DECIDED_EVENT,
             Self::ToolObservationRecorded => TOOL_OBSERVATION_RECORDED_EVENT,
@@ -107,9 +119,13 @@ impl EventType {
             TASK_CREATED_EVENT => Ok(Self::TaskCreated),
             TASK_ENQUEUED_EVENT => Ok(Self::TaskEnqueued),
             TASK_LEASE_ACQUIRED_EVENT => Ok(Self::TaskLeaseAcquired),
+            TASK_LEASE_RENEWED_EVENT => Ok(Self::TaskLeaseRenewed),
+            TASK_LEASE_EXPIRED_EVENT => Ok(Self::TaskLeaseExpired),
             TASK_LEASE_COMPLETED_EVENT => Ok(Self::TaskLeaseCompleted),
             TASK_LEASE_FAILED_EVENT => Ok(Self::TaskLeaseFailed),
             TASK_LEASE_CANCELLED_EVENT => Ok(Self::TaskLeaseCancelled),
+            TASK_RETRY_QUEUED_EVENT => Ok(Self::TaskRetryQueued),
+            TASK_RETRY_STOPPED_EVENT => Ok(Self::TaskRetryStopped),
             TOOL_CALL_INTENDED_EVENT => Ok(Self::ToolCallIntended),
             POLICY_DECIDED_EVENT => Ok(Self::PolicyDecided),
             TOOL_OBSERVATION_RECORDED_EVENT => Ok(Self::ToolObservationRecorded),
@@ -199,6 +215,12 @@ pub struct TaskQueuePayload {
     pub task_id: Uuid,
     pub status: String,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_count: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
 }
 
 impl TaskQueuePayload {
@@ -208,7 +230,23 @@ impl TaskQueuePayload {
             task_id,
             status: status.into(),
             reason: reason.into(),
+            retry_count: None,
+            max_retries: None,
+            stop_reason: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_retry_state(
+        mut self,
+        retry_count: i32,
+        max_retries: i32,
+        stop_reason: Option<String>,
+    ) -> Self {
+        self.retry_count = Some(retry_count);
+        self.max_retries = Some(max_retries);
+        self.stop_reason = stop_reason;
+        self
     }
 }
 
@@ -220,6 +258,12 @@ pub struct TaskLeasePayload {
     pub status: String,
     pub lease_deadline_ms: Option<i64>,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_count: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
 }
 
 impl TaskLeasePayload {
@@ -239,7 +283,23 @@ impl TaskLeasePayload {
             status: status.into(),
             lease_deadline_ms,
             reason: reason.into(),
+            retry_count: None,
+            max_retries: None,
+            stop_reason: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_retry_state(
+        mut self,
+        retry_count: i32,
+        max_retries: i32,
+        stop_reason: Option<String>,
+    ) -> Self {
+        self.retry_count = Some(retry_count);
+        self.max_retries = Some(max_retries);
+        self.stop_reason = stop_reason;
+        self
     }
 }
 
@@ -945,6 +1005,14 @@ impl NewEvent {
         Self::new(session_id, EventType::TaskLeaseAcquired, payload)
     }
 
+    pub fn task_lease_renewed(session_id: Uuid, payload: TaskLeasePayload) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::TaskLeaseRenewed, payload)
+    }
+
+    pub fn task_lease_expired(session_id: Uuid, payload: TaskLeasePayload) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::TaskLeaseExpired, payload)
+    }
+
     pub fn task_lease_completed(
         session_id: Uuid,
         payload: TaskLeasePayload,
@@ -961,6 +1029,14 @@ impl NewEvent {
         payload: TaskLeasePayload,
     ) -> HarnessResult<Self> {
         Self::new(session_id, EventType::TaskLeaseCancelled, payload)
+    }
+
+    pub fn task_retry_queued(session_id: Uuid, payload: TaskQueuePayload) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::TaskRetryQueued, payload)
+    }
+
+    pub fn task_retry_stopped(session_id: Uuid, payload: TaskQueuePayload) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::TaskRetryStopped, payload)
     }
 
     pub fn tool_call_intended(
@@ -1212,7 +1288,8 @@ mod tests {
         let lease_id = Uuid::new_v4();
         let enqueued = NewEvent::task_enqueued(
             session_id,
-            TaskQueuePayload::new(task_id, "queued", "task enqueued for worker execution"),
+            TaskQueuePayload::new(task_id, "queued", "task enqueued for worker execution")
+                .with_retry_state(0, 1, None),
         )
         .expect("task enqueued event");
         let acquired = NewEvent::task_lease_acquired(
@@ -1224,9 +1301,56 @@ mod tests {
                 "leased",
                 Some(123_456),
                 "task lease acquired",
-            ),
+            )
+            .with_retry_state(0, 1, None),
         )
         .expect("task lease acquired event");
+        let renewed = NewEvent::task_lease_renewed(
+            session_id,
+            TaskLeasePayload::new(
+                task_id,
+                lease_id,
+                "worker-1",
+                "leased",
+                Some(223_456),
+                "task lease renewed",
+            )
+            .with_retry_state(0, 1, None),
+        )
+        .expect("task lease renewed event");
+        let expired = NewEvent::task_lease_expired(
+            session_id,
+            TaskLeasePayload::new(
+                task_id,
+                lease_id,
+                "worker-1",
+                "expired",
+                Some(223_456),
+                "task lease expired; task released for retry",
+            )
+            .with_retry_state(1, 1, Some("lease_expired".to_owned())),
+        )
+        .expect("task lease expired event");
+        let retry_queued = NewEvent::task_retry_queued(
+            session_id,
+            TaskQueuePayload::new(
+                task_id,
+                "retry_queued",
+                "task lease expired; task released for retry",
+            )
+            .with_retry_state(1, 1, Some("lease_expired".to_owned())),
+        )
+        .expect("task retry queued event");
+        let retry_stopped = NewEvent::task_retry_stopped(
+            session_id,
+            TaskQueuePayload::new(
+                task_id,
+                "stopped",
+                "task lease expired; max retries exceeded",
+            )
+            .with_retry_state(1, 1, Some("max_retries_exceeded".to_owned())),
+        )
+        .expect("task retry stopped event");
         let completed = NewEvent::task_lease_completed(
             session_id,
             TaskLeasePayload::new(
@@ -1243,10 +1367,21 @@ mod tests {
         assert_eq!(enqueued.event_type.as_str(), "task.enqueued");
         assert_eq!(enqueued.payload["task_id"], task_id.to_string());
         assert_eq!(enqueued.payload["status"], "queued");
+        assert_eq!(enqueued.payload["retry_count"], 0);
         assert_eq!(acquired.event_type.as_str(), "task.lease_acquired");
         assert_eq!(acquired.payload["lease_id"], lease_id.to_string());
         assert_eq!(acquired.payload["worker_id"], "worker-1");
         assert_eq!(acquired.payload["lease_deadline_ms"], 123_456);
+        assert_eq!(renewed.event_type.as_str(), "task.lease_renewed");
+        assert_eq!(renewed.payload["lease_deadline_ms"], 223_456);
+        assert_eq!(expired.event_type.as_str(), "task.lease_expired");
+        assert_eq!(expired.payload["status"], "expired");
+        assert_eq!(expired.payload["stop_reason"], "lease_expired");
+        assert_eq!(retry_queued.event_type.as_str(), "task.retry_queued");
+        assert_eq!(retry_queued.payload["status"], "retry_queued");
+        assert_eq!(retry_queued.payload["retry_count"], 1);
+        assert_eq!(retry_stopped.event_type.as_str(), "task.retry_stopped");
+        assert_eq!(retry_stopped.payload["stop_reason"], "max_retries_exceeded");
         assert_eq!(completed.event_type.as_str(), "task.lease_completed");
         assert_eq!(completed.payload["status"], "completed");
         assert_eq!(completed.payload["reason"], "worker completed task");

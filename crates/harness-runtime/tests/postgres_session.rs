@@ -17,12 +17,13 @@ use harness_runtime::{
     COMMIT_APPROVED_STATE, COMMITTED_STATE, CodexCliAvailabilityRequest, CodexWorkerLaneBudget,
     CodexWorkerLaneFixture, CodexWorkerLaneRequest, CodexWorkerLaneWorkspace,
     CodexWorkerSubprocess, CodexWorkerUsage, ContextBudget, CreateTaskRequest,
-    DEFAULT_TASK_WORKER_LANE_KIND, FakeModelTurnRequest, LeaseNextTaskRequest,
-    PENDING_COMMIT_APPROVAL_STATE, RECOVERY_FAILED_STATE, RecoveryStopReason, Runtime,
-    SelfRecoveryLoopRequest, SessionContextCompileRequest, SessionStatus, SmallCodingTaskRequest,
-    StartSessionRequest, TASK_CANCELLED_STATE, TASK_COMPLETED_STATE, TASK_FAILED_STATE,
-    TASK_LEASED_STATE, TASK_QUEUED_STATE, UsageConfidence, VerificationCommandRequest,
-    WorkerLaneStatus, detect_codex_cli_availability,
+    DEFAULT_TASK_WORKER_LANE_KIND, FakeModelTurnRequest, HeartbeatTaskLeaseRequest,
+    LeaseNextTaskRequest, PENDING_COMMIT_APPROVAL_STATE, RECOVERY_FAILED_STATE, RecoveryStopReason,
+    Runtime, SelfRecoveryLoopRequest, SessionContextCompileRequest, SessionStatus,
+    SmallCodingTaskRequest, StartSessionRequest, TASK_CANCELLED_STATE, TASK_COMPLETED_STATE,
+    TASK_FAILED_STATE, TASK_LEASED_STATE, TASK_QUEUED_STATE, TASK_RETRY_QUEUED_STATE,
+    TASK_STOP_REASON_LEASE_EXPIRED, TASK_STOP_REASON_MAX_RETRIES_EXCEEDED, TASK_STOPPED_STATE,
+    UsageConfidence, VerificationCommandRequest, WorkerLaneStatus, detect_codex_cli_availability,
 };
 use uuid::Uuid;
 
@@ -301,6 +302,152 @@ fn concurrent_task_lease_attempts_have_single_winner() -> Result<(), Box<dyn std
         shown.lease.as_ref().expect("lease slot").worker_id,
         winners[0].2
     );
+    assert!(
+        runtime
+            .lease_next_task(LeaseNextTaskRequest::new("late-worker"))?
+            .is_none()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn task_lease_heartbeat_renews_active_deadline() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new("task-heartbeat-fixture"))?;
+    let task_id = create_and_enqueue_task_with_max_retries(
+        &mut runtime,
+        started.session_id,
+        "write the heartbeat task",
+        1,
+    )?;
+    let leased = runtime
+        .lease_next_task(LeaseNextTaskRequest {
+            worker_id: "worker-heartbeat".to_owned(),
+            lease_duration_ms: 1,
+        })?
+        .expect("task should be leased");
+    let lease = leased.lease.as_ref().expect("lease slot");
+    let old_deadline = lease
+        .lease_deadline_ms
+        .expect("initial lease deadline should be recorded");
+
+    let renewed = runtime.heartbeat_task_lease(
+        task_id,
+        lease.lease_id,
+        HeartbeatTaskLeaseRequest {
+            worker_id: "worker-heartbeat".to_owned(),
+            lease_duration_ms: 60_000,
+        },
+    )?;
+    let renewed_lease = renewed.lease.as_ref().expect("renewed lease slot");
+    let renewed_deadline = renewed_lease
+        .lease_deadline_ms
+        .expect("renewed lease deadline should be recorded");
+    let events = runtime.events_for_session(started.session_id)?;
+
+    assert_eq!(renewed.status, TASK_LEASED_STATE);
+    assert_eq!(renewed_lease.worker_id, "worker-heartbeat");
+    assert!(renewed_deadline > old_deadline);
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == EventType::TaskLeaseRenewed)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn expired_task_lease_requeues_for_retry_and_reassigns() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new("task-retry-fixture"))?;
+    let task_id = create_and_enqueue_task_with_max_retries(
+        &mut runtime,
+        started.session_id,
+        "write the retryable task",
+        1,
+    )?;
+    runtime
+        .lease_next_task(LeaseNextTaskRequest::new("worker-expiring"))?
+        .expect("task should be leased");
+
+    let expired = runtime.expire_task_leases(i64::MAX)?;
+
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].task_id, task_id);
+    assert_eq!(expired[0].status, TASK_RETRY_QUEUED_STATE);
+    let queue = expired[0].queue.as_ref().expect("retry queue slot");
+    assert_eq!(queue.status, TASK_RETRY_QUEUED_STATE);
+    assert_eq!(queue.retry_count, Some(1));
+    assert_eq!(queue.max_retries, Some(1));
+    assert_eq!(
+        queue.stop_reason.as_deref(),
+        Some(TASK_STOP_REASON_LEASE_EXPIRED)
+    );
+    let lease = expired[0].lease.as_ref().expect("expired lease slot");
+    assert_eq!(lease.status, "expired");
+
+    let reassigned = runtime
+        .lease_next_task(LeaseNextTaskRequest::new("worker-retry"))?
+        .expect("retry queued task should be reassigned");
+    let reassigned_queue = reassigned.queue.as_ref().expect("reassigned queue slot");
+    let reassigned_lease = reassigned.lease.as_ref().expect("reassigned lease slot");
+    assert_eq!(reassigned.task_id, task_id);
+    assert_eq!(reassigned.status, TASK_LEASED_STATE);
+    assert_eq!(reassigned_queue.retry_count, Some(1));
+    assert_eq!(reassigned_lease.worker_id, "worker-retry");
+
+    Ok(())
+}
+
+#[test]
+fn expired_task_lease_stops_at_retry_limit() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new("task-stop-fixture"))?;
+    let task_id = create_and_enqueue_task_with_max_retries(
+        &mut runtime,
+        started.session_id,
+        "write the stopped task",
+        0,
+    )?;
+    runtime
+        .lease_next_task(LeaseNextTaskRequest::new("worker-stop"))?
+        .expect("task should be leased");
+
+    let expired = runtime.expire_task_leases(i64::MAX)?;
+
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].task_id, task_id);
+    assert_eq!(expired[0].status, TASK_STOPPED_STATE);
+    let queue = expired[0].queue.as_ref().expect("stopped queue slot");
+    assert_eq!(queue.status, TASK_STOPPED_STATE);
+    assert_eq!(queue.retry_count, Some(0));
+    assert_eq!(queue.max_retries, Some(0));
+    assert_eq!(
+        queue.stop_reason.as_deref(),
+        Some(TASK_STOP_REASON_MAX_RETRIES_EXCEEDED)
+    );
+    let lease = expired[0].lease.as_ref().expect("stopped lease slot");
+    assert_eq!(lease.status, TASK_STOPPED_STATE);
     assert!(
         runtime
             .lease_next_task(LeaseNextTaskRequest::new("late-worker"))?
@@ -1822,8 +1969,17 @@ fn create_and_enqueue_task(
     session_id: Uuid,
     input: &str,
 ) -> Result<Uuid, Box<dyn std::error::Error>> {
+    create_and_enqueue_task_with_max_retries(runtime, session_id, input, 1)
+}
+
+fn create_and_enqueue_task_with_max_retries(
+    runtime: &mut Runtime,
+    session_id: Uuid,
+    input: &str,
+    max_retries: i32,
+) -> Result<Uuid, Box<dyn std::error::Error>> {
     let task = runtime.create_task(session_id, CreateTaskRequest::new(input))?;
-    let enqueued = runtime.enqueue_task(session_id, task.task_id)?;
+    let enqueued = runtime.enqueue_task_with_max_retries(session_id, task.task_id, max_retries)?;
 
     assert_eq!(enqueued.task_id, task.task_id);
     assert_eq!(enqueued.status, TASK_QUEUED_STATE);

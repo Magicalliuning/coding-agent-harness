@@ -12,6 +12,8 @@ pub const MIGRATIONS_DIR: &str = "migrations";
 const RUNTIME_BASELINE_MIGRATION: &str =
     include_str!("../../../migrations/0001_runtime_baseline.sql");
 const TASK_QUEUE_MIGRATION: &str = include_str!("../../../migrations/0002_task_queue.sql");
+const TASK_LEASE_RECOVERY_MIGRATION: &str =
+    include_str!("../../../migrations/0003_task_lease_recovery.sql");
 
 pub struct PostgresEventStore {
     client: Mutex<Client>,
@@ -26,6 +28,17 @@ pub struct TaskQueueRecord {
     pub lease_id: Option<Uuid>,
     pub lease_deadline_ms: Option<i64>,
     pub last_reason: Option<String>,
+    pub retry_count: i32,
+    pub max_retries: i32,
+    pub stop_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskLeaseExpirationRecord {
+    pub queue: TaskQueueRecord,
+    pub expired_lease_id: Uuid,
+    pub expired_worker_id: String,
+    pub expired_deadline_ms: i64,
 }
 
 impl PostgresEventStore {
@@ -42,7 +55,7 @@ impl PostgresEventStore {
         let mut client = self.client()?;
         client
             .batch_execute(&format!(
-                "{RUNTIME_BASELINE_MIGRATION}\n{TASK_QUEUE_MIGRATION}"
+                "{RUNTIME_BASELINE_MIGRATION}\n{TASK_QUEUE_MIGRATION}\n{TASK_LEASE_RECOVERY_MIGRATION}"
             ))
             .map_err(|error| HarnessError::new(error.to_string()))
     }
@@ -120,7 +133,12 @@ impl PostgresEventStore {
         rows.into_iter().map(event_from_row).collect()
     }
 
-    pub fn enqueue_task(&self, session_id: Uuid, task_id: Uuid) -> HarnessResult<TaskQueueRecord> {
+    pub fn enqueue_task(
+        &self,
+        session_id: Uuid,
+        task_id: Uuid,
+        max_retries: i32,
+    ) -> HarnessResult<TaskQueueRecord> {
         let mut client = self.client()?;
         let row = client
             .query_one(
@@ -129,12 +147,14 @@ impl PostgresEventStore {
                     task_id,
                     session_id,
                     status,
-                    last_reason
+                    last_reason,
+                    max_retries
                 )
-                VALUES ($1, $2, 'queued', 'task enqueued for worker execution')
-                RETURNING session_id, task_id, status, worker_id, lease_id, lease_deadline_ms, last_reason
+                VALUES ($1, $2, 'queued', 'task enqueued for worker execution', $3)
+                RETURNING session_id, task_id, status, worker_id, lease_id, lease_deadline_ms,
+                    last_reason, retry_count, max_retries, stop_reason
                 ",
-                &[&task_id, &session_id],
+                &[&task_id, &session_id, &max_retries],
             )
             .map_err(|error| HarnessError::new(error.to_string()))?;
 
@@ -157,7 +177,7 @@ impl PostgresEventStore {
                 WITH candidate AS (
                     SELECT task_id
                     FROM harness_runtime.task_queue
-                    WHERE status = 'queued'
+                    WHERE status IN ('queued', 'retry_queued')
                     ORDER BY created_at ASC
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
@@ -168,13 +188,15 @@ impl PostgresEventStore {
                     worker_id = $1,
                     lease_id = $2,
                     lease_deadline_ms = $3,
+                    stop_reason = NULL,
                     last_reason = 'task lease acquired',
                     updated_at = now()
                 FROM candidate
                 WHERE task_queue.task_id = candidate.task_id
                 RETURNING task_queue.session_id, task_queue.task_id, task_queue.status,
                     task_queue.worker_id, task_queue.lease_id, task_queue.lease_deadline_ms,
-                    task_queue.last_reason
+                    task_queue.last_reason, task_queue.retry_count, task_queue.max_retries,
+                    task_queue.stop_reason
                 ",
                 &[&worker_id, &lease_id, &lease_deadline_ms],
             )
@@ -185,6 +207,130 @@ impl PostgresEventStore {
             .map_err(|error| HarnessError::new(error.to_string()))?;
 
         Ok(row.map(task_queue_record_from_row))
+    }
+
+    pub fn renew_task_lease(
+        &self,
+        task_id: Uuid,
+        lease_id: Uuid,
+        worker_id: &str,
+        now_ms: i64,
+        lease_deadline_ms: i64,
+    ) -> HarnessResult<TaskQueueRecord> {
+        let mut client = self.client()?;
+        let row = client
+            .query_opt(
+                "
+                UPDATE harness_runtime.task_queue
+                SET
+                    lease_deadline_ms = $5,
+                    last_reason = 'task lease renewed',
+                    updated_at = now()
+                WHERE task_id = $1
+                    AND lease_id = $2
+                    AND worker_id = $3
+                    AND status = 'leased'
+                    AND lease_deadline_ms > $4
+                RETURNING session_id, task_id, status, worker_id, lease_id, lease_deadline_ms,
+                    last_reason, retry_count, max_retries, stop_reason
+                ",
+                &[&task_id, &lease_id, &worker_id, &now_ms, &lease_deadline_ms],
+            )
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+
+        row.map(task_queue_record_from_row)
+            .ok_or_else(|| HarnessError::new("active task lease was not found"))
+    }
+
+    pub fn expire_due_task_leases(
+        &self,
+        now_ms: i64,
+    ) -> HarnessResult<Vec<TaskLeaseExpirationRecord>> {
+        let mut client = self.client()?;
+        let mut transaction = client
+            .transaction()
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+        let due_rows = transaction
+            .query(
+                "
+                SELECT session_id, task_id, worker_id, lease_id, lease_deadline_ms,
+                    retry_count, max_retries
+                FROM harness_runtime.task_queue
+                WHERE status = 'leased'
+                    AND lease_deadline_ms <= $1
+                ORDER BY updated_at ASC
+                FOR UPDATE SKIP LOCKED
+                ",
+                &[&now_ms],
+            )
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+
+        let mut expired = Vec::new();
+
+        for row in due_rows {
+            let task_id: Uuid = row.get("task_id");
+            let expired_lease_id: Uuid = row
+                .get::<_, Option<Uuid>>("lease_id")
+                .ok_or_else(|| HarnessError::new("expired task lease id was not recorded"))?;
+            let expired_worker_id: String = row
+                .get::<_, Option<String>>("worker_id")
+                .ok_or_else(|| HarnessError::new("expired task worker id was not recorded"))?;
+            let expired_deadline_ms: i64 = row
+                .get::<_, Option<i64>>("lease_deadline_ms")
+                .ok_or_else(|| HarnessError::new("expired task deadline was not recorded"))?;
+            let retry_count: i32 = row.get("retry_count");
+            let max_retries: i32 = row.get("max_retries");
+            let (next_status, next_retry_count, stop_reason, reason) = if retry_count < max_retries
+            {
+                (
+                    "retry_queued",
+                    retry_count + 1,
+                    Some("lease_expired"),
+                    "task lease expired; task released for retry",
+                )
+            } else {
+                (
+                    "stopped",
+                    retry_count,
+                    Some("max_retries_exceeded"),
+                    "task lease expired; max retries exceeded",
+                )
+            };
+
+            let queue_row = transaction
+                .query_one(
+                    "
+                    UPDATE harness_runtime.task_queue
+                    SET
+                        status = $2,
+                        worker_id = CASE WHEN $2 = 'retry_queued' THEN NULL ELSE worker_id END,
+                        lease_id = CASE WHEN $2 = 'retry_queued' THEN NULL ELSE lease_id END,
+                        lease_deadline_ms = CASE WHEN $2 = 'retry_queued' THEN NULL ELSE lease_deadline_ms END,
+                        retry_count = $3,
+                        stop_reason = $4,
+                        last_reason = $5,
+                        updated_at = now()
+                    WHERE task_id = $1
+                    RETURNING session_id, task_id, status, worker_id, lease_id, lease_deadline_ms,
+                        last_reason, retry_count, max_retries, stop_reason
+                    ",
+                    &[&task_id, &next_status, &next_retry_count, &stop_reason, &reason],
+                )
+                .map_err(|error| HarnessError::new(error.to_string()))?;
+
+            expired.push(TaskLeaseExpirationRecord {
+                queue: task_queue_record_from_row(queue_row),
+                expired_lease_id,
+                expired_worker_id,
+                expired_deadline_ms,
+            });
+        }
+
+        transaction
+            .commit()
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+
+        Ok(expired)
     }
 
     pub fn transition_leased_task(
@@ -206,7 +352,8 @@ impl PostgresEventStore {
                 WHERE task_id = $1
                     AND lease_id = $2
                     AND status = 'leased'
-                RETURNING session_id, task_id, status, worker_id, lease_id, lease_deadline_ms, last_reason
+                RETURNING session_id, task_id, status, worker_id, lease_id, lease_deadline_ms,
+                    last_reason, retry_count, max_retries, stop_reason
                 ",
                 &[&task_id, &lease_id, &status, &reason],
             )
@@ -258,6 +405,9 @@ fn task_queue_record_from_row(row: postgres::Row) -> TaskQueueRecord {
         lease_id: row.get("lease_id"),
         lease_deadline_ms: row.get("lease_deadline_ms"),
         last_reason: row.get("last_reason"),
+        retry_count: row.get("retry_count"),
+        max_retries: row.get("max_retries"),
+        stop_reason: row.get("stop_reason"),
     }
 }
 
@@ -276,5 +426,6 @@ mod tests {
     fn baseline_migration_creates_event_log_table() {
         assert!(RUNTIME_BASELINE_MIGRATION.contains("harness_runtime.event_log"));
         assert!(TASK_QUEUE_MIGRATION.contains("harness_runtime.task_queue"));
+        assert!(TASK_LEASE_RECOVERY_MIGRATION.contains("retry_count"));
     }
 }
