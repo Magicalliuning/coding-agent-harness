@@ -1823,6 +1823,135 @@ fn terminal_and_expire_event_failures_roll_back_queue_mutations()
 }
 
 #[test]
+fn task_queue_successful_transitions_keep_eventlog_replay_and_queue_status_aligned()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let store = PostgresEventStore::connect(&database_url)?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started =
+        runtime.start_session(StartSessionRequest::new("queue-eventlog-success-alignment"))?;
+
+    let assert_replay_and_queue_status = |runtime: &Runtime,
+                                          task_id: Uuid,
+                                          expected_status: &str|
+     -> Result<(), Box<dyn std::error::Error>> {
+        let projected = runtime.show_task(started.session_id, task_id)?;
+        let queue_record = store
+            .task_queue_record(task_id)?
+            .expect("task queue row should exist");
+
+        assert_eq!(projected.status, expected_status);
+        assert_eq!(queue_record.status, expected_status);
+
+        Ok(())
+    };
+
+    let complete_task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "complete atomically with event evidence",
+    )?;
+    let complete_lease = runtime
+        .lease_next_task(LeaseNextTaskRequest::new("complete-atomic-worker"))?
+        .expect("complete task should lease");
+    let complete_lease_id = complete_lease.lease.as_ref().expect("lease slot").lease_id;
+    runtime.complete_task_lease(
+        complete_task_id,
+        complete_lease_id,
+        "complete with durable event evidence",
+    )?;
+    assert_replay_and_queue_status(&runtime, complete_task_id, TASK_COMPLETED_STATE)?;
+
+    let fail_task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "fail atomically with event evidence",
+    )?;
+    let fail_lease = runtime
+        .lease_next_task(LeaseNextTaskRequest::new("fail-atomic-worker"))?
+        .expect("fail task should lease");
+    let fail_lease_id = fail_lease.lease.as_ref().expect("lease slot").lease_id;
+    runtime.fail_task_lease(
+        fail_task_id,
+        fail_lease_id,
+        "fail with durable event evidence",
+    )?;
+    assert_replay_and_queue_status(&runtime, fail_task_id, TASK_FAILED_STATE)?;
+
+    let cancel_task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "cancel atomically with event evidence",
+    )?;
+    let cancel_lease = runtime
+        .lease_next_task(LeaseNextTaskRequest::new("cancel-atomic-worker"))?
+        .expect("cancel task should lease");
+    let cancel_lease_id = cancel_lease.lease.as_ref().expect("lease slot").lease_id;
+    runtime.cancel_task_lease(
+        cancel_task_id,
+        cancel_lease_id,
+        "cancel with durable event evidence",
+    )?;
+    assert_replay_and_queue_status(&runtime, cancel_task_id, TASK_CANCELLED_STATE)?;
+
+    let retry_task = runtime.create_task(
+        started.session_id,
+        CreateTaskRequest::new("expire atomically into retry"),
+    )?;
+    runtime.enqueue_task_with_max_retries(started.session_id, retry_task.task_id, 1)?;
+    let mut retry_lease_request = LeaseNextTaskRequest::new("retry-expire-worker");
+    retry_lease_request.lease_duration_ms = 1;
+    runtime
+        .lease_next_task(retry_lease_request)?
+        .expect("retry expiration task should lease");
+    runtime.expire_task_leases(current_time_ms_for_test()?.saturating_add(60_000))?;
+    assert_replay_and_queue_status(&runtime, retry_task.task_id, TASK_RETRY_QUEUED_STATE)?;
+
+    let stopped_task = runtime.create_task(
+        started.session_id,
+        CreateTaskRequest::new("expire atomically into stopped"),
+    )?;
+    runtime.enqueue_task_with_max_retries(started.session_id, stopped_task.task_id, 0)?;
+    let mut stopped_lease_request = LeaseNextTaskRequest::new("stopped-expire-worker");
+    stopped_lease_request.lease_duration_ms = 1;
+    runtime
+        .lease_next_task(stopped_lease_request)?
+        .expect("stopped expiration task should lease");
+    runtime.expire_task_leases(current_time_ms_for_test()?.saturating_add(60_000))?;
+    assert_replay_and_queue_status(&runtime, stopped_task.task_id, TASK_STOPPED_STATE)?;
+
+    let events = runtime.events_for_session(started.session_id)?;
+    let complete_task_id_text = complete_task_id.to_string();
+    let task_events = events
+        .iter()
+        .filter(|event| {
+            event
+                .payload
+                .get("task_id")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value == complete_task_id_text.as_str())
+        })
+        .map(|event| event.event_type)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        task_events,
+        vec![
+            EventType::TaskCreated,
+            EventType::TaskEnqueued,
+            EventType::TaskLeaseAcquired,
+            EventType::TaskLeaseCompleted,
+        ]
+    );
+
+    Ok(())
+}
+
+#[test]
 fn expired_lease_owner_cannot_terminal_transition_task() -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
         return Ok(());
