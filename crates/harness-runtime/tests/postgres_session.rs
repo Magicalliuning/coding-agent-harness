@@ -16,10 +16,11 @@ use harness_events::{
 };
 use harness_policy::PolicyDecision;
 use harness_runtime::{
-    COMMIT_APPROVED_STATE, COMMIT_FAILED_STATE, COMMIT_REJECTED_STATE, COMMITTED_STATE,
-    CodexCliAvailabilityRequest, CodexWorkerLaneBudget, CodexWorkerLaneFixture,
-    CodexWorkerLaneRequest, CodexWorkerLaneWorkspace, CodexWorkerSubprocess, CodexWorkerUsage,
-    ContextBudget, CreateTaskRequest, DEFAULT_TASK_WORKER_LANE_KIND, EventTimelineInspectRequest,
+    ApprovalCommitInspectRequest, COMMIT_APPROVED_STATE, COMMIT_FAILED_STATE,
+    COMMIT_REJECTED_STATE, COMMITTED_STATE, COMMITTING_STATE, CodexCliAvailabilityRequest,
+    CodexWorkerLaneBudget, CodexWorkerLaneFixture, CodexWorkerLaneRequest,
+    CodexWorkerLaneWorkspace, CodexWorkerSubprocess, CodexWorkerUsage, ContextBudget,
+    CreateTaskRequest, DEFAULT_TASK_WORKER_LANE_KIND, EventTimelineInspectRequest,
     FakeModelTurnRequest, HeartbeatTaskLeaseRequest, LeaseNextTaskRequest,
     LeasedCodexWorkerTaskRequest, PENDING_COMMIT_APPROVAL_STATE, RECOVERY_FAILED_STATE,
     RecoveryStopReason, Runtime, SelfRecoveryLoopRequest, SessionContextCompileRequest,
@@ -588,6 +589,275 @@ fn task_inspect_report_exposes_rejected_and_commit_failed_terminal_evidence()
     assert_eq!(failed_commit.repo_path.as_deref(), Some("C:/failed-repo"));
     assert_eq!(failed_commit.actor.as_deref(), Some("runtime"));
     assert_eq!(failed_commit.failure_reason.as_deref(), Some("git failed"));
+
+    Ok(())
+}
+
+#[test]
+fn approval_commit_inspect_report_tracks_pending_approved_and_committed_read_only()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let (script_name, script) = fake_success_runner_script();
+    let repo = git_fixture_repo_with_files(&[(script_name, script)])?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo.display().to_string()))?;
+    let task_id = create_and_enqueue_task(
+        &mut runtime,
+        started.session_id,
+        "write the approval inspect committed task",
+    )?;
+    runtime
+        .run_next_leased_codex_worker_task(LeasedCodexWorkerTaskRequest::new(
+            "approval-inspect-worker",
+            CodexWorkerLaneRequest::new_subprocess("placeholder", fake_runner_command(script_name)),
+        ))?
+        .expect("queued task should run");
+
+    let pending_report = runtime.inspect_approval_commit(
+        ApprovalCommitInspectRequest::new(started.session_id).with_task_id(task_id),
+    )?;
+    assert_eq!(pending_report.scope, "task");
+    assert_eq!(pending_report.pending_count, 1);
+    assert_eq!(pending_report.decision_count, 0);
+    assert_eq!(pending_report.commit_count, 0);
+    assert_eq!(pending_report.pending_approvals[0].task_id, Some(task_id));
+    assert_eq!(
+        pending_report.pending_approvals[0]
+            .diff
+            .as_ref()
+            .expect("pending diff")
+            .paths,
+        vec!["README.md".to_owned()]
+    );
+    assert!(
+        pending_report.pending_approvals[0]
+            .workspace
+            .allocated_worktree_path
+            .is_some()
+    );
+
+    runtime.approve_task_pending_diff(started.session_id, task_id)?;
+    let committed = runtime.commit_approved_task_diff(
+        started.session_id,
+        task_id,
+        "Commit approval inspect task",
+    )?;
+    let store = PostgresEventStore::connect(&database_url)?;
+    let events_before = runtime.events_for_session(started.session_id)?;
+    let task_before = runtime.show_task(started.session_id, task_id)?;
+    let queue_before = store.task_queue_records(Some(started.session_id))?;
+
+    let report = runtime.inspect_approval_commit(
+        ApprovalCommitInspectRequest::new(started.session_id).with_task_id(task_id),
+    )?;
+
+    assert_eq!(committed.status, COMMITTED_STATE);
+    assert_eq!(report.pending_count, 0);
+    assert_eq!(report.decision_count, 1);
+    assert_eq!(report.commit_count, 2);
+    assert_eq!(report.decisions[0].task_id, Some(task_id));
+    assert_eq!(report.decisions[0].state, COMMIT_APPROVED_STATE);
+    assert_eq!(report.decisions[0].actor.as_deref(), Some("runtime"));
+    assert_eq!(
+        report.decisions[0].reason,
+        "approved by runtime approval state machine"
+    );
+    assert_eq!(report.commits[0].state, COMMITTING_STATE);
+    assert_eq!(report.commits[0].message, "Commit approval inspect task");
+    assert_eq!(report.commits[0].actor.as_deref(), Some("runtime"));
+    assert_eq!(report.commits[1].state, COMMITTED_STATE);
+    assert!(
+        report.commits[1]
+            .commit_sha
+            .as_deref()
+            .is_some_and(|sha| sha.len() == 40)
+    );
+    assert_eq!(report.source_of_truth, "EventLog");
+    assert_eq!(report.projection_kind, "approval_commit_inspect_report");
+
+    let events_after = runtime.events_for_session(started.session_id)?;
+    let task_after = runtime.show_task(started.session_id, task_id)?;
+    let queue_after = store.task_queue_records(Some(started.session_id))?;
+    assert_eq!(events_after.len(), events_before.len());
+    assert_eq!(task_after, task_before);
+    assert_eq!(queue_after, queue_before);
+
+    Ok(())
+}
+
+#[test]
+fn approval_commit_inspect_report_distinguishes_rejected_and_commit_failed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let (script_name, script) = fake_success_runner_script();
+    let reject_repo = git_fixture_repo_with_files(&[(script_name, script)])?;
+    let fail_repo = git_fixture_repo_with_files(&[(script_name, script)])?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+
+    let reject_session =
+        runtime.start_session(StartSessionRequest::new(reject_repo.display().to_string()))?;
+    let reject_task_id = create_and_enqueue_task(
+        &mut runtime,
+        reject_session.session_id,
+        "write the approval inspect rejected task",
+    )?;
+    runtime
+        .run_next_leased_codex_worker_task(LeasedCodexWorkerTaskRequest::new(
+            "approval-reject-worker",
+            CodexWorkerLaneRequest::new_subprocess("placeholder", fake_runner_command(script_name)),
+        ))?
+        .expect("rejected task should run");
+    runtime.reject_task_pending_diff(
+        reject_session.session_id,
+        reject_task_id,
+        "not safe for commit",
+    )?;
+
+    let rejected = runtime.inspect_approval_commit(
+        ApprovalCommitInspectRequest::new(reject_session.session_id).with_task_id(reject_task_id),
+    )?;
+    assert_eq!(rejected.pending_count, 0);
+    assert_eq!(rejected.decision_count, 1);
+    assert_eq!(rejected.commit_count, 0);
+    assert_eq!(rejected.decisions[0].state, COMMIT_REJECTED_STATE);
+    assert_eq!(
+        rejected.decisions[0].rejection_reason.as_deref(),
+        Some("not safe for commit")
+    );
+
+    let fail_session =
+        runtime.start_session(StartSessionRequest::new(fail_repo.display().to_string()))?;
+    let fail_task_id = create_and_enqueue_task(
+        &mut runtime,
+        fail_session.session_id,
+        "write the approval inspect failed task",
+    )?;
+    let failed_run = runtime
+        .run_next_leased_codex_worker_task(LeasedCodexWorkerTaskRequest::new(
+            "approval-fail-worker",
+            CodexWorkerLaneRequest::new_subprocess("placeholder", fake_runner_command(script_name)),
+        ))?
+        .expect("failed task should run");
+    let fail_worktree = PathBuf::from(
+        failed_run
+            .task
+            .worktree
+            .as_ref()
+            .expect("task worktree")
+            .worktree_path
+            .clone(),
+    );
+    run_git(&fail_worktree, &["checkout", "--", "README.md"])?;
+    runtime.approve_task_pending_diff(fail_session.session_id, fail_task_id)?;
+    runtime.commit_approved_task_diff(fail_session.session_id, fail_task_id, "Commit fails")?;
+
+    let failed = runtime.inspect_approval_commit(
+        ApprovalCommitInspectRequest::new(fail_session.session_id).with_task_id(fail_task_id),
+    )?;
+    assert_eq!(failed.pending_count, 0);
+    assert_eq!(failed.decision_count, 1);
+    assert_eq!(failed.decisions[0].state, COMMIT_APPROVED_STATE);
+    assert_eq!(failed.commit_count, 2);
+    assert_eq!(failed.commits[0].state, COMMITTING_STATE);
+    assert_eq!(failed.commits[1].state, COMMIT_FAILED_STATE);
+    assert!(
+        failed.commits[1]
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("approved diff has no local changes"))
+    );
+    assert!(failed.decisions[0].rejection_reason.is_none());
+
+    Ok(())
+}
+
+#[test]
+fn approval_commit_inspect_report_task_scope_excludes_unrelated_task_events()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new("approval-scope-fixture"))?;
+    let first = runtime.create_task(
+        started.session_id,
+        CreateTaskRequest::new("write the first approval scoped task"),
+    )?;
+    let second = runtime.create_task(
+        started.session_id,
+        CreateTaskRequest::new("write the second approval scoped task"),
+    )?;
+    let store = PostgresEventStore::connect(&database_url)?;
+    store.append_event(NewEvent::diff_recorded(
+        started.session_id,
+        DiffSummaryPayload::new(1, 1, 0, vec!["first.md".to_owned()]).with_task_id(first.task_id),
+    )?)?;
+    store.append_event(NewEvent::commit_approval_pending(
+        started.session_id,
+        CommitApprovalPendingPayload::new(PENDING_COMMIT_APPROVAL_STATE, "first pending")
+            .with_task_id(first.task_id),
+    )?)?;
+    store.append_event(NewEvent::diff_recorded(
+        started.session_id,
+        DiffSummaryPayload::new(1, 1, 0, vec!["second.md".to_owned()]).with_task_id(second.task_id),
+    )?)?;
+    store.append_event(NewEvent::commit_approval_pending(
+        started.session_id,
+        CommitApprovalPendingPayload::new(PENDING_COMMIT_APPROVAL_STATE, "second pending")
+            .with_task_id(second.task_id),
+    )?)?;
+    store.append_event(NewEvent::commit_rejected(
+        started.session_id,
+        CommitApprovalDecisionPayload::new(COMMIT_REJECTED_STATE, "second rejected", "runtime")
+            .with_task_id(second.task_id),
+    )?)?;
+
+    let scoped = runtime.inspect_approval_commit(
+        ApprovalCommitInspectRequest::new(started.session_id).with_task_id(first.task_id),
+    )?;
+    assert_eq!(scoped.pending_count, 1);
+    assert_eq!(scoped.pending_approvals[0].task_id, Some(first.task_id));
+    assert_eq!(scoped.pending_approvals[0].summary, "first pending");
+    assert_eq!(scoped.decision_count, 0);
+    assert_eq!(scoped.commit_count, 0);
+    assert!(
+        scoped.pending_approvals[0]
+            .diff
+            .as_ref()
+            .expect("first diff")
+            .paths
+            .contains(&"first.md".to_owned())
+    );
+
+    let session_report =
+        runtime.inspect_approval_commit(ApprovalCommitInspectRequest::new(started.session_id))?;
+    assert_eq!(session_report.pending_count, 1);
+    assert_eq!(session_report.decision_count, 1);
+    assert_eq!(session_report.decisions[0].task_id, Some(second.task_id));
+    assert_eq!(session_report.decisions[0].state, COMMIT_REJECTED_STATE);
+
+    let missing = runtime.inspect_approval_commit(
+        ApprovalCommitInspectRequest::new(started.session_id).with_task_id(Uuid::new_v4()),
+    );
+    assert!(
+        missing
+            .expect_err("missing task should fail")
+            .to_string()
+            .contains("task not found")
+    );
 
     Ok(())
 }

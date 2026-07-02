@@ -641,6 +641,93 @@ pub struct CommitHandoffProjection {
     pub event_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApprovalCommitInspectRequest {
+    pub session_id: Uuid,
+    pub task_id: Option<Uuid>,
+}
+
+impl ApprovalCommitInspectRequest {
+    #[must_use]
+    pub const fn new(session_id: Uuid) -> Self {
+        Self {
+            session_id,
+            task_id: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_task_id(mut self, task_id: Uuid) -> Self {
+        self.task_id = Some(task_id);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ApprovalCommitDiffEvidence {
+    pub repo_path: Option<String>,
+    pub files_changed: usize,
+    pub insertions: usize,
+    pub deletions: usize,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ApprovalCommitWorkspaceEvidence {
+    pub worker_workspace_path: Option<String>,
+    pub worker_worktree_path: Option<String>,
+    pub allocated_worktree_path: Option<String>,
+    pub session_repo_path: Option<String>,
+    pub diff_repo_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PendingApprovalInspectEntry {
+    pub task_id: Option<Uuid>,
+    pub summary: String,
+    pub diff: Option<ApprovalCommitDiffEvidence>,
+    pub workspace: ApprovalCommitWorkspaceEvidence,
+    pub event_sequence: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ApprovalDecisionInspectEntry {
+    pub task_id: Option<Uuid>,
+    pub state: String,
+    pub actor: Option<String>,
+    pub reason: String,
+    pub rejection_reason: Option<String>,
+    pub event_sequence: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CommitHandoffInspectEntry {
+    pub task_id: Option<Uuid>,
+    pub state: String,
+    pub actor: Option<String>,
+    pub repo_path: String,
+    pub message: String,
+    pub commit_sha: Option<String>,
+    pub failure_reason: Option<String>,
+    pub event_sequence: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ApprovalCommitInspectReport {
+    pub session_id: Uuid,
+    pub task_id: Option<Uuid>,
+    pub scope: String,
+    pub pending_approvals: Vec<PendingApprovalInspectEntry>,
+    pub decisions: Vec<ApprovalDecisionInspectEntry>,
+    pub commits: Vec<CommitHandoffInspectEntry>,
+    pub pending_count: usize,
+    pub decision_count: usize,
+    pub commit_count: usize,
+    pub event_count: usize,
+    pub source_of_truth: String,
+    pub projection_kind: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskWorktreeProjection {
     pub lane_id: String,
@@ -1158,6 +1245,22 @@ impl Runtime {
             records,
             &task_statuses,
         ))
+    }
+
+    pub fn inspect_approval_commit(
+        &self,
+        request: ApprovalCommitInspectRequest,
+    ) -> HarnessResult<ApprovalCommitInspectReport> {
+        let events = self.event_store.events_for_session(request.session_id)?;
+        project_session(request.session_id, &events)?;
+        if let Some(task_id) = request.task_id {
+            let tasks = task_projections_from_events(request.session_id, &events)?;
+            if !tasks.iter().any(|task| task.task_id == task_id) {
+                return Err(HarnessError::new(format!("task not found: {task_id}")));
+            }
+        }
+
+        approval_commit_inspect_report_from_events(request, &events)
     }
 
     pub fn enqueue_task(
@@ -3499,6 +3602,138 @@ fn status_counts_from_map(counts: BTreeMap<String, usize>) -> Vec<TaskQueueInspe
         .into_iter()
         .map(|(status, count)| TaskQueueInspectStatusCount { status, count })
         .collect()
+}
+
+fn approval_commit_inspect_report_from_events(
+    request: ApprovalCommitInspectRequest,
+    events: &[EventEnvelope],
+) -> HarnessResult<ApprovalCommitInspectReport> {
+    let mut diffs = BTreeMap::new();
+    let mut workspaces = BTreeMap::new();
+    let mut pending = BTreeMap::new();
+    let mut decisions = Vec::new();
+    let mut commits = Vec::new();
+
+    for event in events {
+        let event_task_id = payload_task_id(&event.payload)?;
+        if request
+            .task_id
+            .is_some_and(|task_id| event_task_id != Some(task_id))
+        {
+            continue;
+        }
+        let scope_key = event_task_id;
+
+        match event.event_type {
+            EventType::WorkerLaneRequested => {
+                let workspace = workspaces
+                    .entry(scope_key)
+                    .or_insert_with(empty_approval_commit_workspace_evidence);
+                workspace.worker_workspace_path =
+                    payload_optional_string(&event.payload, "workspace_path");
+                workspace.worker_worktree_path =
+                    payload_optional_string(&event.payload, "worktree_path");
+            }
+            EventType::WorkerLaneWorktreeAllocated => {
+                let workspace = workspaces
+                    .entry(scope_key)
+                    .or_insert_with(empty_approval_commit_workspace_evidence);
+                workspace.allocated_worktree_path =
+                    Some(payload_string(&event.payload, "worktree_path")?);
+                workspace.session_repo_path =
+                    Some(payload_string(&event.payload, "session_repo_path")?);
+            }
+            EventType::DiffRecorded => {
+                let diff = diff_summary_from_payload(&event.payload)?;
+                let repo_path = payload_optional_string(&event.payload, "repo_path");
+                diffs.insert(
+                    scope_key,
+                    ApprovalCommitDiffEvidence {
+                        repo_path: repo_path.clone(),
+                        files_changed: diff.files_changed,
+                        insertions: diff.insertions,
+                        deletions: diff.deletions,
+                        paths: diff.paths,
+                    },
+                );
+                workspaces
+                    .entry(scope_key)
+                    .or_insert_with(empty_approval_commit_workspace_evidence)
+                    .diff_repo_path = repo_path;
+            }
+            EventType::CommitApprovalPending => {
+                pending.insert(
+                    scope_key,
+                    PendingApprovalInspectEntry {
+                        task_id: scope_key,
+                        summary: payload_string(&event.payload, "summary")?,
+                        diff: diffs.get(&scope_key).cloned(),
+                        workspace: workspaces
+                            .get(&scope_key)
+                            .cloned()
+                            .unwrap_or_else(empty_approval_commit_workspace_evidence),
+                        event_sequence: event.sequence,
+                    },
+                );
+            }
+            EventType::CommitApproved | EventType::CommitRejected => {
+                pending.remove(&scope_key);
+                let reason = payload_string(&event.payload, "reason")?;
+                decisions.push(ApprovalDecisionInspectEntry {
+                    task_id: scope_key,
+                    state: payload_string(&event.payload, "state")?,
+                    actor: payload_optional_string(&event.payload, "actor"),
+                    rejection_reason: (event.event_type == EventType::CommitRejected)
+                        .then(|| reason.clone()),
+                    reason,
+                    event_sequence: event.sequence,
+                });
+            }
+            EventType::CommitStarted | EventType::CommitSucceeded | EventType::CommitFailed => {
+                commits.push(CommitHandoffInspectEntry {
+                    task_id: scope_key,
+                    state: payload_string(&event.payload, "state")?,
+                    actor: payload_optional_string(&event.payload, "actor"),
+                    repo_path: payload_string(&event.payload, "repo_path")?,
+                    message: payload_string(&event.payload, "message")?,
+                    commit_sha: payload_optional_string(&event.payload, "commit_sha"),
+                    failure_reason: payload_optional_string(&event.payload, "failure_reason"),
+                    event_sequence: event.sequence,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let pending_approvals = pending.into_values().collect::<Vec<_>>();
+    Ok(ApprovalCommitInspectReport {
+        session_id: request.session_id,
+        task_id: request.task_id,
+        scope: if request.task_id.is_some() {
+            "task".to_owned()
+        } else {
+            "session".to_owned()
+        },
+        pending_count: pending_approvals.len(),
+        decision_count: decisions.len(),
+        commit_count: commits.len(),
+        pending_approvals,
+        decisions,
+        commits,
+        event_count: events.len(),
+        source_of_truth: "EventLog".to_owned(),
+        projection_kind: "approval_commit_inspect_report".to_owned(),
+    })
+}
+
+fn empty_approval_commit_workspace_evidence() -> ApprovalCommitWorkspaceEvidence {
+    ApprovalCommitWorkspaceEvidence {
+        worker_workspace_path: None,
+        worker_worktree_path: None,
+        allocated_worktree_path: None,
+        session_repo_path: None,
+        diff_repo_path: None,
+    }
 }
 
 fn task_projections_from_events(
