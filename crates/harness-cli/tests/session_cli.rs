@@ -625,6 +625,241 @@ fn cli_inspects_bounded_eventlog_timeline_text_and_json() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn cli_inspects_task_text_and_json_without_mutating_state() -> Result<(), Box<dyn std::error::Error>>
+{
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+
+    let migrate = Command::new(bin)
+        .args(["migrate", "--database-url", &database_url])
+        .output()?;
+    assert!(migrate.status.success());
+
+    let repo_path = std::env::current_dir()?.display().to_string();
+    let start = Command::new(bin)
+        .args([
+            "session",
+            "start",
+            "--repo",
+            &repo_path,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(start.status.success());
+
+    let start_stdout = String::from_utf8(start.stdout)?;
+    let session_id = value_for_key(&start_stdout, "session_id").expect("session_id output");
+
+    let create = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "create",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task",
+            "write the inspectable CLI task",
+            "--max-bytes",
+            "4096",
+            "--max-files",
+            "8",
+            "--max-skill-files",
+            "2",
+            "--focus",
+            "inspect",
+            "--max-output-tokens",
+            "384",
+        ])
+        .output()?;
+    assert!(create.status.success());
+    let create_stdout = String::from_utf8(create.stdout)?;
+    let task_id = value_for_key(&create_stdout, "task_id").expect("task_id output");
+
+    let enqueue = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "enqueue",
+            session_id,
+            task_id,
+            "--database-url",
+            &database_url,
+            "--max-retries",
+            "2",
+        ])
+        .output()?;
+    assert!(enqueue.status.success());
+
+    let lease = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "lease-next",
+            "--database-url",
+            &database_url,
+            "--worker-id",
+            "cli-inspect-worker",
+            "--lease-ms",
+            "30000",
+        ])
+        .output()?;
+    assert!(lease.status.success());
+    let lease_stdout = String::from_utf8(lease.stdout)?;
+    let lease_id = value_for_key(&lease_stdout, "task_lease_id").expect("lease id output");
+
+    let before_show = Command::new(bin)
+        .args([
+            "session",
+            "show",
+            session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(before_show.status.success());
+    let before_show_stdout = String::from_utf8(before_show.stdout)?;
+    assert!(before_show_stdout.contains("event_count=4"));
+
+    let inspect_text = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "inspect",
+            session_id,
+            task_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(inspect_text.status.success());
+    let inspect_text_stdout = String::from_utf8(inspect_text.stdout)?;
+    assert!(inspect_text_stdout.contains(&format!("session_id={session_id}")));
+    assert!(inspect_text_stdout.contains(&format!("task_id={task_id}")));
+    assert!(inspect_text_stdout.contains("task_status=leased"));
+    assert!(inspect_text_stdout.contains("task_input_summary=write the inspectable CLI task"));
+    assert!(inspect_text_stdout.contains("task_context_max_bytes=4096"));
+    assert!(inspect_text_stdout.contains("task_context_max_files=8"));
+    assert!(inspect_text_stdout.contains("task_context_max_skill_files=2"));
+    assert!(inspect_text_stdout.contains("task_focus_terms=inspect"));
+    assert!(inspect_text_stdout.contains("task_max_output_tokens=384"));
+    assert!(inspect_text_stdout.contains("task_queue_status=leased"));
+    assert!(inspect_text_stdout.contains("task_queue_worker_id=cli-inspect-worker"));
+    assert!(inspect_text_stdout.contains(&format!("task_queue_lease_id={lease_id}")));
+    assert!(inspect_text_stdout.contains("task_queue_max_retries=2"));
+    assert!(inspect_text_stdout.contains(&format!("task_lease_id={lease_id}")));
+    assert!(inspect_text_stdout.contains("task_lease_worker_id=cli-inspect-worker"));
+    assert!(inspect_text_stdout.contains("task_event_count=3"));
+    assert!(inspect_text_stdout.contains("task_event_latest_type=task.lease_acquired"));
+    assert!(inspect_text_stdout.contains("source_of_truth=EventLog"));
+    assert!(inspect_text_stdout.contains("projection_kind=task_inspect_report"));
+
+    let inspect_json = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "inspect",
+            session_id,
+            task_id,
+            "--database-url",
+            &database_url,
+            "--json",
+        ])
+        .output()?;
+    assert!(inspect_json.status.success());
+    let inspect_json_stdout = String::from_utf8(inspect_json.stdout)?;
+    let json: Value = serde_json::from_str(&inspect_json_stdout)?;
+    assert_eq!(json["session_id"], session_id);
+    assert_eq!(json["task_id"], task_id);
+    assert_eq!(json["status"], "leased");
+    assert_eq!(
+        json["input_summary"]["text"],
+        "write the inspectable CLI task"
+    );
+    assert_eq!(json["worker_lane_kind"], "codex_cli_worker_lane");
+    assert_eq!(json["context_budget"]["max_bytes"], 4096);
+    assert_eq!(json["context_budget"]["max_files"], 8);
+    assert_eq!(json["context_budget"]["max_skill_files"], 2);
+    assert_eq!(json["max_output_tokens"], 384);
+    assert_eq!(json["queue"]["status"], "leased");
+    assert_eq!(json["queue"]["worker_id"], "cli-inspect-worker");
+    assert_eq!(json["queue"]["lease_id"], lease_id);
+    assert_eq!(json["queue"]["max_retries"], 2);
+    assert_eq!(json["lease"]["worker_id"], "cli-inspect-worker");
+    assert_eq!(json["event_summary"]["event_count"], 3);
+    assert_eq!(
+        json["event_summary"]["latest_event_type"],
+        "task.lease_acquired"
+    );
+    assert_eq!(json["source_of_truth"], "EventLog");
+    assert_eq!(json["projection_kind"], "task_inspect_report");
+
+    let other_start = Command::new(bin)
+        .args([
+            "session",
+            "start",
+            "--repo",
+            &repo_path,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(other_start.status.success());
+    let other_start_stdout = String::from_utf8(other_start.stdout)?;
+    let other_session_id =
+        value_for_key(&other_start_stdout, "session_id").expect("other session id output");
+    let outside_session = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "inspect",
+            other_session_id,
+            task_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(!outside_session.status.success());
+    let outside_session_stderr = String::from_utf8(outside_session.stderr)?;
+    assert!(outside_session_stderr.contains("task not found"));
+
+    let after_show = Command::new(bin)
+        .args([
+            "session",
+            "show",
+            session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(after_show.status.success());
+    let after_show_stdout = String::from_utf8(after_show.stdout)?;
+    assert!(after_show_stdout.contains("event_count=4"));
+
+    let after_task = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "show",
+            session_id,
+            task_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(after_task.status.success());
+    let after_task_stdout = String::from_utf8(after_task.stdout)?;
+    assert!(after_task_stdout.contains("task_queue_status=leased"));
+    assert!(after_task_stdout.contains(&format!("task_lease_id={lease_id}")));
+
+    Ok(())
+}
+
+#[test]
 fn cli_enqueues_leases_and_completes_session_task() -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
         return Ok(());
