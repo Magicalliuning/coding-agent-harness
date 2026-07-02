@@ -2057,6 +2057,7 @@ impl Runtime {
         self.event_store.append_event(NewEvent::diff_recorded(
             session_id,
             diff_summary_payload(&evidence.summary)
+                .with_repo_path(repo_path)
                 .with_git_evidence(evidence.git_status, evidence.git_diff)
                 .with_optional_task_id(task_id),
         )?)?;
@@ -2610,8 +2611,12 @@ fn commit_repo_path_from_events_scoped(
                 }
             }
             EventType::DiffRecorded if event_matches_task_scope(event, task_id)? => {
-                diff_repo_path = latest_worktree_path
-                    .clone()
+                diff_repo_path = event
+                    .payload
+                    .get("repo_path")
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned)
+                    .or_else(|| latest_worktree_path.clone())
                     .or_else(|| task_repo_path.clone())
                     .or_else(|| session_repo_path.clone());
             }
