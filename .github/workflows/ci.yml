@@ -13,6 +13,23 @@ jobs:
   rust-checks:
     name: Rust workspace checks
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: harness_test
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d harness_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      HARNESS_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/harness_test
+      RUST_TEST_THREADS: 1
 
     steps:
       - name: Checkout
