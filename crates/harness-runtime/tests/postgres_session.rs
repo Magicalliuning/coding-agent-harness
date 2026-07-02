@@ -1217,6 +1217,181 @@ fn codex_cli_availability_reports_unauthenticated_skip() -> Result<(), Box<dyn s
 }
 
 #[test]
+fn approved_pending_diff_commits_through_harness_handoff() -> Result<(), Box<dyn std::error::Error>>
+{
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = git_fixture_repo_with_files(&[("AGENTS.md", "Use deterministic agent fixtures.")])?;
+    let commit_count_before = git_commit_count(&repo)?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let session_id = pending_approval_session_for_repo(
+        &mut runtime,
+        &repo,
+        "write the commit handoff fake patch",
+    )?;
+
+    assert_eq!(git_commit_count(&repo)?, commit_count_before);
+    runtime.approve_pending_diff(session_id)?;
+    assert_eq!(git_commit_count(&repo)?, commit_count_before);
+
+    let commit = runtime.commit_approved_diff(session_id, "Commit approved fake patch")?;
+    let events = runtime.events_for_session(session_id)?;
+
+    assert_eq!(commit.state, "committed");
+    assert!(
+        commit
+            .commit_sha
+            .as_deref()
+            .is_some_and(|sha| sha.len() == 40)
+    );
+    assert_eq!(commit.failure_reason, None);
+    assert_eq!(git_commit_count(&repo)?, commit_count_before + 1);
+    assert_eq!(git_text(&repo, &["status", "--short"])?, "");
+    assert_eq!(
+        events.last().expect("last event").event_type,
+        EventType::CommitSucceeded
+    );
+    assert_eq!(
+        events.last().expect("last event").payload["commit_sha"],
+        commit.commit_sha.as_deref().expect("commit sha")
+    );
+    let event_count_after_commit = events.len();
+    let duplicate_commit = runtime
+        .commit_approved_diff(session_id, "Should not commit twice")
+        .expect_err("committed task cannot be committed again");
+    assert!(duplicate_commit.to_string().contains("already committed"));
+    assert_eq!(
+        runtime.events_for_session(session_id)?.len(),
+        event_count_after_commit
+    );
+
+    Ok(())
+}
+
+#[test]
+fn commit_handoff_requires_approved_pending_diff() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = git_fixture_repo_with_files(&[("AGENTS.md", "Use deterministic agent fixtures.")])?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let pending_session_id = pending_approval_session_for_repo(
+        &mut runtime,
+        &repo,
+        "write the unapproved commit handoff fake patch",
+    )?;
+    let pending_event_count = runtime.events_for_session(pending_session_id)?.len();
+
+    let pending_error = runtime
+        .commit_approved_diff(pending_session_id, "Should not commit")
+        .expect_err("pending diff should not commit");
+    assert!(
+        pending_error
+            .to_string()
+            .contains("approved diff is required")
+    );
+    assert_eq!(
+        runtime.events_for_session(pending_session_id)?.len(),
+        pending_event_count
+    );
+
+    runtime.reject_pending_diff(pending_session_id, "not safe")?;
+    let rejected_event_count = runtime.events_for_session(pending_session_id)?.len();
+    let rejected_error = runtime
+        .commit_approved_diff(pending_session_id, "Should not commit")
+        .expect_err("rejected diff should not commit");
+    assert!(
+        rejected_error
+            .to_string()
+            .contains("current state is rejected")
+    );
+    assert_eq!(
+        runtime.events_for_session(pending_session_id)?.len(),
+        rejected_event_count
+    );
+
+    let empty_repo = fixture_repo()?;
+    let missing =
+        runtime.start_session(StartSessionRequest::new(empty_repo.display().to_string()))?;
+    let missing_event_count = runtime.events_for_session(missing.session_id)?.len();
+    let missing_error = runtime
+        .commit_approved_diff(missing.session_id, "Should not commit")
+        .expect_err("missing diff should not commit");
+    assert!(
+        missing_error
+            .to_string()
+            .contains("pending diff was not recorded")
+    );
+    assert_eq!(
+        runtime.events_for_session(missing.session_id)?.len(),
+        missing_event_count
+    );
+
+    Ok(())
+}
+
+#[test]
+fn commit_handoff_records_git_failure_reason() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let session_id = pending_approval_session(&mut runtime)?;
+    runtime.approve_pending_diff(session_id)?;
+
+    let commit = runtime.commit_approved_diff(session_id, "Commit should fail")?;
+    let events = runtime.events_for_session(session_id)?;
+
+    assert_eq!(commit.state, "commit_failed");
+    assert_eq!(commit.commit_sha, None);
+    assert!(
+        commit
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("git"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == EventType::CommitStarted)
+    );
+    assert_eq!(
+        events.last().expect("last event").event_type,
+        EventType::CommitFailed
+    );
+    assert!(
+        events.last().expect("last event").payload["failure_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("git"))
+    );
+    let event_count_after_failure = events.len();
+    let duplicate_commit = runtime
+        .commit_approved_diff(session_id, "Retry failed commit")
+        .expect_err("failed commit handoff cannot be committed again");
+    assert!(
+        duplicate_commit
+            .to_string()
+            .contains("already commit_failed")
+    );
+    assert_eq!(
+        runtime.events_for_session(session_id)?.len(),
+        event_count_after_failure
+    );
+
+    Ok(())
+}
+
+#[test]
 fn denied_verification_command_is_not_executed() -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
         return Ok(());
@@ -1321,12 +1496,19 @@ fn git_fixture_repo_with_files(
 fn pending_approval_session(runtime: &mut Runtime) -> Result<Uuid, Box<dyn std::error::Error>> {
     let repo = fixture_repo()?;
     write_file(&repo, "AGENTS.md", "Use deterministic agent fixtures.")?;
-    let started = runtime.start_session(StartSessionRequest::new(repo.display().to_string()))?;
+    pending_approval_session_for_repo(runtime, &repo, "write the approval state fake patch")
+}
 
+fn pending_approval_session_for_repo(
+    runtime: &mut Runtime,
+    repo: &Path,
+    task: &str,
+) -> Result<Uuid, Box<dyn std::error::Error>> {
+    let started = runtime.start_session(StartSessionRequest::new(repo.display().to_string()))?;
     runtime.run_small_coding_task(
         started.session_id,
         SmallCodingTaskRequest {
-            task: "write the approval state fake patch".to_owned(),
+            task: task.to_owned(),
             context: SessionContextCompileRequest {
                 budget: ContextBudget {
                     max_bytes: 4096,
@@ -1341,6 +1523,12 @@ fn pending_approval_session(runtime: &mut Runtime) -> Result<Uuid, Box<dyn std::
     )?;
 
     Ok(started.session_id)
+}
+
+fn git_commit_count(root: &Path) -> Result<usize, Box<dyn std::error::Error>> {
+    Ok(git_text(root, &["rev-list", "--count", "HEAD"])?
+        .trim()
+        .parse()?)
 }
 
 fn fake_runner_command(script_name: &str) -> CodexWorkerSubprocess {

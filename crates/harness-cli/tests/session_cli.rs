@@ -401,6 +401,121 @@ fn cli_approval_show_approve_rejects_pending_diff() -> Result<(), Box<dyn std::e
 }
 
 #[test]
+fn cli_commit_handoff_requires_approval_and_commits_approved_diff()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+
+    let migrate = Command::new(bin)
+        .args(["migrate", "--database-url", &database_url])
+        .output()?;
+    assert!(migrate.status.success());
+
+    let pending_repo = fixture_repo()?;
+    write_file(
+        &pending_repo,
+        "AGENTS.md",
+        "Use deterministic agent fixtures.",
+    )?;
+    init_git_repo(&pending_repo)?;
+    let pending_commit_count_before: usize = git_commit_count(&pending_repo)?.parse()?;
+    let pending_session_id = start_cli_pending_approval_in_repo(
+        bin,
+        &database_url,
+        &pending_repo,
+        "write the unapproved CLI patch",
+    )?;
+    assert_eq!(
+        git_commit_count(&pending_repo)?.parse::<usize>()?,
+        pending_commit_count_before
+    );
+
+    let unapproved_commit = Command::new(bin)
+        .args([
+            "session",
+            "commit",
+            &pending_session_id,
+            "--database-url",
+            &database_url,
+            "--message",
+            "Should not commit",
+        ])
+        .output()?;
+    assert!(!unapproved_commit.status.success());
+    assert!(String::from_utf8(unapproved_commit.stderr)?.contains("approved diff is required"),);
+    assert_eq!(
+        git_commit_count(&pending_repo)?.parse::<usize>()?,
+        pending_commit_count_before
+    );
+
+    let approved_repo = fixture_repo()?;
+    write_file(
+        &approved_repo,
+        "AGENTS.md",
+        "Use deterministic agent fixtures.",
+    )?;
+    init_git_repo(&approved_repo)?;
+    let approved_commit_count_before: usize = git_commit_count(&approved_repo)?.parse()?;
+    let approved_session_id = start_cli_pending_approval_in_repo(
+        bin,
+        &database_url,
+        &approved_repo,
+        "write the approved CLI commit patch",
+    )?;
+    assert_eq!(
+        git_commit_count(&approved_repo)?.parse::<usize>()?,
+        approved_commit_count_before
+    );
+
+    let approve = Command::new(bin)
+        .args([
+            "session",
+            "approval",
+            "approve",
+            &approved_session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(approve.status.success());
+    assert_eq!(
+        git_commit_count(&approved_repo)?.parse::<usize>()?,
+        approved_commit_count_before
+    );
+
+    let commit = Command::new(bin)
+        .args([
+            "session",
+            "commit",
+            &approved_session_id,
+            "--database-url",
+            &database_url,
+            "--message",
+            "Commit approved CLI patch",
+        ])
+        .output()?;
+    assert!(commit.status.success());
+
+    let commit_stdout = String::from_utf8(commit.stdout)?;
+    let commit_sha = value_for_key(&commit_stdout, "commit_sha").expect("commit sha output");
+    assert!(commit_stdout.contains("commit_state=committed"));
+    assert!(commit_stdout.contains("commit_message=Commit approved CLI patch"));
+    assert!(commit_stdout.contains("commit_failure_reason="));
+    assert!(commit_stdout.contains("event_count=15"));
+    assert_eq!(commit_sha.len(), 40);
+    assert_eq!(
+        git_commit_count(&approved_repo)?.parse::<usize>()?,
+        approved_commit_count_before + 1
+    );
+    assert_eq!(git_status(&approved_repo)?, "");
+
+    Ok(())
+}
+
+#[test]
 fn cli_recovers_fixture_task_with_bounded_loop() -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
         return Ok(());
@@ -537,6 +652,17 @@ fn start_cli_pending_approval(
 ) -> Result<(PathBuf, String), Box<dyn std::error::Error>> {
     let repo = fixture_repo()?;
     write_file(&repo, "AGENTS.md", "Use deterministic agent fixtures.")?;
+    let session_id = start_cli_pending_approval_in_repo(bin, database_url, &repo, task)?;
+
+    Ok((repo, session_id))
+}
+
+fn start_cli_pending_approval_in_repo(
+    bin: &str,
+    database_url: &str,
+    repo: &Path,
+    task: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     let repo_path = repo.display().to_string();
 
     let start = Command::new(bin)
@@ -576,7 +702,7 @@ fn start_cli_pending_approval(
         .output()?;
     assert!(coding_task.status.success());
 
-    Ok((repo, session_id))
+    Ok(session_id)
 }
 
 fn workspace_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -633,6 +759,16 @@ fn init_git_repo(repo: &Path) -> Result<(), Box<dyn std::error::Error>> {
 fn git_commit_count(repo: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let output = Command::new("git")
         .args(["rev-list", "--count", "HEAD"])
+        .current_dir(repo)
+        .output()?;
+    assert!(output.status.success());
+
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+fn git_status(repo: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("git")
+        .args(["status", "--short"])
         .current_dir(repo)
         .output()?;
     assert!(output.status.success());

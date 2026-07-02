@@ -4,12 +4,12 @@ use std::path::PathBuf;
 use harness_core::{HarnessError, HarnessResult};
 use harness_runtime::{
     ApprovalProjection, CodexCliAcceptanceRequest, CodexCliAcceptanceResult,
-    CodexCliAvailabilityRequest, ContextBudget, DEFAULT_CODEX_CLI_ACCEPTANCE_TASK,
-    DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS, DEFAULT_CODEX_CLI_PROGRAM, FakeModelTurnRequest,
-    FakeModelTurnResult, Runtime, SelfRecoveryLoopRequest, SelfRecoveryLoopResult,
-    SessionContextCompileRequest, SessionContextCompileResult, SessionProjection,
-    SmallCodingTaskRequest, SmallCodingTaskResult, StartSessionRequest, VerificationCommandRequest,
-    VerificationCommandResult,
+    CodexCliAvailabilityRequest, CommitHandoffProjection, ContextBudget,
+    DEFAULT_CODEX_CLI_ACCEPTANCE_TASK, DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS,
+    DEFAULT_CODEX_CLI_PROGRAM, FakeModelTurnRequest, FakeModelTurnResult, Runtime,
+    SelfRecoveryLoopRequest, SelfRecoveryLoopResult, SessionContextCompileRequest,
+    SessionContextCompileResult, SessionProjection, SmallCodingTaskRequest, SmallCodingTaskResult,
+    StartSessionRequest, VerificationCommandRequest, VerificationCommandResult,
 };
 use uuid::Uuid;
 
@@ -260,6 +260,20 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
             };
 
             print_approval_projection(&approval);
+            Ok(())
+        }
+        "commit" => {
+            let session_id = args
+                .get(1)
+                .ok_or_else(|| HarnessError::new("session id is required"))?;
+            let session_id = Uuid::parse_str(session_id)
+                .map_err(|error| HarnessError::new(error.to_string()))?;
+            let database_url = database_url_from_args(args.clone())?;
+            let message = required_arg_value(&args, "--message")?;
+            let mut runtime = Runtime::connect_postgres(&database_url)?;
+            let commit = runtime.commit_approved_diff(session_id, message)?;
+
+            print_commit_handoff_projection(&commit);
             Ok(())
         }
         "codex-acceptance" => {
@@ -555,6 +569,19 @@ fn print_approval_projection(approval: &ApprovalProjection) {
     println!("diff_deletions={}", approval.diff.deletions);
     println!("diff_paths={}", approval.diff.paths.join(","));
     println!("event_count={}", approval.event_count);
+}
+
+fn print_commit_handoff_projection(commit: &CommitHandoffProjection) {
+    println!("session_id={}", commit.session_id);
+    println!("commit_state={}", commit.state);
+    println!("commit_repo_path={}", commit.repo_path);
+    println!("commit_message={}", commit.message);
+    println!("commit_sha={}", commit.commit_sha.as_deref().unwrap_or(""));
+    println!(
+        "commit_failure_reason={}",
+        commit.failure_reason.as_deref().unwrap_or("")
+    );
+    println!("event_count={}", commit.event_count);
 }
 
 fn print_codex_cli_acceptance_result(result: &CodexCliAcceptanceResult) {
