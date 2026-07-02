@@ -12,9 +12,9 @@ use harness_events::{
     FilePatchIntentPayload, FilePatchObservationPayload, FilePatchPayload, ModelDecisionPayload,
     ModelRequestPayload, NewEvent, PolicyDecisionPayload, RecoveryFailurePayload,
     RecoveryPlanPayload, RecoveryRepairAttemptPayload, RecoveryStoppedPayload,
-    SessionStartedPayload, SkillMetadataPayload, ToolCallIntentPayload, ToolObservationPayload,
-    WorkerLaneBudgetPayload, WorkerLaneObservationPayload, WorkerLaneRequestPayload,
-    WorkerLaneStatePayload, WorkerLaneWorktreeAllocatedPayload,
+    SessionStartedPayload, SkillMetadataPayload, TaskCreatedPayload, ToolCallIntentPayload,
+    ToolObservationPayload, WorkerLaneBudgetPayload, WorkerLaneObservationPayload,
+    WorkerLaneRequestPayload, WorkerLaneStatePayload, WorkerLaneWorktreeAllocatedPayload,
 };
 use harness_models::{DeterministicFakeModelProvider, FakeModelRequest, FilePatchProposal};
 use harness_policy::{
@@ -38,6 +38,8 @@ pub const COMMIT_REJECTED_STATE: &str = "rejected";
 pub const COMMITTING_STATE: &str = "committing";
 pub const COMMITTED_STATE: &str = "committed";
 pub const COMMIT_FAILED_STATE: &str = "commit_failed";
+pub const TASK_CREATED_STATE: &str = "created";
+pub const DEFAULT_TASK_WORKER_LANE_KIND: &str = "codex_cli_worker_lane";
 pub const RECOVERY_FAILED_STATE: &str = "recovery_failed";
 pub const SELF_RECOVERY_MAX_ROUNDS: usize = 2;
 pub const DEFAULT_CODEX_CLI_PROGRAM: &str = "codex";
@@ -82,6 +84,28 @@ pub struct SessionProjection {
     pub repo_path: String,
     pub status: SessionStatus,
     pub event_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTaskRequest {
+    pub input: String,
+    pub repo_path: Option<String>,
+    pub worker_lane_kind: String,
+    pub context: SessionContextCompileRequest,
+    pub max_output_tokens: usize,
+}
+
+impl CreateTaskRequest {
+    #[must_use]
+    pub fn new(input: impl Into<String>) -> Self {
+        Self {
+            input: input.into(),
+            repo_path: None,
+            worker_lane_kind: DEFAULT_TASK_WORKER_LANE_KIND.to_owned(),
+            context: SessionContextCompileRequest::default(),
+            max_output_tokens: 256,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,6 +240,59 @@ pub struct CommitHandoffProjection {
     pub message: String,
     pub commit_sha: Option<String>,
     pub failure_reason: Option<String>,
+    pub event_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskWorktreeProjection {
+    pub lane_id: String,
+    pub lane_kind: String,
+    pub worktree_path: String,
+    pub base_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskWorkerOutputProjection {
+    pub lane_id: String,
+    pub lane_kind: String,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskApprovalProjection {
+    pub state: String,
+    pub summary: String,
+    pub rejection_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCommitProjection {
+    pub state: String,
+    pub message: String,
+    pub commit_sha: Option<String>,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskProjection {
+    pub session_id: Uuid,
+    pub task_id: Uuid,
+    pub repo_path: String,
+    pub input: String,
+    pub status: String,
+    pub worker_lane_kind: String,
+    pub context_budget: ContextBudget,
+    pub focus_terms: Vec<String>,
+    pub max_output_tokens: usize,
+    pub worktree: Option<TaskWorktreeProjection>,
+    pub worker_output: Option<TaskWorkerOutputProjection>,
+    pub diff: Option<DiffSummary>,
+    pub approval: Option<TaskApprovalProjection>,
+    pub commit: Option<TaskCommitProjection>,
     pub event_count: usize,
 }
 
@@ -504,6 +581,61 @@ impl Runtime {
     pub fn show_session(&self, session_id: Uuid) -> HarnessResult<SessionProjection> {
         let events = self.event_store.events_for_session(session_id)?;
         project_session(session_id, &events)
+    }
+
+    pub fn create_task(
+        &mut self,
+        session_id: Uuid,
+        request: CreateTaskRequest,
+    ) -> HarnessResult<TaskProjection> {
+        if request.input.trim().is_empty() {
+            return Err(HarnessError::new("task input cannot be empty"));
+        }
+
+        if request.worker_lane_kind.trim().is_empty() {
+            return Err(HarnessError::new("task worker lane kind cannot be empty"));
+        }
+
+        let session = self.show_session(session_id)?;
+        let repo_path = request
+            .repo_path
+            .unwrap_or_else(|| session.repo_path.clone());
+        if repo_path.trim().is_empty() {
+            return Err(HarnessError::new("task repo path cannot be empty"));
+        }
+
+        let task_id = Uuid::new_v4();
+        self.event_store.append_event(NewEvent::task_created(
+            session_id,
+            TaskCreatedPayload::new(
+                task_id,
+                repo_path,
+                request.input.trim(),
+                TASK_CREATED_STATE,
+                request.worker_lane_kind.trim(),
+                request.context.budget.max_bytes,
+                request.context.budget.max_files,
+                request.context.budget.max_skill_files,
+                request.context.focus_terms,
+                request.max_output_tokens,
+            ),
+        )?)?;
+
+        self.show_task(session_id, task_id)
+    }
+
+    pub fn list_tasks(&self, session_id: Uuid) -> HarnessResult<Vec<TaskProjection>> {
+        let events = self.event_store.events_for_session(session_id)?;
+        project_session(session_id, &events)?;
+        task_projections_from_events(session_id, &events)
+    }
+
+    pub fn show_task(&self, session_id: Uuid, task_id: Uuid) -> HarnessResult<TaskProjection> {
+        let tasks = self.list_tasks(session_id)?;
+        tasks
+            .into_iter()
+            .find(|task| task.task_id == task_id)
+            .ok_or_else(|| HarnessError::new(format!("task not found: {task_id}")))
     }
 
     pub fn events_for_session(&self, session_id: Uuid) -> HarnessResult<Vec<EventEnvelope>> {
@@ -1486,6 +1618,128 @@ pub fn project_session(
     })
 }
 
+fn task_projections_from_events(
+    session_id: Uuid,
+    events: &[EventEnvelope],
+) -> HarnessResult<Vec<TaskProjection>> {
+    let mut tasks = Vec::new();
+
+    for event in events {
+        if event.event_type == EventType::TaskCreated {
+            let payload: TaskCreatedPayload = serde_json::from_value(event.payload.clone())
+                .map_err(|error| HarnessError::new(error.to_string()))?;
+            tasks.push(task_projection_from_created_payload(
+                session_id,
+                payload,
+                events.len(),
+            ));
+            continue;
+        }
+
+        let Some(task_id) = payload_task_id(&event.payload)? else {
+            continue;
+        };
+        let Some(task) = tasks.iter_mut().find(|task| task.task_id == task_id) else {
+            continue;
+        };
+
+        match event.event_type {
+            EventType::WorkerLaneRequested => {
+                task.worker_lane_kind = payload_string(&event.payload, "lane_kind")?;
+                task.input = payload_string(&event.payload, "task")?;
+            }
+            EventType::WorkerLaneStateChanged => {
+                task.status = payload_string(&event.payload, "to_state")?;
+            }
+            EventType::WorkerLaneWorktreeAllocated => {
+                task.worktree = Some(TaskWorktreeProjection {
+                    lane_id: payload_string(&event.payload, "lane_id")?,
+                    lane_kind: payload_string(&event.payload, "lane_kind")?,
+                    worktree_path: payload_string(&event.payload, "worktree_path")?,
+                    base_ref: payload_string(&event.payload, "base_ref")?,
+                });
+            }
+            EventType::WorkerLaneObservationRecorded => {
+                let status = payload_string(&event.payload, "status")?;
+                task.status = status.clone();
+                task.worker_output = Some(TaskWorkerOutputProjection {
+                    lane_id: payload_string(&event.payload, "lane_id")?,
+                    lane_kind: payload_string(&event.payload, "lane_kind")?,
+                    status,
+                    exit_code: payload_i32_optional(&event.payload, "exit_code")?,
+                    stdout: payload_string(&event.payload, "stdout")?,
+                    stderr: payload_string(&event.payload, "stderr")?,
+                    duration_ms: payload_u64(&event.payload, "duration_ms")?,
+                });
+            }
+            EventType::DiffRecorded => {
+                task.diff = Some(diff_summary_from_payload(&event.payload)?);
+            }
+            EventType::CommitApprovalPending => {
+                let state = payload_string(&event.payload, "state")?;
+                task.status = state.clone();
+                task.approval = Some(TaskApprovalProjection {
+                    state,
+                    summary: payload_string(&event.payload, "summary")?,
+                    rejection_reason: None,
+                });
+            }
+            EventType::CommitApproved | EventType::CommitRejected => {
+                let state = payload_string(&event.payload, "state")?;
+                let reason = payload_string(&event.payload, "reason")?;
+                task.status = state.clone();
+                task.approval = Some(TaskApprovalProjection {
+                    rejection_reason: (event.event_type == EventType::CommitRejected)
+                        .then(|| reason.clone()),
+                    state,
+                    summary: reason,
+                });
+            }
+            EventType::CommitStarted | EventType::CommitSucceeded | EventType::CommitFailed => {
+                let state = payload_string(&event.payload, "state")?;
+                task.status = state.clone();
+                task.commit = Some(TaskCommitProjection {
+                    state,
+                    message: payload_string(&event.payload, "message")?,
+                    commit_sha: payload_optional_string(&event.payload, "commit_sha"),
+                    failure_reason: payload_optional_string(&event.payload, "failure_reason"),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    Ok(tasks)
+}
+
+fn task_projection_from_created_payload(
+    session_id: Uuid,
+    payload: TaskCreatedPayload,
+    event_count: usize,
+) -> TaskProjection {
+    TaskProjection {
+        session_id,
+        task_id: payload.task_id,
+        repo_path: payload.repo_path,
+        input: payload.input,
+        status: payload.status,
+        worker_lane_kind: payload.worker_lane_kind,
+        context_budget: ContextBudget {
+            max_bytes: payload.max_context_bytes,
+            max_files: payload.max_context_files,
+            max_skill_files: payload.max_context_skill_files,
+        },
+        focus_terms: payload.focus_terms,
+        max_output_tokens: payload.max_output_tokens,
+        worktree: None,
+        worker_output: None,
+        diff: None,
+        approval: None,
+        commit: None,
+        event_count,
+    }
+}
+
 fn context_compiled_payload(bundle: &CompiledContextBundle) -> ContextCompiledPayload {
     ContextCompiledPayload {
         repo_path: bundle.repo_path.clone(),
@@ -1714,6 +1968,39 @@ fn payload_string(payload: &serde_json::Value, key: &str) -> HarnessResult<Strin
         .get(key)
         .and_then(|value| value.as_str())
         .map(ToOwned::to_owned)
+        .ok_or_else(|| HarnessError::new(format!("payload {key} is missing")))
+}
+
+fn payload_optional_string(payload: &serde_json::Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+}
+
+fn payload_task_id(payload: &serde_json::Value) -> HarnessResult<Option<Uuid>> {
+    payload
+        .get("task_id")
+        .and_then(|value| value.as_str())
+        .map(|value| Uuid::parse_str(value).map_err(|error| HarnessError::new(error.to_string())))
+        .transpose()
+}
+
+fn payload_i32_optional(payload: &serde_json::Value, key: &str) -> HarnessResult<Option<i32>> {
+    payload
+        .get(key)
+        .and_then(|value| value.as_i64())
+        .map(|value| {
+            i32::try_from(value)
+                .map_err(|_| HarnessError::new(format!("payload {key} is out of range")))
+        })
+        .transpose()
+}
+
+fn payload_u64(payload: &serde_json::Value, key: &str) -> HarnessResult<u64> {
+    payload
+        .get(key)
+        .and_then(|value| value.as_u64())
         .ok_or_else(|| HarnessError::new(format!("payload {key} is missing")))
 }
 
@@ -2073,6 +2360,7 @@ fn worker_lane_request_payload(
     intent: &CodexWorkerLaneIntent,
 ) -> WorkerLaneRequestPayload {
     WorkerLaneRequestPayload {
+        task_id: None,
         lane_id: lane_id.to_owned(),
         lane_kind: lane_kind.to_owned(),
         task: intent.task.clone(),
@@ -2094,6 +2382,7 @@ fn worker_lane_observation_payload(
     observation: &CodexWorkerLaneObservation,
 ) -> WorkerLaneObservationPayload {
     WorkerLaneObservationPayload {
+        task_id: None,
         lane_id: lane_id.to_owned(),
         lane_kind: lane_kind.to_owned(),
         status: observation.status.as_str().to_owned(),
@@ -2215,6 +2504,92 @@ mod tests {
     }
 
     #[test]
+    fn task_projection_replays_task_scoped_events_without_database() {
+        let session_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let session_started =
+            NewEvent::session_started(session_id, SessionStartedPayload::new("C:/repo"))
+                .expect("session started event");
+        let task_created = NewEvent::task_created(
+            session_id,
+            TaskCreatedPayload::new(
+                task_id,
+                "C:/repo",
+                "draft a task patch",
+                TASK_CREATED_STATE,
+                DEFAULT_TASK_WORKER_LANE_KIND,
+                4096,
+                8,
+                2,
+                vec!["agent".to_owned()],
+                256,
+            ),
+        )
+        .expect("task created event");
+        let diff = NewEvent::diff_recorded(
+            session_id,
+            DiffSummaryPayload::new(1, 3, 0, vec![".harness/task.md".to_owned()])
+                .with_task_id(task_id),
+        )
+        .expect("diff event");
+        let approval = NewEvent::commit_approval_pending(
+            session_id,
+            CommitApprovalPendingPayload::new(
+                PENDING_COMMIT_APPROVAL_STATE,
+                "verification passed; awaiting human commit approval",
+            )
+            .with_task_id(task_id),
+        )
+        .expect("approval event");
+        let commit = NewEvent::commit_succeeded(
+            session_id,
+            CommitHandoffPayload::succeeded(
+                "C:/repo",
+                "Commit approved task patch",
+                "runtime",
+                "0123456789abcdef0123456789abcdef01234567",
+            )
+            .with_task_id(task_id),
+        )
+        .expect("commit event");
+        let events = vec![
+            event_envelope(1, session_started),
+            event_envelope(2, task_created),
+            event_envelope(3, diff),
+            event_envelope(4, approval),
+            event_envelope(5, commit),
+        ];
+
+        let tasks = task_projections_from_events(session_id, &events).expect("task projection");
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task_id, task_id);
+        assert_eq!(tasks[0].status, COMMITTED_STATE);
+        assert_eq!(tasks[0].input, "draft a task patch");
+        assert_eq!(tasks[0].worker_lane_kind, DEFAULT_TASK_WORKER_LANE_KIND);
+        assert_eq!(tasks[0].context_budget.max_bytes, 4096);
+        assert_eq!(tasks[0].focus_terms, vec!["agent"]);
+        assert_eq!(
+            tasks[0].diff.as_ref().expect("diff slot").paths,
+            vec![".harness/task.md"]
+        );
+        assert_eq!(
+            tasks[0].approval.as_ref().expect("approval slot").state,
+            PENDING_COMMIT_APPROVAL_STATE
+        );
+        assert_eq!(
+            tasks[0]
+                .commit
+                .as_ref()
+                .expect("commit slot")
+                .commit_sha
+                .as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(tasks[0].event_count, 5);
+    }
+
+    #[test]
     fn context_payload_preserves_sources_and_skill_metadata() {
         let bundle = CompiledContextBundle {
             repo_path: "C:/repo".to_owned(),
@@ -2247,5 +2622,16 @@ mod tests {
         assert_eq!(payload.budget_skill_files, 8);
         assert_eq!(payload.sources[0].path, "AGENTS.md");
         assert_eq!(payload.skills[0].name.as_deref(), Some("demo"));
+    }
+
+    fn event_envelope(sequence: i64, event: NewEvent) -> EventEnvelope {
+        EventEnvelope {
+            event_id: event.event_id,
+            session_id: event.session_id,
+            sequence,
+            event_type: event.event_type,
+            schema_version: event.schema_version,
+            payload: event.payload,
+        }
     }
 }

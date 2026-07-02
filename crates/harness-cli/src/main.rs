@@ -4,12 +4,13 @@ use std::path::PathBuf;
 use harness_core::{HarnessError, HarnessResult};
 use harness_runtime::{
     ApprovalProjection, CodexCliAcceptanceRequest, CodexCliAcceptanceResult,
-    CodexCliAvailabilityRequest, CommitHandoffProjection, ContextBudget,
+    CodexCliAvailabilityRequest, CommitHandoffProjection, ContextBudget, CreateTaskRequest,
     DEFAULT_CODEX_CLI_ACCEPTANCE_TASK, DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS,
-    DEFAULT_CODEX_CLI_PROGRAM, FakeModelTurnRequest, FakeModelTurnResult, Runtime,
-    SelfRecoveryLoopRequest, SelfRecoveryLoopResult, SessionContextCompileRequest,
-    SessionContextCompileResult, SessionProjection, SmallCodingTaskRequest, SmallCodingTaskResult,
-    StartSessionRequest, VerificationCommandRequest, VerificationCommandResult,
+    DEFAULT_CODEX_CLI_PROGRAM, DEFAULT_TASK_WORKER_LANE_KIND, FakeModelTurnRequest,
+    FakeModelTurnResult, Runtime, SelfRecoveryLoopRequest, SelfRecoveryLoopResult,
+    SessionContextCompileRequest, SessionContextCompileResult, SessionProjection,
+    SmallCodingTaskRequest, SmallCodingTaskResult, StartSessionRequest, TaskProjection,
+    VerificationCommandRequest, VerificationCommandResult,
 };
 use uuid::Uuid;
 
@@ -77,6 +78,62 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
 
             print_projection(&projection);
             Ok(())
+        }
+        "task" => {
+            let action = args
+                .get(1)
+                .ok_or_else(|| HarnessError::new("task action is required"))?;
+            let session_id = args
+                .get(2)
+                .ok_or_else(|| HarnessError::new("session id is required"))?;
+            let session_id = Uuid::parse_str(session_id)
+                .map_err(|error| HarnessError::new(error.to_string()))?;
+            let database_url = database_url_from_args(args.clone())?;
+            let mut runtime = Runtime::connect_postgres(&database_url)?;
+
+            match action.as_str() {
+                "create" => {
+                    let input = required_arg_value(&args, "--task")?;
+                    let repo_path = optional_arg_value(&args, "--repo")
+                        .map(canonical_repo_path)
+                        .transpose()?;
+                    let worker_lane_kind = optional_arg_value(&args, "--worker-lane")
+                        .unwrap_or(DEFAULT_TASK_WORKER_LANE_KIND);
+                    let max_output_tokens = optional_arg_value(&args, "--max-output-tokens")
+                        .map(|value| parse_usize_arg("--max-output-tokens", value))
+                        .transpose()?
+                        .unwrap_or(256);
+                    let request = CreateTaskRequest {
+                        input: input.to_owned(),
+                        repo_path,
+                        worker_lane_kind: worker_lane_kind.to_owned(),
+                        context: SessionContextCompileRequest {
+                            budget: context_budget_from_args(&args)?,
+                            focus_terms: repeated_arg_values(&args, "--focus"),
+                        },
+                        max_output_tokens,
+                    };
+                    let task = runtime.create_task(session_id, request)?;
+                    print_task_projection(&task);
+                    Ok(())
+                }
+                "list" => {
+                    let tasks = runtime.list_tasks(session_id)?;
+                    print_task_list(&tasks);
+                    Ok(())
+                }
+                "show" => {
+                    let task_id = args
+                        .get(3)
+                        .ok_or_else(|| HarnessError::new("task id is required"))?;
+                    let task_id = Uuid::parse_str(task_id)
+                        .map_err(|error| HarnessError::new(error.to_string()))?;
+                    let task = runtime.show_task(session_id, task_id)?;
+                    print_task_projection(&task);
+                    Ok(())
+                }
+                other => Err(HarnessError::new(format!("unknown task action: {other}"))),
+            }
         }
         "verify-command" => {
             let session_id = args
@@ -418,6 +475,123 @@ fn print_projection(projection: &SessionProjection) {
     println!("status={}", projection.status.as_str());
     println!("repo_path={}", projection.repo_path);
     println!("event_count={}", projection.event_count);
+}
+
+fn print_task_list(tasks: &[TaskProjection]) {
+    println!("task_count={}", tasks.len());
+    println!(
+        "task_ids={}",
+        tasks
+            .iter()
+            .map(|task| task.task_id.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    for (index, task) in tasks.iter().enumerate() {
+        println!("task_{index}_id={}", task.task_id);
+        println!("task_{index}_status={}", task.status);
+        println!("task_{index}_repo_path={}", task.repo_path);
+        println!("task_{index}_input={}", task.input);
+        println!("task_{index}_worker_lane_kind={}", task.worker_lane_kind);
+    }
+}
+
+fn print_task_projection(task: &TaskProjection) {
+    println!("session_id={}", task.session_id);
+    println!("task_id={}", task.task_id);
+    println!("task_status={}", task.status);
+    println!("task_repo_path={}", task.repo_path);
+    println!("task_input={}", task.input);
+    println!("task_worker_lane_kind={}", task.worker_lane_kind);
+    println!("task_context_max_bytes={}", task.context_budget.max_bytes);
+    println!("task_context_max_files={}", task.context_budget.max_files);
+    println!(
+        "task_context_max_skill_files={}",
+        task.context_budget.max_skill_files
+    );
+    println!("task_focus_terms={}", task.focus_terms.join(","));
+    println!("task_max_output_tokens={}", task.max_output_tokens);
+
+    if let Some(worktree) = &task.worktree {
+        println!("task_worktree_lane_id={}", worktree.lane_id);
+        println!("task_worktree_lane_kind={}", worktree.lane_kind);
+        println!("task_worktree_path={}", worktree.worktree_path);
+        println!("task_worktree_base_ref={}", worktree.base_ref);
+    } else {
+        println!("task_worktree_lane_id=");
+        println!("task_worktree_lane_kind=");
+        println!("task_worktree_path=");
+        println!("task_worktree_base_ref=");
+    }
+
+    if let Some(worker_output) = &task.worker_output {
+        println!("task_worker_lane_id={}", worker_output.lane_id);
+        println!("task_worker_lane_kind={}", worker_output.lane_kind);
+        println!("task_worker_status={}", worker_output.status);
+        println!(
+            "task_worker_exit_code={}",
+            worker_output
+                .exit_code
+                .map_or_else(String::new, |exit_code| exit_code.to_string())
+        );
+        println!("task_worker_stdout={}", worker_output.stdout);
+        println!("task_worker_stderr={}", worker_output.stderr);
+        println!("task_worker_duration_ms={}", worker_output.duration_ms);
+    } else {
+        println!("task_worker_lane_id=");
+        println!("task_worker_lane_kind=");
+        println!("task_worker_status=");
+        println!("task_worker_exit_code=");
+        println!("task_worker_stdout=");
+        println!("task_worker_stderr=");
+        println!("task_worker_duration_ms=");
+    }
+
+    if let Some(diff) = &task.diff {
+        println!("task_diff_files_changed={}", diff.files_changed);
+        println!("task_diff_insertions={}", diff.insertions);
+        println!("task_diff_deletions={}", diff.deletions);
+        println!("task_diff_paths={}", diff.paths.join(","));
+    } else {
+        println!("task_diff_files_changed=");
+        println!("task_diff_insertions=");
+        println!("task_diff_deletions=");
+        println!("task_diff_paths=");
+    }
+
+    if let Some(approval) = &task.approval {
+        println!("task_approval_state={}", approval.state);
+        println!("task_approval_summary={}", approval.summary);
+        println!(
+            "task_approval_rejection_reason={}",
+            approval.rejection_reason.as_deref().unwrap_or("")
+        );
+    } else {
+        println!("task_approval_state=");
+        println!("task_approval_summary=");
+        println!("task_approval_rejection_reason=");
+    }
+
+    if let Some(commit) = &task.commit {
+        println!("task_commit_state={}", commit.state);
+        println!("task_commit_message={}", commit.message);
+        println!(
+            "task_commit_sha={}",
+            commit.commit_sha.as_deref().unwrap_or("")
+        );
+        println!(
+            "task_commit_failure_reason={}",
+            commit.failure_reason.as_deref().unwrap_or("")
+        );
+    } else {
+        println!("task_commit_state=");
+        println!("task_commit_message=");
+        println!("task_commit_sha=");
+        println!("task_commit_failure_reason=");
+    }
+
+    println!("event_count={}", task.event_count);
 }
 
 fn print_verification_result(result: &VerificationCommandResult) {

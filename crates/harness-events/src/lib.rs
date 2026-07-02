@@ -6,6 +6,7 @@ use uuid::Uuid;
 pub const EVENTLOG_SCHEMA_VERSION: u16 = 1;
 
 pub const SESSION_STARTED_EVENT: &str = "session.started";
+pub const TASK_CREATED_EVENT: &str = "task.created";
 pub const TOOL_CALL_INTENDED_EVENT: &str = "tool.call_intended";
 pub const POLICY_DECIDED_EVENT: &str = "policy.decided";
 pub const TOOL_OBSERVATION_RECORDED_EVENT: &str = "tool.observation_recorded";
@@ -31,6 +32,7 @@ pub const WORKER_LANE_OBSERVATION_RECORDED_EVENT: &str = "worker_lane.observatio
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventType {
     SessionStarted,
+    TaskCreated,
     ToolCallIntended,
     PolicyDecided,
     ToolObservationRecorded,
@@ -59,6 +61,7 @@ impl EventType {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::SessionStarted => SESSION_STARTED_EVENT,
+            Self::TaskCreated => TASK_CREATED_EVENT,
             Self::ToolCallIntended => TOOL_CALL_INTENDED_EVENT,
             Self::PolicyDecided => POLICY_DECIDED_EVENT,
             Self::ToolObservationRecorded => TOOL_OBSERVATION_RECORDED_EVENT,
@@ -86,6 +89,7 @@ impl EventType {
     pub fn parse(value: &str) -> HarnessResult<Self> {
         match value {
             SESSION_STARTED_EVENT => Ok(Self::SessionStarted),
+            TASK_CREATED_EVENT => Ok(Self::TaskCreated),
             TOOL_CALL_INTENDED_EVENT => Ok(Self::ToolCallIntended),
             POLICY_DECIDED_EVENT => Ok(Self::PolicyDecided),
             TOOL_OBSERVATION_RECORDED_EVENT => Ok(Self::ToolObservationRecorded),
@@ -122,6 +126,50 @@ impl SessionStartedPayload {
     pub fn new(repo_path: impl Into<String>) -> Self {
         Self {
             repo_path: repo_path.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCreatedPayload {
+    pub task_id: Uuid,
+    pub repo_path: String,
+    pub input: String,
+    pub status: String,
+    pub worker_lane_kind: String,
+    pub max_context_bytes: usize,
+    pub max_context_files: usize,
+    pub max_context_skill_files: usize,
+    pub focus_terms: Vec<String>,
+    pub max_output_tokens: usize,
+}
+
+impl TaskCreatedPayload {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        task_id: Uuid,
+        repo_path: impl Into<String>,
+        input: impl Into<String>,
+        status: impl Into<String>,
+        worker_lane_kind: impl Into<String>,
+        max_context_bytes: usize,
+        max_context_files: usize,
+        max_context_skill_files: usize,
+        focus_terms: Vec<String>,
+        max_output_tokens: usize,
+    ) -> Self {
+        Self {
+            task_id,
+            repo_path: repo_path.into(),
+            input: input.into(),
+            status: status.into(),
+            worker_lane_kind: worker_lane_kind.into(),
+            max_context_bytes,
+            max_context_files,
+            max_context_skill_files,
+            focus_terms,
+            max_output_tokens,
         }
     }
 }
@@ -398,6 +446,8 @@ impl ModelDecisionPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffSummaryPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Uuid>,
     pub files_changed: usize,
     pub insertions: usize,
     pub deletions: usize,
@@ -415,6 +465,7 @@ impl DiffSummaryPayload {
         paths: Vec<String>,
     ) -> Self {
         Self {
+            task_id: None,
             files_changed,
             insertions,
             deletions,
@@ -434,10 +485,18 @@ impl DiffSummaryPayload {
         self.git_diff = git_diff.into();
         self
     }
+
+    #[must_use]
+    pub const fn with_task_id(mut self, task_id: Uuid) -> Self {
+        self.task_id = Some(task_id);
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitApprovalPendingPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Uuid>,
     pub state: String,
     pub summary: String,
 }
@@ -446,14 +505,23 @@ impl CommitApprovalPendingPayload {
     #[must_use]
     pub fn new(state: impl Into<String>, summary: impl Into<String>) -> Self {
         Self {
+            task_id: None,
             state: state.into(),
             summary: summary.into(),
         }
+    }
+
+    #[must_use]
+    pub const fn with_task_id(mut self, task_id: Uuid) -> Self {
+        self.task_id = Some(task_id);
+        self
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitApprovalDecisionPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Uuid>,
     pub state: String,
     pub reason: String,
     pub actor: String,
@@ -467,15 +535,24 @@ impl CommitApprovalDecisionPayload {
         actor: impl Into<String>,
     ) -> Self {
         Self {
+            task_id: None,
             state: state.into(),
             reason: reason.into(),
             actor: actor.into(),
         }
     }
+
+    #[must_use]
+    pub const fn with_task_id(mut self, task_id: Uuid) -> Self {
+        self.task_id = Some(task_id);
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitHandoffPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Uuid>,
     pub state: String,
     pub repo_path: String,
     pub message: String,
@@ -492,6 +569,7 @@ impl CommitHandoffPayload {
         actor: impl Into<String>,
     ) -> Self {
         Self {
+            task_id: None,
             state: "committing".to_owned(),
             repo_path: repo_path.into(),
             message: message.into(),
@@ -509,6 +587,7 @@ impl CommitHandoffPayload {
         commit_sha: impl Into<String>,
     ) -> Self {
         Self {
+            task_id: None,
             state: "committed".to_owned(),
             repo_path: repo_path.into(),
             message: message.into(),
@@ -526,6 +605,7 @@ impl CommitHandoffPayload {
         failure_reason: impl Into<String>,
     ) -> Self {
         Self {
+            task_id: None,
             state: "commit_failed".to_owned(),
             repo_path: repo_path.into(),
             message: message.into(),
@@ -533,6 +613,12 @@ impl CommitHandoffPayload {
             commit_sha: None,
             failure_reason: Some(failure_reason.into()),
         }
+    }
+
+    #[must_use]
+    pub const fn with_task_id(mut self, task_id: Uuid) -> Self {
+        self.task_id = Some(task_id);
+        self
     }
 }
 
@@ -652,6 +738,8 @@ impl WorkerLaneBudgetPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerLaneRequestPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Uuid>,
     pub lane_id: String,
     pub lane_kind: String,
     pub task: String,
@@ -664,6 +752,8 @@ pub struct WorkerLaneRequestPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerLaneStatePayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Uuid>,
     pub lane_id: String,
     pub lane_kind: String,
     pub from_state: Option<String>,
@@ -681,6 +771,7 @@ impl WorkerLaneStatePayload {
         reason: impl Into<String>,
     ) -> Self {
         Self {
+            task_id: None,
             lane_id: lane_id.into(),
             lane_kind: lane_kind.into(),
             from_state,
@@ -688,10 +779,18 @@ impl WorkerLaneStatePayload {
             reason: reason.into(),
         }
     }
+
+    #[must_use]
+    pub const fn with_task_id(mut self, task_id: Uuid) -> Self {
+        self.task_id = Some(task_id);
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerLaneWorktreeAllocatedPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Uuid>,
     pub lane_id: String,
     pub lane_kind: String,
     pub session_repo_path: String,
@@ -709,6 +808,7 @@ impl WorkerLaneWorktreeAllocatedPayload {
         base_ref: impl Into<String>,
     ) -> Self {
         Self {
+            task_id: None,
             lane_id: lane_id.into(),
             lane_kind: lane_kind.into(),
             session_repo_path: session_repo_path.into(),
@@ -716,10 +816,18 @@ impl WorkerLaneWorktreeAllocatedPayload {
             base_ref: base_ref.into(),
         }
     }
+
+    #[must_use]
+    pub const fn with_task_id(mut self, task_id: Uuid) -> Self {
+        self.task_id = Some(task_id);
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerLaneObservationPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Uuid>,
     pub lane_id: String,
     pub lane_kind: String,
     pub status: String,
@@ -754,6 +862,10 @@ impl NewEvent {
             payload: serde_json::to_value(payload)
                 .map_err(|error| HarnessError::new(error.to_string()))?,
         })
+    }
+
+    pub fn task_created(session_id: Uuid, payload: TaskCreatedPayload) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::TaskCreated, payload)
     }
 
     pub fn tool_call_intended(
@@ -967,6 +1079,38 @@ mod tests {
     }
 
     #[test]
+    fn task_created_event_serializes_first_class_task_metadata() {
+        let session_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let event = NewEvent::task_created(
+            session_id,
+            TaskCreatedPayload::new(
+                task_id,
+                "C:/repo",
+                "draft a patch",
+                "created",
+                "codex_cli_worker_lane",
+                4096,
+                8,
+                2,
+                vec!["agent".to_owned()],
+                256,
+            ),
+        )
+        .expect("task created event");
+
+        assert_eq!(event.event_type.as_str(), "task.created");
+        assert_eq!(event.payload["task_id"], task_id.to_string());
+        assert_eq!(event.payload["repo_path"], "C:/repo");
+        assert_eq!(event.payload["input"], "draft a patch");
+        assert_eq!(event.payload["status"], "created");
+        assert_eq!(event.payload["worker_lane_kind"], "codex_cli_worker_lane");
+        assert_eq!(event.payload["max_context_bytes"], 4096);
+        assert_eq!(event.payload["focus_terms"][0], "agent");
+        assert_eq!(event.payload["max_output_tokens"], 256);
+    }
+
+    #[test]
     fn tool_events_serialize_policy_and_observation_payloads() {
         let session_id = Uuid::new_v4();
         let intent = NewEvent::tool_call_intended(
@@ -1123,6 +1267,7 @@ mod tests {
         .expect("commit failed event");
 
         assert_eq!(diff.event_type.as_str(), "diff.recorded");
+        assert!(diff.payload.get("task_id").is_none());
         assert_eq!(diff.payload["files_changed"], 1);
         assert_eq!(diff.payload["paths"][0], ".harness/fake-agent-turn.md");
         assert_eq!(pending.event_type.as_str(), "commit.approval_pending");
@@ -1198,6 +1343,7 @@ mod tests {
         let requested = NewEvent::worker_lane_requested(
             session_id,
             WorkerLaneRequestPayload {
+                task_id: None,
                 lane_id: "lane-1".to_owned(),
                 lane_kind: "codex_cli".to_owned(),
                 task: "draft a patch".to_owned(),
@@ -1234,6 +1380,7 @@ mod tests {
         let observation = NewEvent::worker_lane_observation_recorded(
             session_id,
             WorkerLaneObservationPayload {
+                task_id: None,
                 lane_id: "lane-1".to_owned(),
                 lane_kind: "codex_cli".to_owned(),
                 status: "succeeded".to_owned(),
@@ -1249,6 +1396,7 @@ mod tests {
         .expect("worker lane observation event");
 
         assert_eq!(requested.event_type.as_str(), "worker_lane.requested");
+        assert!(requested.payload.get("task_id").is_none());
         assert_eq!(requested.payload["task"], "draft a patch");
         assert_eq!(requested.payload["budget"]["max_output_tokens"], 2_048);
         assert_eq!(running.event_type.as_str(), "worker_lane.state_changed");

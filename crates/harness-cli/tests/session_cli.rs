@@ -74,6 +74,136 @@ fn cli_starts_and_shows_session_from_postgres_eventlog() -> Result<(), Box<dyn s
 }
 
 #[test]
+fn cli_creates_lists_and_shows_session_tasks() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+
+    let migrate = Command::new(bin)
+        .args(["migrate", "--database-url", &database_url])
+        .output()?;
+    assert!(migrate.status.success());
+
+    let repo_path = std::env::current_dir()?.display().to_string();
+    let start = Command::new(bin)
+        .args([
+            "session",
+            "start",
+            "--repo",
+            &repo_path,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(start.status.success());
+
+    let start_stdout = String::from_utf8(start.stdout)?;
+    let session_id = value_for_key(&start_stdout, "session_id").expect("session_id output");
+
+    let first = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "create",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task",
+            "write the first CLI task",
+            "--max-bytes",
+            "4096",
+            "--max-files",
+            "8",
+            "--max-skill-files",
+            "2",
+            "--focus",
+            "agent",
+            "--focus",
+            "task",
+            "--max-output-tokens",
+            "384",
+        ])
+        .output()?;
+    assert!(first.status.success());
+
+    let first_stdout = String::from_utf8(first.stdout)?;
+    let first_task_id = value_for_key(&first_stdout, "task_id").expect("task_id output");
+    assert!(first_stdout.contains("task_status=created"));
+    assert!(first_stdout.contains("task_input=write the first CLI task"));
+    assert!(first_stdout.contains("task_worker_lane_kind=codex_cli_worker_lane"));
+    assert!(first_stdout.contains("task_context_max_bytes=4096"));
+    assert!(first_stdout.contains("task_context_max_files=8"));
+    assert!(first_stdout.contains("task_context_max_skill_files=2"));
+    assert!(first_stdout.contains("task_focus_terms=agent,task"));
+    assert!(first_stdout.contains("task_max_output_tokens=384"));
+    assert!(first_stdout.contains("task_worktree_path="));
+    assert!(first_stdout.contains("task_approval_state="));
+    assert!(first_stdout.contains("event_count=2"));
+
+    let second = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "create",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task",
+            "write the second CLI task",
+        ])
+        .output()?;
+    assert!(second.status.success());
+
+    let second_stdout = String::from_utf8(second.stdout)?;
+    let second_task_id = value_for_key(&second_stdout, "task_id").expect("second task_id output");
+    assert_ne!(first_task_id, second_task_id);
+
+    let list = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "list",
+            session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(list.status.success());
+
+    let list_stdout = String::from_utf8(list.stdout)?;
+    assert!(list_stdout.contains("task_count=2"));
+    assert!(list_stdout.contains(&format!("task_ids={first_task_id},{second_task_id}")));
+    assert!(list_stdout.contains(&format!("task_0_id={first_task_id}")));
+    assert!(list_stdout.contains("task_0_status=created"));
+    assert!(list_stdout.contains("task_0_input=write the first CLI task"));
+    assert!(list_stdout.contains(&format!("task_1_id={second_task_id}")));
+    assert!(list_stdout.contains("task_1_input=write the second CLI task"));
+
+    let show = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "show",
+            session_id,
+            first_task_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(show.status.success());
+
+    let show_stdout = String::from_utf8(show.stdout)?;
+    assert!(show_stdout.contains(&format!("task_id={first_task_id}")));
+    assert!(show_stdout.contains("task_status=created"));
+    assert!(show_stdout.contains("task_input=write the first CLI task"));
+    assert!(show_stdout.contains("event_count=3"));
+
+    Ok(())
+}
+
+#[test]
 fn cli_codex_acceptance_reports_explicit_skip_when_unavailable()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
