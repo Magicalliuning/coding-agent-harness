@@ -314,6 +314,204 @@ fn small_coding_task_stops_at_pending_commit_approval() -> Result<(), Box<dyn st
 }
 
 #[test]
+fn pending_approval_projection_shows_pending_diff() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = fixture_repo()?;
+    write_file(&repo, "AGENTS.md", "Use deterministic agent fixtures.")?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo.display().to_string()))?;
+
+    runtime.run_small_coding_task(
+        started.session_id,
+        SmallCodingTaskRequest {
+            task: "write the approval projection fake patch".to_owned(),
+            context: SessionContextCompileRequest {
+                budget: ContextBudget {
+                    max_bytes: 4096,
+                    max_files: 8,
+                    max_skill_files: 8,
+                },
+                focus_terms: vec!["agent".to_owned()],
+            },
+            max_output_tokens: 256,
+            verification: VerificationCommandRequest::new("cargo", vec!["--version".to_owned()]),
+        },
+    )?;
+
+    let approval = runtime.show_approval(started.session_id)?;
+
+    assert_eq!(approval.state, PENDING_COMMIT_APPROVAL_STATE);
+    assert_eq!(approval.diff.files_changed, 1);
+    assert_eq!(approval.diff.paths, vec![".harness/fake-agent-turn.md"]);
+    assert_eq!(
+        approval.summary,
+        "verification passed; awaiting human commit approval"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn approving_pending_diff_records_approved_projection() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let session_id = pending_approval_session(&mut runtime)?;
+
+    let approval = runtime.approve_pending_diff(session_id)?;
+    let events = runtime.events_for_session(session_id)?;
+
+    assert_eq!(approval.state, "approved");
+    assert_eq!(approval.rejection_reason, None);
+    assert_eq!(approval.event_count, events.len());
+    assert_eq!(
+        events.last().expect("last event").event_type,
+        EventType::CommitApproved
+    );
+    assert_eq!(
+        events.last().expect("last event").payload["actor"],
+        "runtime"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn rejecting_pending_diff_records_reason_projection() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let session_id = pending_approval_session(&mut runtime)?;
+
+    let approval = runtime.reject_pending_diff(session_id, "not the intended change")?;
+    let events = runtime.events_for_session(session_id)?;
+
+    assert_eq!(approval.state, "rejected");
+    assert_eq!(
+        approval.rejection_reason.as_deref(),
+        Some("not the intended change")
+    );
+    assert_eq!(approval.event_count, events.len());
+    assert_eq!(
+        events.last().expect("last event").event_type,
+        EventType::CommitRejected
+    );
+    assert_eq!(
+        events.last().expect("last event").payload["reason"],
+        "not the intended change"
+    );
+    assert_eq!(
+        events.last().expect("last event").payload["actor"],
+        "runtime"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn invalid_or_duplicate_approval_actions_do_not_corrupt_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let session_id = pending_approval_session(&mut runtime)?;
+
+    let blank_rejection = runtime
+        .reject_pending_diff(session_id, "  ")
+        .expect_err("blank rejection reason should fail");
+    let event_count_before_approval = runtime.events_for_session(session_id)?.len();
+    assert!(
+        blank_rejection
+            .to_string()
+            .contains("rejection reason is required")
+    );
+
+    runtime.approve_pending_diff(session_id)?;
+    let event_count_after_approval = runtime.events_for_session(session_id)?.len();
+
+    let duplicate_approval = runtime
+        .approve_pending_diff(session_id)
+        .expect_err("duplicate approval should fail");
+    let rejected_after_approval = runtime
+        .reject_pending_diff(session_id, "too late")
+        .expect_err("reject after approval should fail");
+    let approval = runtime.show_approval(session_id)?;
+    let final_event_count = runtime.events_for_session(session_id)?.len();
+
+    assert_eq!(event_count_after_approval, event_count_before_approval + 1);
+    assert!(duplicate_approval.to_string().contains("already approved"));
+    assert!(
+        rejected_after_approval
+            .to_string()
+            .contains("already approved")
+    );
+    assert_eq!(approval.state, "approved");
+    assert_eq!(final_event_count, event_count_after_approval);
+
+    Ok(())
+}
+
+#[test]
+fn approval_actions_require_recorded_pending_diff() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = fixture_repo()?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo.display().to_string()))?;
+
+    let show_error = runtime
+        .show_approval(started.session_id)
+        .expect_err("missing pending approval should fail");
+    let approve_error = runtime
+        .approve_pending_diff(started.session_id)
+        .expect_err("missing pending approval should not approve");
+    let reject_error = runtime
+        .reject_pending_diff(started.session_id, "no diff")
+        .expect_err("missing pending approval should not reject");
+    let events = runtime.events_for_session(started.session_id)?;
+
+    assert!(
+        show_error
+            .to_string()
+            .contains("pending diff was not recorded")
+    );
+    assert!(
+        approve_error
+            .to_string()
+            .contains("pending diff was not recorded")
+    );
+    assert!(
+        reject_error
+            .to_string()
+            .contains("pending diff was not recorded")
+    );
+    assert_eq!(events.len(), 1);
+
+    Ok(())
+}
+
+#[test]
 fn self_recovery_fixture_records_initial_failure() -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
         return Ok(());
@@ -1118,6 +1316,31 @@ fn git_fixture_repo_with_files(
         ],
     )?;
     Ok(repo)
+}
+
+fn pending_approval_session(runtime: &mut Runtime) -> Result<Uuid, Box<dyn std::error::Error>> {
+    let repo = fixture_repo()?;
+    write_file(&repo, "AGENTS.md", "Use deterministic agent fixtures.")?;
+    let started = runtime.start_session(StartSessionRequest::new(repo.display().to_string()))?;
+
+    runtime.run_small_coding_task(
+        started.session_id,
+        SmallCodingTaskRequest {
+            task: "write the approval state fake patch".to_owned(),
+            context: SessionContextCompileRequest {
+                budget: ContextBudget {
+                    max_bytes: 4096,
+                    max_files: 8,
+                    max_skill_files: 8,
+                },
+                focus_terms: vec!["agent".to_owned()],
+            },
+            max_output_tokens: 256,
+            verification: VerificationCommandRequest::new("cargo", vec!["--version".to_owned()]),
+        },
+    )?;
+
+    Ok(started.session_id)
 }
 
 fn fake_runner_command(script_name: &str) -> CodexWorkerSubprocess {

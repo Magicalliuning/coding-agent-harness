@@ -7,13 +7,14 @@ use harness_context::{CompiledContextBundle, ContextCompileRequest, compile_repo
 use harness_core::{HarnessError, HarnessResult};
 use harness_db::PostgresEventStore;
 use harness_events::{
-    CommitApprovalPendingPayload, ContextCompiledPayload, ContextSourcePayload, DiffSummaryPayload,
-    EventEnvelope, EventType, FilePatchIntentPayload, FilePatchObservationPayload,
-    FilePatchPayload, ModelDecisionPayload, ModelRequestPayload, NewEvent, PolicyDecisionPayload,
-    RecoveryFailurePayload, RecoveryPlanPayload, RecoveryRepairAttemptPayload,
-    RecoveryStoppedPayload, SessionStartedPayload, SkillMetadataPayload, ToolCallIntentPayload,
-    ToolObservationPayload, WorkerLaneBudgetPayload, WorkerLaneObservationPayload,
-    WorkerLaneRequestPayload, WorkerLaneStatePayload, WorkerLaneWorktreeAllocatedPayload,
+    CommitApprovalDecisionPayload, CommitApprovalPendingPayload, ContextCompiledPayload,
+    ContextSourcePayload, DiffSummaryPayload, EventEnvelope, EventType, FilePatchIntentPayload,
+    FilePatchObservationPayload, FilePatchPayload, ModelDecisionPayload, ModelRequestPayload,
+    NewEvent, PolicyDecisionPayload, RecoveryFailurePayload, RecoveryPlanPayload,
+    RecoveryRepairAttemptPayload, RecoveryStoppedPayload, SessionStartedPayload,
+    SkillMetadataPayload, ToolCallIntentPayload, ToolObservationPayload, WorkerLaneBudgetPayload,
+    WorkerLaneObservationPayload, WorkerLaneRequestPayload, WorkerLaneStatePayload,
+    WorkerLaneWorktreeAllocatedPayload,
 };
 use harness_models::{DeterministicFakeModelProvider, FakeModelRequest, FilePatchProposal};
 use harness_policy::{
@@ -32,6 +33,8 @@ use harness_tools::{
 use uuid::Uuid;
 
 pub const PENDING_COMMIT_APPROVAL_STATE: &str = "pending_commit_approval";
+pub const COMMIT_APPROVED_STATE: &str = "approved";
+pub const COMMIT_REJECTED_STATE: &str = "rejected";
 pub const RECOVERY_FAILED_STATE: &str = "recovery_failed";
 pub const SELF_RECOVERY_MAX_ROUNDS: usize = 2;
 pub const DEFAULT_CODEX_CLI_PROGRAM: &str = "codex";
@@ -172,6 +175,34 @@ pub struct DiffSummary {
     pub insertions: usize,
     pub deletions: usize,
     pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalState {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+impl ApprovalState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => PENDING_COMMIT_APPROVAL_STATE,
+            Self::Approved => COMMIT_APPROVED_STATE,
+            Self::Rejected => COMMIT_REJECTED_STATE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalProjection {
+    pub session_id: Uuid,
+    pub state: String,
+    pub diff: DiffSummary,
+    pub summary: String,
+    pub rejection_reason: Option<String>,
+    pub event_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -463,6 +494,59 @@ impl Runtime {
 
     pub fn events_for_session(&self, session_id: Uuid) -> HarnessResult<Vec<EventEnvelope>> {
         self.event_store.events_for_session(session_id)
+    }
+
+    pub fn show_approval(&self, session_id: Uuid) -> HarnessResult<ApprovalProjection> {
+        let events = self.event_store.events_for_session(session_id)?;
+
+        approval_projection_from_events(session_id, &events)
+    }
+
+    pub fn approve_pending_diff(&mut self, session_id: Uuid) -> HarnessResult<ApprovalProjection> {
+        let projection = self.show_approval(session_id)?;
+        if projection.state != PENDING_COMMIT_APPROVAL_STATE {
+            return Err(HarnessError::new(format!(
+                "pending diff is already {}",
+                projection.state
+            )));
+        }
+
+        self.event_store.append_event(NewEvent::commit_approved(
+            session_id,
+            CommitApprovalDecisionPayload::new(
+                COMMIT_APPROVED_STATE,
+                "approved by runtime approval state machine",
+                "runtime",
+            ),
+        )?)?;
+
+        self.show_approval(session_id)
+    }
+
+    pub fn reject_pending_diff(
+        &mut self,
+        session_id: Uuid,
+        reason: impl Into<String>,
+    ) -> HarnessResult<ApprovalProjection> {
+        let reason = reason.into();
+        if reason.trim().is_empty() {
+            return Err(HarnessError::new("rejection reason is required"));
+        }
+
+        let projection = self.show_approval(session_id)?;
+        if projection.state != PENDING_COMMIT_APPROVAL_STATE {
+            return Err(HarnessError::new(format!(
+                "pending diff is already {}",
+                projection.state
+            )));
+        }
+
+        self.event_store.append_event(NewEvent::commit_rejected(
+            session_id,
+            CommitApprovalDecisionPayload::new(COMMIT_REJECTED_STATE, reason.trim(), "runtime"),
+        )?)?;
+
+        self.show_approval(session_id)
     }
 
     pub fn run_verification_command(
@@ -1411,6 +1495,102 @@ fn diff_summary_from_patch(patch: &FilePatchProposal) -> DiffSummary {
         deletions: patch.expected_content.as_deref().map_or(0, line_count),
         paths: vec![patch.path.clone()],
     }
+}
+
+fn approval_projection_from_events(
+    session_id: Uuid,
+    events: &[EventEnvelope],
+) -> HarnessResult<ApprovalProjection> {
+    let mut diff = None;
+    let mut state = None;
+    let mut summary = String::new();
+    let mut rejection_reason = None;
+
+    for event in events {
+        match event.event_type {
+            EventType::DiffRecorded => {
+                diff = Some(diff_summary_from_payload(&event.payload)?);
+            }
+            EventType::CommitApprovalPending => {
+                state = Some(ApprovalState::Pending);
+                summary = event
+                    .payload
+                    .get("summary")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                rejection_reason = None;
+            }
+            EventType::CommitApproved => {
+                state = Some(ApprovalState::Approved);
+                summary = event
+                    .payload
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                rejection_reason = None;
+            }
+            EventType::CommitRejected => {
+                state = Some(ApprovalState::Rejected);
+                let reason = event
+                    .payload
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                summary = reason.clone();
+                rejection_reason = Some(reason);
+            }
+            _ => {}
+        }
+    }
+
+    let diff = diff.ok_or_else(|| HarnessError::new("pending diff was not recorded"))?;
+    let state = state.ok_or_else(|| HarnessError::new("approval state was not recorded"))?;
+
+    Ok(ApprovalProjection {
+        session_id,
+        state: state.as_str().to_owned(),
+        diff,
+        summary,
+        rejection_reason,
+        event_count: events.len(),
+    })
+}
+
+fn diff_summary_from_payload(payload: &serde_json::Value) -> HarnessResult<DiffSummary> {
+    let files_changed = payload_usize(payload, "files_changed")?;
+    let insertions = payload_usize(payload, "insertions")?;
+    let deletions = payload_usize(payload, "deletions")?;
+    let paths = payload
+        .get("paths")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| HarnessError::new("diff paths are missing"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| HarnessError::new("diff path is not a string"))
+        })
+        .collect::<HarnessResult<Vec<_>>>()?;
+
+    Ok(DiffSummary {
+        files_changed,
+        insertions,
+        deletions,
+        paths,
+    })
+}
+
+fn payload_usize(payload: &serde_json::Value, key: &str) -> HarnessResult<usize> {
+    let value = payload
+        .get(key)
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| HarnessError::new(format!("diff {key} is missing")))?;
+
+    usize::try_from(value).map_err(|_| HarnessError::new(format!("diff {key} is out of range")))
 }
 
 #[must_use]
