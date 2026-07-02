@@ -7,6 +7,92 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 #[test]
+fn cli_reports_architecture_data_flow_and_storage_text_and_json()
+-> Result<(), Box<dyn std::error::Error>> {
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+
+    let architecture = Command::new(bin)
+        .args(["report", "architecture"])
+        .output()?;
+    assert!(architecture.status.success());
+    let architecture_stdout = String::from_utf8(architecture.stdout)?;
+    assert!(architecture_stdout.contains("report_id=runtime_architecture"));
+    assert!(architecture_stdout.contains("node_count="));
+    assert!(architecture_stdout.contains("node_1_id=runtime"));
+    assert!(architecture_stdout.contains("node_2_id=policy_gate"));
+    assert!(architecture_stdout.contains("boundary_adrs=ADR-0001,ADR-0002,ADR-0004,ADR-0007"));
+    assert!(architecture_stdout.contains("non_goal_0_id=web_ui"));
+
+    let architecture_json = Command::new(bin)
+        .args(["report", "architecture", "--json"])
+        .output()?;
+    assert!(architecture_json.status.success());
+    let architecture_json_stdout = String::from_utf8(architecture_json.stdout)?;
+    let architecture: Value = serde_json::from_str(&architecture_json_stdout)?;
+    assert_eq!(architecture["report_id"], "runtime_architecture");
+    assert!(
+        architecture["nodes"]
+            .as_array()
+            .expect("architecture nodes")
+            .iter()
+            .any(|node| node["id"] == "local_governed_codex_cli_worker")
+    );
+    assert!(
+        architecture["non_goals"]
+            .as_array()
+            .expect("architecture non-goals")
+            .iter()
+            .any(|non_goal| non_goal["id"] == "replace_eventlog")
+    );
+
+    let data_flow = Command::new(bin).args(["report", "data-flow"]).output()?;
+    assert!(data_flow.status.success());
+    let data_flow_stdout = String::from_utf8(data_flow.stdout)?;
+    assert!(data_flow_stdout.contains("report_id=runtime_data_flow"));
+    assert!(data_flow_stdout.contains("step_0_id=task_creation"));
+    assert!(data_flow_stdout.contains("step_5_id=policy_decision"));
+    assert!(data_flow_stdout.contains("step_12_event_types=commit.succeeded,commit.failed"));
+
+    let data_flow_json = Command::new(bin)
+        .args(["report", "data-flow", "--json"])
+        .output()?;
+    assert!(data_flow_json.status.success());
+    let data_flow_json_stdout = String::from_utf8(data_flow_json.stdout)?;
+    let data_flow: Value = serde_json::from_str(&data_flow_json_stdout)?;
+    assert_eq!(data_flow["projection_kind"], "runtime_data_flow_report");
+    assert_eq!(data_flow["steps"][0]["id"], "task_creation");
+    assert_eq!(data_flow["steps"][5]["component_id"], "policy_gate");
+    assert_eq!(data_flow["steps"][12]["event_types"][1], "commit.failed");
+
+    let storage = Command::new(bin).args(["report", "storage"]).output()?;
+    assert!(storage.status.success());
+    let storage_stdout = String::from_utf8(storage.stdout)?;
+    assert!(storage_stdout.contains("report_id=runtime_storage"));
+    assert!(storage_stdout.contains("table_0_name=harness_runtime.event_log"));
+    assert!(storage_stdout.contains("table_1_name=harness_runtime.task_queue"));
+    assert!(storage_stdout.contains("projection_0_id=session_projection"));
+
+    let storage_json = Command::new(bin)
+        .args(["report", "storage", "--json"])
+        .output()?;
+    assert!(storage_json.status.success());
+    let storage_json_stdout = String::from_utf8(storage_json.stdout)?;
+    let storage: Value = serde_json::from_str(&storage_json_stdout)?;
+    assert_eq!(storage["projection_kind"], "runtime_storage_report");
+    assert_eq!(storage["tables"][0]["role"], "append_only_source_of_truth");
+    assert_eq!(storage["tables"][1]["role"], "runtime_scheduling_state");
+    assert!(
+        storage["projections"]
+            .as_array()
+            .expect("storage projections")
+            .iter()
+            .any(|projection| projection["id"] == "approval_commit_projection")
+    );
+
+    Ok(())
+}
+
+#[test]
 fn cli_starts_and_shows_session_from_postgres_eventlog() -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
         return Ok(());
