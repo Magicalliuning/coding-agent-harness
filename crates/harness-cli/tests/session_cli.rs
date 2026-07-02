@@ -571,15 +571,21 @@ fn cli_runs_next_queued_task_through_codex_worker() -> Result<(), Box<dyn std::e
         database_url.clone(),
         "--worker-id".to_owned(),
         "cli-queue-worker".to_owned(),
+        "--timeout-ms".to_owned(),
+        "120000".to_owned(),
         "--max-stdout-bytes".to_owned(),
         "4".to_owned(),
         "--".to_owned(),
     ];
     args.extend(fake_runner_cli_command(script_name));
+    let before_ms = current_time_ms_for_test()?;
     let run = Command::new(bin).args(args).output()?;
     assert!(run.status.success());
 
     let run_stdout = String::from_utf8(run.stdout)?;
+    let lease_deadline_ms: i64 = value_for_key(&run_stdout, "task_lease_deadline_ms")
+        .expect("task lease deadline output")
+        .parse()?;
     assert!(run_stdout.contains("task_leased=true"));
     assert!(run_stdout.contains("worker_final_status=succeeded"));
     assert!(run_stdout.contains("worker_pending_commit_state=pending_commit_approval"));
@@ -589,6 +595,10 @@ fn cli_runs_next_queued_task_through_codex_worker() -> Result<(), Box<dyn std::e
     assert!(run_stdout.contains("task_worker_status=succeeded"));
     assert!(run_stdout.contains("task_diff_paths=README.md"));
     assert!(run_stdout.contains("task_approval_state=pending_commit_approval"));
+    assert!(
+        lease_deadline_ms >= before_ms + 121_000,
+        "lease deadline {lease_deadline_ms} should cover timeout plus margin from {before_ms}"
+    );
     assert_eq!(git_status(&repo)?, "");
 
     Ok(())
@@ -1264,6 +1274,12 @@ fn value_for_key<'a>(output: &'a str, key: &str) -> Option<&'a str> {
     output
         .lines()
         .find_map(|line| line.strip_prefix(&format!("{key}=")))
+}
+
+fn current_time_ms_for_test() -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+    )?)
 }
 
 fn fixture_repo() -> Result<PathBuf, Box<dyn std::error::Error>> {

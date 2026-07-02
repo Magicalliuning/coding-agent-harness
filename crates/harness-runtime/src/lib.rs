@@ -52,6 +52,7 @@ pub const TASK_STOPPED_STATE: &str = "stopped";
 pub const TASK_STOP_REASON_LEASE_EXPIRED: &str = "lease_expired";
 pub const TASK_STOP_REASON_MAX_RETRIES_EXCEEDED: &str = "max_retries_exceeded";
 pub const DEFAULT_TASK_WORKER_LANE_KIND: &str = "codex_cli_worker_lane";
+pub const QUEUED_WORKER_LEASE_TIMEOUT_MARGIN_MS: u64 = 1_000;
 pub const RECOVERY_FAILED_STATE: &str = "recovery_failed";
 pub const SELF_RECOVERY_MAX_ROUNDS: usize = 2;
 pub const DEFAULT_CODEX_CLI_PROGRAM: &str = "codex";
@@ -1836,10 +1837,18 @@ impl Runtime {
         &mut self,
         request: LeasedCodexWorkerTaskRequest,
     ) -> HarnessResult<Option<LeasedCodexWorkerTaskResult>> {
+        if request.lease_duration_ms == 0 {
+            return Err(HarnessError::new("lease duration must be positive"));
+        }
+
+        let lease_duration_ms = effective_queued_worker_lease_duration_ms(
+            request.lease_duration_ms,
+            request.worker.timeout_ms,
+        );
         let Some(leased_task) = self.lease_next_task_for_worker_lane(
             LeaseNextTaskRequest {
                 worker_id: request.worker_id.clone(),
-                lease_duration_ms: request.lease_duration_ms,
+                lease_duration_ms,
             },
             DEFAULT_TASK_WORKER_LANE_KIND,
         )?
@@ -2589,6 +2598,14 @@ fn event_matches_task_scope(event: &EventEnvelope, task_id: Option<Uuid>) -> Har
     payload_task_id(&event.payload).map(|payload_task_id| payload_task_id == task_id)
 }
 
+fn effective_queued_worker_lease_duration_ms(
+    requested_lease_duration_ms: u64,
+    worker_timeout_ms: u64,
+) -> u64 {
+    requested_lease_duration_ms
+        .max(worker_timeout_ms.saturating_add(QUEUED_WORKER_LEASE_TIMEOUT_MARGIN_MS))
+}
+
 fn payload_string(payload: &serde_json::Value, key: &str) -> HarnessResult<String> {
     payload
         .get(key)
@@ -3159,6 +3176,22 @@ mod tests {
         assert!(report.contains("Coding Agent Harness bootstrap"));
         assert!(report.contains("HARNESS_DATABASE_URL"));
         assert!(report.to_ascii_lowercase().contains("eventlog"));
+    }
+
+    #[test]
+    fn queued_worker_lease_duration_covers_worker_timeout() {
+        assert_eq!(
+            effective_queued_worker_lease_duration_ms(60_000, 30_000),
+            60_000
+        );
+        assert_eq!(
+            effective_queued_worker_lease_duration_ms(60_000, 300_000),
+            301_000
+        );
+        assert_eq!(
+            effective_queued_worker_lease_duration_ms(u64::MAX, 300_000),
+            u64::MAX
+        );
     }
 
     #[test]
