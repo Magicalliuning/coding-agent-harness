@@ -316,6 +316,91 @@ fn cli_coding_task_stops_pending_commit_approval() -> Result<(), Box<dyn std::er
 }
 
 #[test]
+fn cli_approval_show_approve_rejects_pending_diff() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+
+    let migrate = Command::new(bin)
+        .args(["migrate", "--database-url", &database_url])
+        .output()?;
+    assert!(migrate.status.success());
+
+    let (_approved_repo, approved_session_id) =
+        start_cli_pending_approval(bin, &database_url, "write the approved CLI patch")?;
+
+    let show = Command::new(bin)
+        .args([
+            "session",
+            "approval",
+            "show",
+            &approved_session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(show.status.success());
+
+    let show_stdout = String::from_utf8(show.stdout)?;
+    assert!(show_stdout.contains("approval_state=pending_commit_approval"));
+    assert!(show_stdout.contains("diff_paths=.harness/fake-agent-turn.md"));
+
+    let approve = Command::new(bin)
+        .args([
+            "session",
+            "approval",
+            "approve",
+            &approved_session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(approve.status.success());
+
+    let approve_stdout = String::from_utf8(approve.stdout)?;
+    assert!(approve_stdout.contains("approval_state=approved"));
+    assert!(approve_stdout.contains("approval_rejection_reason="));
+
+    let duplicate_approve = Command::new(bin)
+        .args([
+            "session",
+            "approval",
+            "approve",
+            &approved_session_id,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(!duplicate_approve.status.success());
+    assert!(String::from_utf8(duplicate_approve.stderr)?.contains("already approved"));
+
+    let (_rejected_repo, rejected_session_id) =
+        start_cli_pending_approval(bin, &database_url, "write the rejected CLI patch")?;
+
+    let reject = Command::new(bin)
+        .args([
+            "session",
+            "approval",
+            "reject",
+            &rejected_session_id,
+            "--database-url",
+            &database_url,
+            "--reason",
+            "not the requested change",
+        ])
+        .output()?;
+    assert!(reject.status.success());
+
+    let reject_stdout = String::from_utf8(reject.stdout)?;
+    assert!(reject_stdout.contains("approval_state=rejected"));
+    assert!(reject_stdout.contains("approval_rejection_reason=not the requested change"));
+
+    Ok(())
+}
+
+#[test]
 fn cli_recovers_fixture_task_with_bounded_loop() -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
         return Ok(());
@@ -443,6 +528,55 @@ fn v0_acceptance_fixture_repo() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
     copy_dir(&source, &target)?;
     Ok(target)
+}
+
+fn start_cli_pending_approval(
+    bin: &str,
+    database_url: &str,
+    task: &str,
+) -> Result<(PathBuf, String), Box<dyn std::error::Error>> {
+    let repo = fixture_repo()?;
+    write_file(&repo, "AGENTS.md", "Use deterministic agent fixtures.")?;
+    let repo_path = repo.display().to_string();
+
+    let start = Command::new(bin)
+        .args([
+            "session",
+            "start",
+            "--repo",
+            &repo_path,
+            "--database-url",
+            database_url,
+        ])
+        .output()?;
+    assert!(start.status.success());
+
+    let start_stdout = String::from_utf8(start.stdout)?;
+    let session_id = value_for_key(&start_stdout, "session_id")
+        .expect("session_id output")
+        .to_owned();
+
+    let coding_task = Command::new(bin)
+        .args([
+            "session",
+            "coding-task",
+            &session_id,
+            "--database-url",
+            database_url,
+            "--task",
+            task,
+            "--max-bytes",
+            "4096",
+            "--focus",
+            "agent",
+            "--",
+            "cargo",
+            "--version",
+        ])
+        .output()?;
+    assert!(coding_task.status.success());
+
+    Ok((repo, session_id))
 }
 
 fn workspace_root() -> Result<PathBuf, Box<dyn std::error::Error>> {

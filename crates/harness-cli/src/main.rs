@@ -3,12 +3,13 @@ use std::path::PathBuf;
 
 use harness_core::{HarnessError, HarnessResult};
 use harness_runtime::{
-    CodexCliAcceptanceRequest, CodexCliAcceptanceResult, CodexCliAvailabilityRequest,
-    ContextBudget, DEFAULT_CODEX_CLI_ACCEPTANCE_TASK, DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS,
-    DEFAULT_CODEX_CLI_PROGRAM, FakeModelTurnRequest, FakeModelTurnResult, Runtime,
-    SelfRecoveryLoopRequest, SelfRecoveryLoopResult, SessionContextCompileRequest,
-    SessionContextCompileResult, SessionProjection, SmallCodingTaskRequest, SmallCodingTaskResult,
-    StartSessionRequest, VerificationCommandRequest, VerificationCommandResult,
+    ApprovalProjection, CodexCliAcceptanceRequest, CodexCliAcceptanceResult,
+    CodexCliAvailabilityRequest, ContextBudget, DEFAULT_CODEX_CLI_ACCEPTANCE_TASK,
+    DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS, DEFAULT_CODEX_CLI_PROGRAM, FakeModelTurnRequest,
+    FakeModelTurnResult, Runtime, SelfRecoveryLoopRequest, SelfRecoveryLoopResult,
+    SessionContextCompileRequest, SessionContextCompileResult, SessionProjection,
+    SmallCodingTaskRequest, SmallCodingTaskResult, StartSessionRequest, VerificationCommandRequest,
+    VerificationCommandResult,
 };
 use uuid::Uuid;
 
@@ -231,6 +232,34 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
             )?;
 
             print_self_recovery_loop_result(&result);
+            Ok(())
+        }
+        "approval" => {
+            let action = args
+                .get(1)
+                .ok_or_else(|| HarnessError::new("approval action is required"))?;
+            let session_id = args
+                .get(2)
+                .ok_or_else(|| HarnessError::new("session id is required"))?;
+            let session_id = Uuid::parse_str(session_id)
+                .map_err(|error| HarnessError::new(error.to_string()))?;
+            let database_url = database_url_from_args(args.clone())?;
+            let mut runtime = Runtime::connect_postgres(&database_url)?;
+            let approval = match action.as_str() {
+                "show" => runtime.show_approval(session_id)?,
+                "approve" => runtime.approve_pending_diff(session_id)?,
+                "reject" => {
+                    let reason = required_arg_value(&args, "--reason")?;
+                    runtime.reject_pending_diff(session_id, reason)?
+                }
+                other => {
+                    return Err(HarnessError::new(format!(
+                        "unknown approval action: {other}"
+                    )));
+                }
+            };
+
+            print_approval_projection(&approval);
             Ok(())
         }
         "codex-acceptance" => {
@@ -511,6 +540,21 @@ fn print_self_recovery_loop_result(result: &SelfRecoveryLoopResult) {
     println!("token_max_output={}", result.token_ledger.max_output_tokens);
     println!("final_state={}", result.final_state);
     println!("event_count={}", result.event_count);
+}
+
+fn print_approval_projection(approval: &ApprovalProjection) {
+    println!("session_id={}", approval.session_id);
+    println!("approval_state={}", approval.state);
+    println!("approval_summary={}", approval.summary);
+    println!(
+        "approval_rejection_reason={}",
+        approval.rejection_reason.as_deref().unwrap_or("")
+    );
+    println!("diff_files_changed={}", approval.diff.files_changed);
+    println!("diff_insertions={}", approval.diff.insertions);
+    println!("diff_deletions={}", approval.diff.deletions);
+    println!("diff_paths={}", approval.diff.paths.join(","));
+    println!("event_count={}", approval.event_count);
 }
 
 fn print_codex_cli_acceptance_result(result: &CodexCliAcceptanceResult) {

@@ -14,6 +14,8 @@ pub const MODEL_REQUEST_RECORDED_EVENT: &str = "model.request_recorded";
 pub const MODEL_DECISION_RECORDED_EVENT: &str = "model.decision_recorded";
 pub const DIFF_RECORDED_EVENT: &str = "diff.recorded";
 pub const COMMIT_APPROVAL_PENDING_EVENT: &str = "commit.approval_pending";
+pub const COMMIT_APPROVED_EVENT: &str = "commit.approved";
+pub const COMMIT_REJECTED_EVENT: &str = "commit.rejected";
 pub const RECOVERY_FAILURE_CLASSIFIED_EVENT: &str = "recovery.failure_classified";
 pub const RECOVERY_PLAN_RECORDED_EVENT: &str = "recovery.plan_recorded";
 pub const RECOVERY_REPAIR_ATTEMPTED_EVENT: &str = "recovery.repair_attempted";
@@ -34,6 +36,8 @@ pub enum EventType {
     ModelDecisionRecorded,
     DiffRecorded,
     CommitApprovalPending,
+    CommitApproved,
+    CommitRejected,
     RecoveryFailureClassified,
     RecoveryPlanRecorded,
     RecoveryRepairAttempted,
@@ -57,6 +61,8 @@ impl EventType {
             Self::ModelDecisionRecorded => MODEL_DECISION_RECORDED_EVENT,
             Self::DiffRecorded => DIFF_RECORDED_EVENT,
             Self::CommitApprovalPending => COMMIT_APPROVAL_PENDING_EVENT,
+            Self::CommitApproved => COMMIT_APPROVED_EVENT,
+            Self::CommitRejected => COMMIT_REJECTED_EVENT,
             Self::RecoveryFailureClassified => RECOVERY_FAILURE_CLASSIFIED_EVENT,
             Self::RecoveryPlanRecorded => RECOVERY_PLAN_RECORDED_EVENT,
             Self::RecoveryRepairAttempted => RECOVERY_REPAIR_ATTEMPTED_EVENT,
@@ -79,6 +85,8 @@ impl EventType {
             MODEL_DECISION_RECORDED_EVENT => Ok(Self::ModelDecisionRecorded),
             DIFF_RECORDED_EVENT => Ok(Self::DiffRecorded),
             COMMIT_APPROVAL_PENDING_EVENT => Ok(Self::CommitApprovalPending),
+            COMMIT_APPROVED_EVENT => Ok(Self::CommitApproved),
+            COMMIT_REJECTED_EVENT => Ok(Self::CommitRejected),
             RECOVERY_FAILURE_CLASSIFIED_EVENT => Ok(Self::RecoveryFailureClassified),
             RECOVERY_PLAN_RECORDED_EVENT => Ok(Self::RecoveryPlanRecorded),
             RECOVERY_REPAIR_ATTEMPTED_EVENT => Ok(Self::RecoveryRepairAttempted),
@@ -433,6 +441,28 @@ impl CommitApprovalPendingPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitApprovalDecisionPayload {
+    pub state: String,
+    pub reason: String,
+    pub actor: String,
+}
+
+impl CommitApprovalDecisionPayload {
+    #[must_use]
+    pub fn new(
+        state: impl Into<String>,
+        reason: impl Into<String>,
+        actor: impl Into<String>,
+    ) -> Self {
+        Self {
+            state: state.into(),
+            reason: reason.into(),
+            actor: actor.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryFailurePayload {
     pub round: usize,
     pub classification: String,
@@ -716,6 +746,20 @@ impl NewEvent {
         Self::new(session_id, EventType::CommitApprovalPending, payload)
     }
 
+    pub fn commit_approved(
+        session_id: Uuid,
+        payload: CommitApprovalDecisionPayload,
+    ) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::CommitApproved, payload)
+    }
+
+    pub fn commit_rejected(
+        session_id: Uuid,
+        payload: CommitApprovalDecisionPayload,
+    ) -> HarnessResult<Self> {
+        Self::new(session_id, EventType::CommitRejected, payload)
+    }
+
     pub fn recovery_failure_classified(
         session_id: Uuid,
         payload: RecoveryFailurePayload,
@@ -953,12 +997,28 @@ mod tests {
             ),
         )
         .expect("commit approval pending event");
+        let approved = NewEvent::commit_approved(
+            session_id,
+            CommitApprovalDecisionPayload::new("approved", "approved by runtime", "runtime"),
+        )
+        .expect("commit approved event");
+        let rejected = NewEvent::commit_rejected(
+            session_id,
+            CommitApprovalDecisionPayload::new("rejected", "not the intended change", "runtime"),
+        )
+        .expect("commit rejected event");
 
         assert_eq!(diff.event_type.as_str(), "diff.recorded");
         assert_eq!(diff.payload["files_changed"], 1);
         assert_eq!(diff.payload["paths"][0], ".harness/fake-agent-turn.md");
         assert_eq!(pending.event_type.as_str(), "commit.approval_pending");
         assert_eq!(pending.payload["state"], "pending_commit_approval");
+        assert_eq!(approved.event_type.as_str(), "commit.approved");
+        assert_eq!(approved.payload["state"], "approved");
+        assert_eq!(approved.payload["actor"], "runtime");
+        assert_eq!(rejected.event_type.as_str(), "commit.rejected");
+        assert_eq!(rejected.payload["state"], "rejected");
+        assert_eq!(rejected.payload["reason"], "not the intended change");
     }
 
     #[test]
