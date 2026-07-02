@@ -86,7 +86,12 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
             let action = args
                 .get(1)
                 .ok_or_else(|| HarnessError::new("task action is required"))?;
-            let database_url = database_url_from_args(args.clone())?;
+            let database_args = if action == "run-next-codex-worker" {
+                args_before_separator(&args).to_vec()
+            } else {
+                args.clone()
+            };
+            let database_url = database_url_from_args(database_args)?;
             let mut runtime = Runtime::connect_postgres(&database_url)?;
 
             match action.as_str() {

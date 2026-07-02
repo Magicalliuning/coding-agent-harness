@@ -1841,6 +1841,18 @@ impl Runtime {
             return Err(HarnessError::new("lease duration must be positive"));
         }
 
+        if request.worker.timeout_ms == 0 {
+            return Err(HarnessError::new(
+                "queued codex worker timeout must be positive",
+            ));
+        }
+
+        if request.worker.budget.max_stdout_bytes == 0 {
+            return Err(HarnessError::new(
+                "queued codex worker stdout budget must be positive",
+            ));
+        }
+
         let lease_duration_ms = effective_queued_worker_lease_duration_ms(
             request.lease_duration_ms,
             request.worker.timeout_ms,
