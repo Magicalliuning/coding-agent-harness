@@ -539,8 +539,11 @@ pub struct ModelRequestPayload {
     #[serde(default)]
     pub request_id: String,
     pub provider: String,
+    #[serde(default)]
     pub provider_kind: String,
+    #[serde(default)]
     pub model_id: String,
+    #[serde(default, alias = "task")]
     pub task_summary: String,
     pub context_source_count: usize,
     pub context_used_bytes: usize,
@@ -578,13 +581,16 @@ pub struct ModelDecisionPayload {
     #[serde(default)]
     pub request_id: String,
     pub provider: String,
-    pub provider_kind: String,
-    pub model_id: String,
     #[serde(default)]
+    pub provider_kind: String,
+    #[serde(default)]
+    pub model_id: String,
+    #[serde(default, alias = "summary")]
     pub response_summary: String,
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub max_output_tokens: usize,
+    #[serde(default = "default_usage_known")]
     pub usage_known: bool,
     pub patch: FilePatchPayload,
 }
@@ -617,6 +623,10 @@ impl ModelDecisionPayload {
             patch,
         }
     }
+}
+
+const fn default_usage_known() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1708,6 +1718,72 @@ mod tests {
         assert_eq!(error.payload["error_kind"], "provider_error");
         assert_eq!(intent.event_type.as_str(), "tool.call_intended");
         assert_eq!(intent.payload["tool_name"], "apply_file_patch");
+    }
+
+    #[test]
+    fn legacy_model_events_keep_payload_replay_compatible() {
+        assert_eq!(
+            EventType::parse(LEGACY_MODEL_REQUEST_RECORDED_EVENT).expect("legacy request event"),
+            EventType::ModelRequestRecorded
+        );
+        assert_eq!(
+            EventType::parse(LEGACY_MODEL_DECISION_RECORDED_EVENT).expect("legacy decision event"),
+            EventType::ModelDecisionRecorded
+        );
+        assert_eq!(
+            EventType::parse(LEGACY_MODEL_PROVIDER_SKIPPED_EVENT).expect("legacy skipped event"),
+            EventType::ModelProviderSkipped
+        );
+        assert_eq!(
+            EventType::parse(LEGACY_MODEL_PROVIDER_ERROR_EVENT).expect("legacy error event"),
+            EventType::ModelProviderError
+        );
+
+        let legacy_request = serde_json::json!({
+            "provider": "deterministic-fake-model",
+            "task": "write fixture",
+            "context_source_count": 1,
+            "context_used_bytes": 128,
+            "max_output_tokens": 256
+        });
+        let request: ModelRequestPayload =
+            serde_json::from_value(legacy_request).expect("legacy model request payload");
+
+        assert_eq!(request.request_id, "");
+        assert_eq!(request.provider, "deterministic-fake-model");
+        assert_eq!(request.provider_kind, "");
+        assert_eq!(request.model_id, "");
+        assert_eq!(request.task_summary, "write fixture");
+        assert_eq!(request.context_source_count, 1);
+        assert_eq!(request.context_used_bytes, 128);
+        assert_eq!(request.max_output_tokens, 256);
+
+        let legacy_decision = serde_json::json!({
+            "provider": "deterministic-fake-model",
+            "summary": "propose patch",
+            "prompt_tokens": 40,
+            "completion_tokens": 12,
+            "max_output_tokens": 256,
+            "patch": {
+                "path": ".harness/fake-agent-turn.md",
+                "expected_content": null,
+                "replacement_content": "fake patch"
+            }
+        });
+        let decision: ModelDecisionPayload =
+            serde_json::from_value(legacy_decision).expect("legacy model decision payload");
+
+        assert_eq!(decision.request_id, "");
+        assert_eq!(decision.provider, "deterministic-fake-model");
+        assert_eq!(decision.provider_kind, "");
+        assert_eq!(decision.model_id, "");
+        assert_eq!(decision.response_summary, "propose patch");
+        assert_eq!(decision.prompt_tokens, 40);
+        assert_eq!(decision.completion_tokens, 12);
+        assert_eq!(decision.max_output_tokens, 256);
+        assert!(decision.usage_known);
+        assert_eq!(decision.patch.path, ".harness/fake-agent-turn.md");
+        assert_eq!(decision.patch.replacement_content, "fake patch");
     }
 
     #[test]
