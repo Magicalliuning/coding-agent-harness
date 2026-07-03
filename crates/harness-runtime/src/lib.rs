@@ -12,14 +12,19 @@ use harness_events::{
     CommitApprovalDecisionPayload, CommitApprovalPendingPayload, CommitHandoffPayload,
     ContextCompiledPayload, ContextSourcePayload, DiffSummaryPayload, EventEnvelope, EventType,
     FilePatchIntentPayload, FilePatchObservationPayload, FilePatchPayload, ModelDecisionPayload,
-    ModelRequestPayload, NewEvent, PolicyDecisionPayload, RecoveryFailurePayload,
-    RecoveryPlanPayload, RecoveryRepairAttemptPayload, RecoveryStoppedPayload,
-    SessionStartedPayload, SkillMetadataPayload, TaskCreatedPayload, TaskLeasePayload,
-    TaskQueuePayload, ToolCallIntentPayload, ToolObservationPayload, WorkerLaneBudgetPayload,
+    ModelProviderErrorPayload, ModelProviderSkippedPayload, ModelRequestPayload, NewEvent,
+    PolicyDecisionPayload, RecoveryFailurePayload, RecoveryPlanPayload,
+    RecoveryRepairAttemptPayload, RecoveryStoppedPayload, SessionStartedPayload,
+    SkillMetadataPayload, TaskCreatedPayload, TaskLeasePayload, TaskQueuePayload,
+    ToolCallIntentPayload, ToolObservationPayload, WorkerLaneBudgetPayload,
     WorkerLaneObservationPayload, WorkerLaneRequestPayload, WorkerLaneStatePayload,
     WorkerLaneWorktreeAllocatedPayload,
 };
-use harness_models::{DeterministicFakeModelProvider, FakeModelRequest, FilePatchProposal};
+use harness_models::{
+    DETERMINISTIC_FAKE_MODEL_ID, DETERMINISTIC_FAKE_PROVIDER_KIND, FilePatchProposal,
+    ModelProviderOutcome, ModelProviderRequest, ModelProviderRouter, ModelProviderSelection,
+    OPENAI_COMPATIBLE_PROVIDER_KIND,
+};
 use harness_policy::{
     CodexWorkerLanePolicyInput, PolicyDecision, evaluate_codex_worker_lane, evaluate_file_patch,
     evaluate_verification_command,
@@ -61,6 +66,7 @@ pub const DEFAULT_CODEX_CLI_PROGRAM: &str = "codex";
 pub const DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS: u64 = 120_000;
 pub const DEFAULT_CODEX_CLI_ACCEPTANCE_TASK: &str = "Create or update .harness/codex-manual-acceptance.md with a short note saying local Codex CLI manual acceptance ran successfully. Do not commit the change.";
 pub const DEFAULT_TIMELINE_PAYLOAD_LIMIT_BYTES: usize = 512;
+pub const DEFAULT_OPENAI_COMPATIBLE_API_KEY_ENV: &str = "OPENAI_API_KEY";
 
 pub struct Runtime {
     event_store: PostgresEventStore,
@@ -608,8 +614,114 @@ impl FakeModelTurnRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeModelProvider {
+    DeterministicFake,
+    OpenAiCompatible {
+        model_id: String,
+        api_key_env: String,
+    },
+}
+
+impl RuntimeModelProvider {
+    #[must_use]
+    pub fn deterministic_fake() -> Self {
+        Self::DeterministicFake
+    }
+
+    #[must_use]
+    pub fn openai_compatible(model_id: impl Into<String>) -> Self {
+        Self::OpenAiCompatible {
+            model_id: model_id.into(),
+            api_key_env: DEFAULT_OPENAI_COMPATIBLE_API_KEY_ENV.to_owned(),
+        }
+    }
+
+    #[must_use]
+    pub fn provider_kind(&self) -> &'static str {
+        match self {
+            Self::DeterministicFake => DETERMINISTIC_FAKE_PROVIDER_KIND,
+            Self::OpenAiCompatible { .. } => OPENAI_COMPATIBLE_PROVIDER_KIND,
+        }
+    }
+
+    #[must_use]
+    pub fn model_id(&self) -> &str {
+        match self {
+            Self::DeterministicFake => DETERMINISTIC_FAKE_MODEL_ID,
+            Self::OpenAiCompatible { model_id, .. } => model_id,
+        }
+    }
+
+    #[must_use]
+    pub fn provider_name(&self) -> &str {
+        self.model_id()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelProviderRoutingRequest {
+    pub provider: RuntimeModelProvider,
+    pub task: String,
+    pub context: SessionContextCompileRequest,
+    pub max_output_tokens: usize,
+}
+
+impl ModelProviderRoutingRequest {
+    #[must_use]
+    pub fn deterministic_fake(task: impl Into<String>) -> Self {
+        Self {
+            provider: RuntimeModelProvider::DeterministicFake,
+            task: task.into(),
+            context: SessionContextCompileRequest::default(),
+            max_output_tokens: 256,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelProviderRoutingStatus {
+    Responded,
+    Skipped,
+    Error,
+}
+
+impl ModelProviderRoutingStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Responded => "responded",
+            Self::Skipped => "skipped",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelProviderRoutingResult {
+    pub session_id: Uuid,
+    pub provider: String,
+    pub provider_kind: String,
+    pub model_id: String,
+    pub request_id: String,
+    pub status: ModelProviderRoutingStatus,
+    pub summary: Option<String>,
+    pub skipped_reason: Option<String>,
+    pub error_kind: Option<String>,
+    pub safe_error_message: Option<String>,
+    pub patch: Option<FilePatchProposal>,
+    pub prompt_tokens: Option<usize>,
+    pub completion_tokens: Option<usize>,
+    pub max_output_tokens: usize,
+    pub usage_known: bool,
+    pub event_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FakeModelTurnResult {
     pub session_id: Uuid,
+    pub provider: String,
+    pub provider_kind: String,
+    pub model_id: String,
     pub patch: FilePatchProposal,
     pub decision: PolicyDecision,
     pub reason: String,
@@ -2064,54 +2176,200 @@ impl Runtime {
         })
     }
 
-    pub fn run_fake_model_turn(
+    pub fn run_model_provider_route(
         &mut self,
         session_id: Uuid,
-        request: FakeModelTurnRequest,
-    ) -> HarnessResult<FakeModelTurnResult> {
+        request: ModelProviderRoutingRequest,
+    ) -> HarnessResult<ModelProviderRoutingResult> {
         let context = self.compile_session_context(session_id, request.context)?;
-        let model_request = FakeModelRequest::new(
+        self.record_model_provider_route(
+            session_id,
+            request.provider,
             request.task,
+            &context,
+            request.max_output_tokens,
+        )
+    }
+
+    fn record_model_provider_route(
+        &mut self,
+        session_id: Uuid,
+        provider: RuntimeModelProvider,
+        task: String,
+        context: &SessionContextCompileResult,
+        max_output_tokens: usize,
+    ) -> HarnessResult<ModelProviderRoutingResult> {
+        let provider_name = provider.provider_name().to_owned();
+        let provider_kind = provider.provider_kind().to_owned();
+        let model_id = provider.model_id().to_owned();
+        let request_id = Uuid::new_v4().to_string();
+        let skipped_configuration_key_name = match &provider {
+            RuntimeModelProvider::OpenAiCompatible { api_key_env, .. } => Some(api_key_env.clone()),
+            RuntimeModelProvider::DeterministicFake => None,
+        };
+        let model_request = ModelProviderRequest::new(
+            task,
             context.bundle.sources.len(),
             context.bundle.used_bytes,
-            request.max_output_tokens,
+            max_output_tokens,
         )?;
-        let provider = DeterministicFakeModelProvider;
-
         self.event_store
             .append_event(NewEvent::model_request_recorded(
                 session_id,
                 ModelRequestPayload::new(
-                    "deterministic-fake-model",
-                    model_request.task.clone(),
+                    request_id.clone(),
+                    provider_name.clone(),
+                    provider_kind.clone(),
+                    model_id.clone(),
+                    model_task_summary(&model_request.task),
                     model_request.context_source_count,
                     model_request.context_used_bytes,
                     model_request.max_output_tokens,
                 ),
             )?)?;
 
-        let decision = provider.decide(model_request)?;
-        let patch_payload = file_patch_payload(&decision.patch);
+        match ModelProviderRouter.route(model_provider_selection(&provider), model_request) {
+            Ok(ModelProviderOutcome::Response(response)) => {
+                let patch_payload = model_patch_evidence_payload(&response.patch);
+                self.event_store
+                    .append_event(NewEvent::model_decision_recorded(
+                        session_id,
+                        ModelDecisionPayload::new(
+                            request_id.clone(),
+                            provider_name.clone(),
+                            response.provider_kind.clone(),
+                            response.model_id.clone(),
+                            response.summary.clone(),
+                            response.usage.prompt_tokens,
+                            response.usage.completion_tokens,
+                            response.usage.max_output_tokens,
+                            true,
+                            patch_payload,
+                        ),
+                    )?)?;
 
-        self.event_store
-            .append_event(NewEvent::model_decision_recorded(
-                session_id,
-                ModelDecisionPayload::new(
-                    decision.provider,
-                    decision.summary.clone(),
-                    decision.usage.prompt_tokens,
-                    decision.usage.completion_tokens,
-                    decision.usage.max_output_tokens,
-                    patch_payload.clone(),
-                ),
-            )?)?;
+                Ok(ModelProviderRoutingResult {
+                    session_id,
+                    provider: provider_name,
+                    provider_kind: response.provider_kind,
+                    model_id: response.model_id,
+                    request_id,
+                    status: ModelProviderRoutingStatus::Responded,
+                    summary: Some(response.summary),
+                    skipped_reason: None,
+                    error_kind: None,
+                    safe_error_message: None,
+                    patch: Some(response.patch),
+                    prompt_tokens: Some(response.usage.prompt_tokens),
+                    completion_tokens: Some(response.usage.completion_tokens),
+                    max_output_tokens: response.usage.max_output_tokens,
+                    usage_known: true,
+                    event_count: self.event_store.events_for_session(session_id)?.len(),
+                })
+            }
+            Ok(ModelProviderOutcome::Skipped(skipped)) => {
+                self.event_store
+                    .append_event(NewEvent::model_provider_skipped(
+                        session_id,
+                        ModelProviderSkippedPayload::new(
+                            request_id.clone(),
+                            provider_name.clone(),
+                            skipped.provider_kind.clone(),
+                            skipped.model_id.clone(),
+                            skipped.reason.clone(),
+                            skipped_configuration_key_name,
+                        ),
+                    )?)?;
+
+                Ok(ModelProviderRoutingResult {
+                    session_id,
+                    provider: provider_name,
+                    provider_kind: skipped.provider_kind,
+                    model_id: skipped.model_id,
+                    request_id,
+                    status: ModelProviderRoutingStatus::Skipped,
+                    summary: None,
+                    skipped_reason: Some(skipped.reason),
+                    error_kind: None,
+                    safe_error_message: None,
+                    patch: None,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    max_output_tokens,
+                    usage_known: false,
+                    event_count: self.event_store.events_for_session(session_id)?.len(),
+                })
+            }
+            Err(error) => {
+                let safe_error_message = sanitize_provider_error_message(error.message());
+                self.event_store
+                    .append_event(NewEvent::model_provider_error(
+                        session_id,
+                        ModelProviderErrorPayload::new(
+                            request_id.clone(),
+                            provider_name,
+                            provider_kind,
+                            model_id,
+                            "provider_error",
+                            safe_error_message.clone(),
+                            false,
+                        ),
+                    )?)?;
+
+                Ok(ModelProviderRoutingResult {
+                    session_id,
+                    provider: provider.provider_name().to_owned(),
+                    provider_kind: provider.provider_kind().to_owned(),
+                    model_id: provider.model_id().to_owned(),
+                    request_id,
+                    status: ModelProviderRoutingStatus::Error,
+                    summary: None,
+                    skipped_reason: None,
+                    error_kind: Some("provider_error".to_owned()),
+                    safe_error_message: Some(safe_error_message),
+                    patch: None,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    max_output_tokens,
+                    usage_known: false,
+                    event_count: self.event_store.events_for_session(session_id)?.len(),
+                })
+            }
+        }
+    }
+
+    pub fn run_fake_model_turn(
+        &mut self,
+        session_id: Uuid,
+        request: FakeModelTurnRequest,
+    ) -> HarnessResult<FakeModelTurnResult> {
+        let context = self.compile_session_context(session_id, request.context)?;
+        let routed = self.record_model_provider_route(
+            session_id,
+            RuntimeModelProvider::DeterministicFake,
+            request.task,
+            &context,
+            request.max_output_tokens,
+        )?;
+        let Some(patch) = routed.patch.clone() else {
+            return Err(HarnessError::new(
+                "fake model provider did not return a patch",
+            ));
+        };
+        let prompt_tokens = routed.prompt_tokens.ok_or_else(|| {
+            HarnessError::new("fake model provider did not return prompt token usage")
+        })?;
+        let completion_tokens = routed.completion_tokens.ok_or_else(|| {
+            HarnessError::new("fake model provider did not return completion token usage")
+        })?;
+        let patch_payload = file_patch_payload(&patch);
 
         let tool_name = harness_tools::APPLY_FILE_PATCH_TOOL.name;
         let intent = FilePatchIntent::new(
             context.bundle.repo_path.clone(),
-            decision.patch.path.clone(),
-            decision.patch.expected_content.clone(),
-            decision.patch.replacement_content.clone(),
+            patch.path.clone(),
+            patch.expected_content.clone(),
+            patch.replacement_content.clone(),
         )?;
 
         self.event_store
@@ -2124,10 +2382,7 @@ impl Runtime {
                 ),
             )?)?;
 
-        let evaluation = evaluate_file_patch(
-            &decision.patch.path,
-            decision.patch.replacement_content.len(),
-        );
+        let evaluation = evaluate_file_patch(&patch.path, patch.replacement_content.len());
 
         self.event_store.append_event(NewEvent::policy_decided(
             session_id,
@@ -2161,12 +2416,15 @@ impl Runtime {
 
         Ok(FakeModelTurnResult {
             session_id,
-            patch: decision.patch,
+            provider: routed.provider,
+            provider_kind: routed.provider_kind,
+            model_id: routed.model_id,
+            patch,
             decision: evaluation.decision,
             reason: evaluation.reason,
             observation,
-            prompt_tokens: decision.usage.prompt_tokens,
-            completion_tokens: decision.usage.completion_tokens,
+            prompt_tokens,
+            completion_tokens,
             event_count: self.event_store.events_for_session(session_id)?.len(),
         })
     }
@@ -4873,6 +5131,45 @@ fn context_compiled_payload(bundle: &CompiledContextBundle) -> ContextCompiledPa
             })
             .collect(),
     }
+}
+
+fn model_provider_selection(provider: &RuntimeModelProvider) -> ModelProviderSelection {
+    match provider {
+        RuntimeModelProvider::DeterministicFake => ModelProviderSelection::DeterministicFake,
+        RuntimeModelProvider::OpenAiCompatible {
+            model_id,
+            api_key_env,
+        } => ModelProviderSelection::OpenAiCompatible {
+            model_id: model_id.clone(),
+            api_key_available: env::var_os(api_key_env).is_some(),
+        },
+    }
+}
+
+fn sanitize_provider_error_message(message: &str) -> String {
+    let mut sanitized = message.to_owned();
+
+    for (key, value) in env::vars() {
+        let key_upper = key.to_ascii_uppercase();
+        let looks_sensitive = key_upper.contains("KEY")
+            || key_upper.contains("TOKEN")
+            || key_upper.contains("SECRET")
+            || key_upper.contains("PASSWORD");
+
+        if looks_sensitive && value.len() >= 4 {
+            sanitized = sanitized.replace(&value, "[REDACTED]");
+        }
+    }
+
+    sanitized
+}
+
+fn model_task_summary(task: &str) -> String {
+    format!("redacted_task_chars={}", task.chars().count())
+}
+
+fn model_patch_evidence_payload(patch: &FilePatchProposal) -> FilePatchPayload {
+    FilePatchPayload::new(patch.path.clone(), None, "[REDACTED_MODEL_PATCH_PROPOSAL]")
 }
 
 fn file_patch_payload(patch: &FilePatchProposal) -> FilePatchPayload {

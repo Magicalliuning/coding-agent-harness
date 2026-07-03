@@ -2593,6 +2593,176 @@ fn cli_compiles_session_context() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn cli_routes_model_provider_and_reports_skip() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+    let repo = fixture_repo()?;
+    write_file(&repo, "AGENTS.md", "Use deterministic agent fixtures.")?;
+
+    let migrate = Command::new(bin)
+        .args(["migrate", "--database-url", &database_url])
+        .output()?;
+    assert!(migrate.status.success());
+
+    let repo_path = repo.display().to_string();
+    let start = Command::new(bin)
+        .args([
+            "session",
+            "start",
+            "--repo",
+            &repo_path,
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(start.status.success());
+
+    let start_stdout = String::from_utf8(start.stdout)?;
+    let session_id = value_for_key(&start_stdout, "session_id").expect("session_id output");
+    let fake_secret = "HARNESS_MODEL_ENTRY_CLI_SECRET_VALUE";
+
+    let fake = Command::new(bin)
+        .args([
+            "session",
+            "model-route",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task",
+            &format!("route the CLI fake provider without leaking {fake_secret}"),
+            "--max-bytes",
+            "4096",
+            "--focus",
+            "agent",
+        ])
+        .output()?;
+    assert!(fake.status.success());
+
+    let fake_stdout = String::from_utf8(fake.stdout)?;
+    assert!(fake_stdout.contains("model_provider_kind=deterministic_fake"));
+    assert!(fake_stdout.contains("model_id=deterministic-fake-model"));
+    assert!(fake_stdout.contains("model_request_id="));
+    assert!(fake_stdout.contains("model_status=responded"));
+    assert!(fake_stdout.contains("usage_known=true"));
+    assert!(fake_stdout.contains("patch_path=.harness/fake-agent-turn.md"));
+    assert!(!fake_stdout.contains(fake_secret));
+    assert!(!String::from_utf8(fake.stderr)?.contains(fake_secret));
+
+    let error = Command::new(bin)
+        .args([
+            "session",
+            "model-route",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task",
+            &format!("route the CLI error provider without leaking {fake_secret}"),
+            "--max-output-tokens",
+            "1",
+        ])
+        .output()?;
+    assert!(error.status.success());
+
+    let error_stdout = String::from_utf8(error.stdout)?;
+    assert!(error_stdout.contains("model_provider_kind=deterministic_fake"));
+    assert!(error_stdout.contains("model_status=error"));
+    assert!(error_stdout.contains("model_error_kind=provider_error"));
+    assert!(
+        error_stdout
+            .contains("model_safe_error_message=fake model patch exceeds output token budget")
+    );
+    assert!(error_stdout.contains("usage_known=false"));
+    assert!(!error_stdout.contains(fake_secret));
+    assert!(!String::from_utf8(error.stderr)?.contains(fake_secret));
+
+    let skipped = Command::new(bin)
+        .env_remove("HARNESS_TEST_MISSING_OPENAI_KEY")
+        .args([
+            "session",
+            "model-route",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task",
+            "route the CLI real provider",
+            "--provider",
+            "openai-compatible",
+            "--model",
+            "gpt-test",
+            "--api-key-env",
+            "HARNESS_TEST_MISSING_OPENAI_KEY",
+        ])
+        .output()?;
+    assert!(skipped.status.success());
+
+    let skipped_stdout = String::from_utf8(skipped.stdout)?;
+    assert!(skipped_stdout.contains("model_provider_kind=openai_compatible"));
+    assert!(skipped_stdout.contains("model_id=gpt-test"));
+    assert!(skipped_stdout.contains("model_status=skipped"));
+    assert!(skipped_stdout.contains("usage_known=false"));
+    assert!(skipped_stdout.contains(
+        "model_skipped_reason=openai-compatible provider credentials are not configured"
+    ));
+    assert!(!skipped_stdout.contains(fake_secret));
+    assert!(!String::from_utf8(skipped.stderr)?.contains(fake_secret));
+
+    let configured_skipped = Command::new(bin)
+        .env("HARNESS_TEST_PRESENT_OPENAI_KEY", fake_secret)
+        .args([
+            "session",
+            "model-route",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--task",
+            "route the CLI configured real provider",
+            "--provider",
+            "openai-compatible",
+            "--model",
+            "gpt-test",
+            "--api-key-env",
+            "HARNESS_TEST_PRESENT_OPENAI_KEY",
+        ])
+        .output()?;
+    assert!(configured_skipped.status.success());
+
+    let configured_skipped_stdout = String::from_utf8(configured_skipped.stdout)?;
+    assert!(configured_skipped_stdout.contains("model_provider_kind=openai_compatible"));
+    assert!(configured_skipped_stdout.contains("model_status=skipped"));
+    assert!(configured_skipped_stdout.contains(
+        "model_skipped_reason=openai-compatible provider execution is not implemented in Phase A #75"
+    ));
+    assert!(!configured_skipped_stdout.contains(fake_secret));
+    assert!(!String::from_utf8(configured_skipped.stderr)?.contains(fake_secret));
+
+    let timeline = Command::new(bin)
+        .args([
+            "session",
+            "timeline",
+            session_id,
+            "--database-url",
+            &database_url,
+            "--payload-bytes",
+            "4096",
+            "--json",
+        ])
+        .output()?;
+    assert!(timeline.status.success());
+    assert!(!String::from_utf8(timeline.stderr)?.contains(fake_secret));
+    let timeline_stdout = String::from_utf8(timeline.stdout)?;
+    assert!(!timeline_stdout.contains(fake_secret));
+    assert!(timeline_stdout.contains("model.requested"));
+    assert!(timeline_stdout.contains("model.responded"));
+    assert!(timeline_stdout.contains("model.skipped"));
+    assert!(timeline_stdout.contains("model.error"));
+
+    Ok(())
+}
+
+#[test]
 fn cli_runs_fake_model_turn() -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
         return Ok(());
@@ -2641,6 +2811,8 @@ fn cli_runs_fake_model_turn() -> Result<(), Box<dyn std::error::Error>> {
     assert!(turn.status.success());
 
     let turn_stdout = String::from_utf8(turn.stdout)?;
+    assert!(turn_stdout.contains("model_provider_kind=deterministic_fake"));
+    assert!(turn_stdout.contains("model_id=deterministic-fake-model"));
     let written = fs::read_to_string(repo.join(".harness/fake-agent-turn.md"))?;
     assert!(turn_stdout.contains("patch_path=.harness/fake-agent-turn.md"));
     assert!(turn_stdout.contains("policy_decision=allow"));
