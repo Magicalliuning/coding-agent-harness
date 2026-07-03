@@ -682,6 +682,7 @@ impl ModelProviderRoutingRequest {
 pub enum ModelProviderRoutingStatus {
     Responded,
     Skipped,
+    Error,
 }
 
 impl ModelProviderRoutingStatus {
@@ -690,6 +691,7 @@ impl ModelProviderRoutingStatus {
         match self {
             Self::Responded => "responded",
             Self::Skipped => "skipped",
+            Self::Error => "error",
         }
     }
 }
@@ -700,9 +702,12 @@ pub struct ModelProviderRoutingResult {
     pub provider: String,
     pub provider_kind: String,
     pub model_id: String,
+    pub request_id: String,
     pub status: ModelProviderRoutingStatus,
     pub summary: Option<String>,
     pub skipped_reason: Option<String>,
+    pub error_kind: Option<String>,
+    pub safe_error_message: Option<String>,
     pub patch: Option<FilePatchProposal>,
     pub prompt_tokens: Option<usize>,
     pub completion_tokens: Option<usize>,
@@ -2197,6 +2202,11 @@ impl Runtime {
         let provider_name = provider.provider_name().to_owned();
         let provider_kind = provider.provider_kind().to_owned();
         let model_id = provider.model_id().to_owned();
+        let request_id = Uuid::new_v4().to_string();
+        let skipped_configuration_key_name = match &provider {
+            RuntimeModelProvider::OpenAiCompatible { api_key_env, .. } => Some(api_key_env.clone()),
+            RuntimeModelProvider::DeterministicFake => None,
+        };
         let model_request = ModelProviderRequest::new(
             task,
             context.bundle.sources.len(),
@@ -2207,10 +2217,11 @@ impl Runtime {
             .append_event(NewEvent::model_request_recorded(
                 session_id,
                 ModelRequestPayload::new(
+                    request_id.clone(),
                     provider_name.clone(),
                     provider_kind.clone(),
                     model_id.clone(),
-                    model_request.task.clone(),
+                    model_task_summary(&model_request.task),
                     model_request.context_source_count,
                     model_request.context_used_bytes,
                     model_request.max_output_tokens,
@@ -2219,11 +2230,12 @@ impl Runtime {
 
         match ModelProviderRouter.route(model_provider_selection(&provider), model_request) {
             Ok(ModelProviderOutcome::Response(response)) => {
-                let patch_payload = file_patch_payload(&response.patch);
+                let patch_payload = model_patch_evidence_payload(&response.patch);
                 self.event_store
                     .append_event(NewEvent::model_decision_recorded(
                         session_id,
                         ModelDecisionPayload::new(
+                            request_id.clone(),
                             provider_name.clone(),
                             response.provider_kind.clone(),
                             response.model_id.clone(),
@@ -2241,9 +2253,12 @@ impl Runtime {
                     provider: provider_name,
                     provider_kind: response.provider_kind,
                     model_id: response.model_id,
+                    request_id,
                     status: ModelProviderRoutingStatus::Responded,
                     summary: Some(response.summary),
                     skipped_reason: None,
+                    error_kind: None,
+                    safe_error_message: None,
                     patch: Some(response.patch),
                     prompt_tokens: Some(response.usage.prompt_tokens),
                     completion_tokens: Some(response.usage.completion_tokens),
@@ -2257,10 +2272,12 @@ impl Runtime {
                     .append_event(NewEvent::model_provider_skipped(
                         session_id,
                         ModelProviderSkippedPayload::new(
+                            request_id.clone(),
                             provider_name.clone(),
                             skipped.provider_kind.clone(),
                             skipped.model_id.clone(),
                             skipped.reason.clone(),
+                            skipped_configuration_key_name,
                         ),
                     )?)?;
 
@@ -2269,9 +2286,12 @@ impl Runtime {
                     provider: provider_name,
                     provider_kind: skipped.provider_kind,
                     model_id: skipped.model_id,
+                    request_id,
                     status: ModelProviderRoutingStatus::Skipped,
                     summary: None,
                     skipped_reason: Some(skipped.reason),
+                    error_kind: None,
+                    safe_error_message: None,
                     patch: None,
                     prompt_tokens: None,
                     completion_tokens: None,
@@ -2281,18 +2301,39 @@ impl Runtime {
                 })
             }
             Err(error) => {
+                let safe_error_message = sanitize_provider_error_message(error.message());
                 self.event_store
                     .append_event(NewEvent::model_provider_error(
                         session_id,
                         ModelProviderErrorPayload::new(
+                            request_id.clone(),
                             provider_name,
                             provider_kind,
                             model_id,
-                            error.message().to_owned(),
+                            "provider_error",
+                            safe_error_message.clone(),
+                            false,
                         ),
                     )?)?;
 
-                Err(error)
+                Ok(ModelProviderRoutingResult {
+                    session_id,
+                    provider: provider.provider_name().to_owned(),
+                    provider_kind: provider.provider_kind().to_owned(),
+                    model_id: provider.model_id().to_owned(),
+                    request_id,
+                    status: ModelProviderRoutingStatus::Error,
+                    summary: None,
+                    skipped_reason: None,
+                    error_kind: Some("provider_error".to_owned()),
+                    safe_error_message: Some(safe_error_message),
+                    patch: None,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    max_output_tokens,
+                    usage_known: false,
+                    event_count: self.event_store.events_for_session(session_id)?.len(),
+                })
             }
         }
     }
@@ -5103,6 +5144,32 @@ fn model_provider_selection(provider: &RuntimeModelProvider) -> ModelProviderSel
             api_key_available: env::var_os(api_key_env).is_some(),
         },
     }
+}
+
+fn sanitize_provider_error_message(message: &str) -> String {
+    let mut sanitized = message.to_owned();
+
+    for (key, value) in env::vars() {
+        let key_upper = key.to_ascii_uppercase();
+        let looks_sensitive = key_upper.contains("KEY")
+            || key_upper.contains("TOKEN")
+            || key_upper.contains("SECRET")
+            || key_upper.contains("PASSWORD");
+
+        if looks_sensitive && value.len() >= 4 {
+            sanitized = sanitized.replace(&value, "[REDACTED]");
+        }
+    }
+
+    sanitized
+}
+
+fn model_task_summary(task: &str) -> String {
+    format!("redacted_task_chars={}", task.chars().count())
+}
+
+fn model_patch_evidence_payload(patch: &FilePatchProposal) -> FilePatchPayload {
+    FilePatchPayload::new(patch.path.clone(), None, "[REDACTED_MODEL_PATCH_PROPOSAL]")
 }
 
 fn file_patch_payload(patch: &FilePatchProposal) -> FilePatchPayload {

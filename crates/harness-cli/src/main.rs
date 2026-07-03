@@ -2737,6 +2737,7 @@ fn print_model_provider_routing_result(result: &ModelProviderRoutingResult) {
     println!("model_provider={}", result.provider);
     println!("model_provider_kind={}", result.provider_kind);
     println!("model_id={}", result.model_id);
+    println!("model_request_id={}", result.request_id);
     println!("model_status={}", result.status.as_str());
     println!("usage_known={}", result.usage_known);
     println!("max_output_tokens={}", result.max_output_tokens);
@@ -2747,6 +2748,14 @@ fn print_model_provider_routing_result(result: &ModelProviderRoutingResult) {
 
     if let Some(skipped_reason) = &result.skipped_reason {
         println!("model_skipped_reason={skipped_reason}");
+    }
+
+    if let Some(error_kind) = &result.error_kind {
+        println!("model_error_kind={error_kind}");
+    }
+
+    if let Some(safe_error_message) = &result.safe_error_message {
+        println!("model_safe_error_message={safe_error_message}");
     }
 
     if let Some(prompt_tokens) = result.prompt_tokens {

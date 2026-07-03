@@ -20,10 +20,14 @@ pub const TOOL_CALL_INTENDED_EVENT: &str = "tool.call_intended";
 pub const POLICY_DECIDED_EVENT: &str = "policy.decided";
 pub const TOOL_OBSERVATION_RECORDED_EVENT: &str = "tool.observation_recorded";
 pub const CONTEXT_COMPILED_EVENT: &str = "context.compiled";
-pub const MODEL_REQUEST_RECORDED_EVENT: &str = "model.request_recorded";
-pub const MODEL_DECISION_RECORDED_EVENT: &str = "model.decision_recorded";
-pub const MODEL_PROVIDER_SKIPPED_EVENT: &str = "model.provider_skipped";
-pub const MODEL_PROVIDER_ERROR_EVENT: &str = "model.provider_error";
+pub const MODEL_REQUEST_RECORDED_EVENT: &str = "model.requested";
+pub const MODEL_DECISION_RECORDED_EVENT: &str = "model.responded";
+pub const MODEL_PROVIDER_SKIPPED_EVENT: &str = "model.skipped";
+pub const MODEL_PROVIDER_ERROR_EVENT: &str = "model.error";
+pub const LEGACY_MODEL_REQUEST_RECORDED_EVENT: &str = "model.request_recorded";
+pub const LEGACY_MODEL_DECISION_RECORDED_EVENT: &str = "model.decision_recorded";
+pub const LEGACY_MODEL_PROVIDER_SKIPPED_EVENT: &str = "model.provider_skipped";
+pub const LEGACY_MODEL_PROVIDER_ERROR_EVENT: &str = "model.provider_error";
 pub const DIFF_RECORDED_EVENT: &str = "diff.recorded";
 pub const COMMIT_APPROVAL_PENDING_EVENT: &str = "commit.approval_pending";
 pub const COMMIT_APPROVED_EVENT: &str = "commit.approved";
@@ -136,10 +140,18 @@ impl EventType {
             POLICY_DECIDED_EVENT => Ok(Self::PolicyDecided),
             TOOL_OBSERVATION_RECORDED_EVENT => Ok(Self::ToolObservationRecorded),
             CONTEXT_COMPILED_EVENT => Ok(Self::ContextCompiled),
-            MODEL_REQUEST_RECORDED_EVENT => Ok(Self::ModelRequestRecorded),
-            MODEL_DECISION_RECORDED_EVENT => Ok(Self::ModelDecisionRecorded),
-            MODEL_PROVIDER_SKIPPED_EVENT => Ok(Self::ModelProviderSkipped),
-            MODEL_PROVIDER_ERROR_EVENT => Ok(Self::ModelProviderError),
+            MODEL_REQUEST_RECORDED_EVENT | LEGACY_MODEL_REQUEST_RECORDED_EVENT => {
+                Ok(Self::ModelRequestRecorded)
+            }
+            MODEL_DECISION_RECORDED_EVENT | LEGACY_MODEL_DECISION_RECORDED_EVENT => {
+                Ok(Self::ModelDecisionRecorded)
+            }
+            MODEL_PROVIDER_SKIPPED_EVENT | LEGACY_MODEL_PROVIDER_SKIPPED_EVENT => {
+                Ok(Self::ModelProviderSkipped)
+            }
+            MODEL_PROVIDER_ERROR_EVENT | LEGACY_MODEL_PROVIDER_ERROR_EVENT => {
+                Ok(Self::ModelProviderError)
+            }
             DIFF_RECORDED_EVENT => Ok(Self::DiffRecorded),
             COMMIT_APPROVAL_PENDING_EVENT => Ok(Self::CommitApprovalPending),
             COMMIT_APPROVED_EVENT => Ok(Self::CommitApproved),
@@ -524,10 +536,12 @@ pub struct ContextCompiledPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelRequestPayload {
+    #[serde(default)]
+    pub request_id: String,
     pub provider: String,
     pub provider_kind: String,
     pub model_id: String,
-    pub task: String,
+    pub task_summary: String,
     pub context_source_count: usize,
     pub context_used_bytes: usize,
     pub max_output_tokens: usize,
@@ -535,20 +549,23 @@ pub struct ModelRequestPayload {
 
 impl ModelRequestPayload {
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        request_id: impl Into<String>,
         provider: impl Into<String>,
         provider_kind: impl Into<String>,
         model_id: impl Into<String>,
-        task: impl Into<String>,
+        task_summary: impl Into<String>,
         context_source_count: usize,
         context_used_bytes: usize,
         max_output_tokens: usize,
     ) -> Self {
         Self {
+            request_id: request_id.into(),
             provider: provider.into(),
             provider_kind: provider_kind.into(),
             model_id: model_id.into(),
-            task: task.into(),
+            task_summary: task_summary.into(),
             context_source_count,
             context_used_bytes,
             max_output_tokens,
@@ -558,10 +575,13 @@ impl ModelRequestPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelDecisionPayload {
+    #[serde(default)]
+    pub request_id: String,
     pub provider: String,
     pub provider_kind: String,
     pub model_id: String,
-    pub summary: String,
+    #[serde(default)]
+    pub response_summary: String,
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub max_output_tokens: usize,
@@ -573,10 +593,11 @@ impl ModelDecisionPayload {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        request_id: impl Into<String>,
         provider: impl Into<String>,
         provider_kind: impl Into<String>,
         model_id: impl Into<String>,
-        summary: impl Into<String>,
+        response_summary: impl Into<String>,
         prompt_tokens: usize,
         completion_tokens: usize,
         max_output_tokens: usize,
@@ -584,10 +605,11 @@ impl ModelDecisionPayload {
         patch: FilePatchPayload,
     ) -> Self {
         Self {
+            request_id: request_id.into(),
             provider: provider.into(),
             provider_kind: provider_kind.into(),
             model_id: model_id.into(),
-            summary: summary.into(),
+            response_summary: response_summary.into(),
             prompt_tokens,
             completion_tokens,
             max_output_tokens,
@@ -599,50 +621,71 @@ impl ModelDecisionPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelProviderSkippedPayload {
+    #[serde(default)]
+    pub request_id: String,
     pub provider: String,
     pub provider_kind: String,
     pub model_id: String,
     pub skipped_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration_key_name: Option<String>,
 }
 
 impl ModelProviderSkippedPayload {
     #[must_use]
     pub fn new(
+        request_id: impl Into<String>,
         provider: impl Into<String>,
         provider_kind: impl Into<String>,
         model_id: impl Into<String>,
         skipped_reason: impl Into<String>,
+        configuration_key_name: Option<String>,
     ) -> Self {
         Self {
+            request_id: request_id.into(),
             provider: provider.into(),
             provider_kind: provider_kind.into(),
             model_id: model_id.into(),
             skipped_reason: skipped_reason.into(),
+            configuration_key_name,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelProviderErrorPayload {
+    #[serde(default)]
+    pub request_id: String,
     pub provider: String,
     pub provider_kind: String,
     pub model_id: String,
-    pub error: String,
+    #[serde(default)]
+    pub error_kind: String,
+    #[serde(default)]
+    pub safe_error_message: String,
+    #[serde(default)]
+    pub retryable: bool,
 }
 
 impl ModelProviderErrorPayload {
     #[must_use]
     pub fn new(
+        request_id: impl Into<String>,
         provider: impl Into<String>,
         provider_kind: impl Into<String>,
         model_id: impl Into<String>,
-        error: impl Into<String>,
+        error_kind: impl Into<String>,
+        safe_error_message: impl Into<String>,
+        retryable: bool,
     ) -> Self {
         Self {
+            request_id: request_id.into(),
             provider: provider.into(),
             provider_kind: provider_kind.into(),
             model_id: model_id.into(),
-            error: error.into(),
+            error_kind: error_kind.into(),
+            safe_error_message: safe_error_message.into(),
+            retryable,
         }
     }
 }
@@ -1582,6 +1625,7 @@ mod tests {
         let request = NewEvent::model_request_recorded(
             session_id,
             ModelRequestPayload::new(
+                "model-request-1",
                 "deterministic-fake-model",
                 "deterministic_fake",
                 "deterministic-fake-model",
@@ -1595,6 +1639,7 @@ mod tests {
         let decision = NewEvent::model_decision_recorded(
             session_id,
             ModelDecisionPayload::new(
+                "model-request-1",
                 "deterministic-fake-model",
                 "deterministic_fake",
                 "deterministic-fake-model",
@@ -1610,20 +1655,25 @@ mod tests {
         let skipped = NewEvent::model_provider_skipped(
             session_id,
             ModelProviderSkippedPayload::new(
+                "model-request-2",
                 "openai-compatible",
                 "openai_compatible",
                 "gpt-test",
                 "openai-compatible provider credentials are not configured",
+                Some("OPENAI_API_KEY".to_owned()),
             ),
         )
         .expect("model skipped event");
         let error = NewEvent::model_provider_error(
             session_id,
             ModelProviderErrorPayload::new(
+                "model-request-3",
                 "deterministic-fake-model",
                 "deterministic_fake",
                 "deterministic-fake-model",
+                "provider_error",
                 "fake model patch exceeds output token budget",
+                false,
             ),
         )
         .expect("model error event");
@@ -1633,25 +1683,29 @@ mod tests {
         )
         .expect("file patch intent event");
 
-        assert_eq!(request.event_type.as_str(), "model.request_recorded");
+        assert_eq!(request.event_type.as_str(), "model.requested");
+        assert_eq!(request.payload["request_id"], "model-request-1");
         assert_eq!(request.payload["provider_kind"], "deterministic_fake");
         assert_eq!(request.payload["model_id"], "deterministic-fake-model");
         assert_eq!(request.payload["context_used_bytes"], 128);
         assert_eq!(decision.payload["usage_known"], true);
+        assert_eq!(decision.payload["response_summary"], "propose patch");
         assert_eq!(
             decision.payload["patch"]["path"],
             ".harness/fake-agent-turn.md"
         );
-        assert_eq!(skipped.event_type.as_str(), "model.provider_skipped");
+        assert_eq!(skipped.event_type.as_str(), "model.skipped");
         assert_eq!(
             skipped.payload["skipped_reason"],
             "openai-compatible provider credentials are not configured"
         );
-        assert_eq!(error.event_type.as_str(), "model.provider_error");
+        assert_eq!(skipped.payload["configuration_key_name"], "OPENAI_API_KEY");
+        assert_eq!(error.event_type.as_str(), "model.error");
         assert_eq!(
-            error.payload["error"],
+            error.payload["safe_error_message"],
             "fake model patch exceeds output token budget"
         );
+        assert_eq!(error.payload["error_kind"], "provider_error");
         assert_eq!(intent.event_type.as_str(), "tool.call_intended");
         assert_eq!(intent.payload["tool_name"], "apply_file_patch");
     }
