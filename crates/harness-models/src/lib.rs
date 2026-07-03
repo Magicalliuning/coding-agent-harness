@@ -1,5 +1,9 @@
 use harness_core::{HarnessError, HarnessResult};
 
+pub const DETERMINISTIC_FAKE_PROVIDER_KIND: &str = "deterministic_fake";
+pub const DETERMINISTIC_FAKE_MODEL_ID: &str = "deterministic-fake-model";
+pub const OPENAI_COMPATIBLE_PROVIDER_KIND: &str = "openai_compatible";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelSource {
     Internal,
@@ -83,7 +87,7 @@ impl DeterministicFakeModelProvider {
         }
 
         Ok(FakeModelDecision {
-            provider: "deterministic-fake-model",
+            provider: DETERMINISTIC_FAKE_MODEL_ID,
             summary: "propose deterministic fixture patch".to_owned(),
             usage: TokenUsage {
                 prompt_tokens: estimate_tokens(&request.task)
@@ -97,6 +101,137 @@ impl DeterministicFakeModelProvider {
                 replacement_content,
             },
         })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelProviderSelection {
+    DeterministicFake,
+    OpenAiCompatible {
+        model_id: String,
+        api_key_available: bool,
+    },
+}
+
+impl ModelProviderSelection {
+    #[must_use]
+    pub fn provider_kind(&self) -> &'static str {
+        match self {
+            Self::DeterministicFake => DETERMINISTIC_FAKE_PROVIDER_KIND,
+            Self::OpenAiCompatible { .. } => OPENAI_COMPATIBLE_PROVIDER_KIND,
+        }
+    }
+
+    #[must_use]
+    pub fn model_id(&self) -> &str {
+        match self {
+            Self::DeterministicFake => DETERMINISTIC_FAKE_MODEL_ID,
+            Self::OpenAiCompatible { model_id, .. } => model_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelProviderRequest {
+    pub task: String,
+    pub context_source_count: usize,
+    pub context_used_bytes: usize,
+    pub max_output_tokens: usize,
+}
+
+impl ModelProviderRequest {
+    pub fn new(
+        task: impl Into<String>,
+        context_source_count: usize,
+        context_used_bytes: usize,
+        max_output_tokens: usize,
+    ) -> HarnessResult<Self> {
+        let task = task.into();
+
+        if task.trim().is_empty() {
+            return Err(HarnessError::new("model provider task cannot be empty"));
+        }
+
+        Ok(Self {
+            task,
+            context_source_count,
+            context_used_bytes,
+            max_output_tokens,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelProviderResponse {
+    pub provider_kind: String,
+    pub model_id: String,
+    pub summary: String,
+    pub usage: TokenUsage,
+    pub patch: FilePatchProposal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelProviderSkipped {
+    pub provider_kind: String,
+    pub model_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelProviderOutcome {
+    Response(ModelProviderResponse),
+    Skipped(ModelProviderSkipped),
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ModelProviderRouter;
+
+impl ModelProviderRouter {
+    pub fn route(
+        self,
+        selection: ModelProviderSelection,
+        request: ModelProviderRequest,
+    ) -> HarnessResult<ModelProviderOutcome> {
+        match selection {
+            ModelProviderSelection::DeterministicFake => {
+                let fake_request = FakeModelRequest::new(
+                    request.task,
+                    request.context_source_count,
+                    request.context_used_bytes,
+                    request.max_output_tokens,
+                )?;
+                let decision = DeterministicFakeModelProvider.decide(fake_request)?;
+
+                Ok(ModelProviderOutcome::Response(ModelProviderResponse {
+                    provider_kind: DETERMINISTIC_FAKE_PROVIDER_KIND.to_owned(),
+                    model_id: DETERMINISTIC_FAKE_MODEL_ID.to_owned(),
+                    summary: decision.summary,
+                    usage: decision.usage,
+                    patch: decision.patch,
+                }))
+            }
+            ModelProviderSelection::OpenAiCompatible {
+                model_id,
+                api_key_available,
+            } => {
+                if api_key_available {
+                    Ok(ModelProviderOutcome::Skipped(ModelProviderSkipped {
+                        provider_kind: OPENAI_COMPATIBLE_PROVIDER_KIND.to_owned(),
+                        model_id,
+                        reason:
+                            "openai-compatible provider execution is not implemented in Phase A #75"
+                                .to_owned(),
+                    }))
+                } else {
+                    Ok(ModelProviderOutcome::Skipped(ModelProviderSkipped {
+                        provider_kind: OPENAI_COMPATIBLE_PROVIDER_KIND.to_owned(),
+                        model_id,
+                        reason: "openai-compatible provider credentials are not configured"
+                            .to_owned(),
+                    }))
+                }
+            }
+        }
     }
 }
 
@@ -148,5 +283,48 @@ mod tests {
             error.message(),
             "fake model patch exceeds output token budget"
         );
+    }
+
+    #[test]
+    fn router_routes_fake_provider_to_normalized_response() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let request = ModelProviderRequest::new("write a fixture", 2, 128, 128)?;
+        let outcome =
+            ModelProviderRouter.route(ModelProviderSelection::DeterministicFake, request)?;
+        let ModelProviderOutcome::Response(response) = outcome else {
+            panic!("expected response");
+        };
+
+        assert_eq!(response.provider_kind, DETERMINISTIC_FAKE_PROVIDER_KIND);
+        assert_eq!(response.model_id, DETERMINISTIC_FAKE_MODEL_ID);
+        assert_eq!(response.patch.path, ".harness/fake-agent-turn.md");
+        assert!(response.usage.prompt_tokens > 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn router_returns_skipped_reason_for_unconfigured_real_provider()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = ModelProviderRequest::new("write a fixture", 2, 128, 128)?;
+        let outcome = ModelProviderRouter.route(
+            ModelProviderSelection::OpenAiCompatible {
+                model_id: "gpt-test".to_owned(),
+                api_key_available: false,
+            },
+            request,
+        )?;
+        let ModelProviderOutcome::Skipped(skipped) = outcome else {
+            panic!("expected skipped outcome");
+        };
+
+        assert_eq!(skipped.provider_kind, OPENAI_COMPATIBLE_PROVIDER_KIND);
+        assert_eq!(skipped.model_id, "gpt-test");
+        assert_eq!(
+            skipped.reason,
+            "openai-compatible provider credentials are not configured"
+        );
+
+        Ok(())
     }
 }
