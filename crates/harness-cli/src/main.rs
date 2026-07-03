@@ -1,13 +1,16 @@
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use harness_core::{HarnessError, HarnessResult};
 use harness_runtime::{
     ApprovalCommitInspectReport, ApprovalCommitInspectRequest, ApprovalProjection,
-    CodexCliAcceptanceRequest, CodexCliAcceptanceResult, CodexCliAvailabilityRequest,
-    CodexWorkerLaneRequest, CodexWorkerSubprocess, CommitHandoffProjection, ContextBudget,
-    CreateTaskRequest, DEFAULT_CODEX_CLI_ACCEPTANCE_TASK, DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS,
+    CapabilityGateReport, CapabilityNode, CapabilityRegistryReport, CodexCliAcceptanceRequest,
+    CodexCliAcceptanceResult, CodexCliAvailabilityRequest, CodexWorkerLaneRequest,
+    CodexWorkerSubprocess, CommitHandoffProjection, ContextBudget, CreateTaskRequest,
+    DEFAULT_CODEX_CLI_ACCEPTANCE_TASK, DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS,
     DEFAULT_CODEX_CLI_PROGRAM, DEFAULT_TASK_WORKER_LANE_KIND, DEFAULT_TIMELINE_PAYLOAD_LIMIT_BYTES,
     EventTimelineInspectRequest, EventTimelineReport, FakeModelTurnRequest, FakeModelTurnResult,
     HeartbeatTaskLeaseRequest, LeaseNextTaskRequest, LeasedCodexWorkerTaskRequest,
@@ -52,12 +55,304 @@ fn run() -> HarnessResult<()> {
             println!("migrations=applied");
             Ok(())
         }
+        Some("capability") => run_capability_command(args.collect()),
         Some("report") => run_report_command(args.collect()),
         Some("session") => run_session_command(args.collect()),
         Some(other) => Err(HarnessError::new(format!(
-            "unknown command: {other}; usage: harness-cli [--version|doctor|migrate|report|session]"
+            "unknown command: {other}; usage: harness-cli [--version|doctor|migrate|capability|report|session]"
         ))),
     }
+}
+
+fn run_capability_command(args: Vec<String>) -> HarnessResult<()> {
+    let Some(command) = args.first() else {
+        return Err(HarnessError::new("capability command is required"));
+    };
+
+    match command.as_str() {
+        "list" => {
+            let report = Runtime::capability_registry();
+            if has_flag(&args, "--json") {
+                print_capability_registry_json(&report)
+            } else {
+                print_capability_registry(&report);
+                Ok(())
+            }
+        }
+        "show" => {
+            let capability_id = args
+                .get(1)
+                .ok_or_else(|| HarnessError::new("capability id is required"))?;
+            let capability = Runtime::capability(capability_id)?;
+            if has_flag(&args, "--json") {
+                print_capability_json(&capability)
+            } else {
+                print_capability(&capability);
+                Ok(())
+            }
+        }
+        "gate" => {
+            let capability_id = args
+                .get(1)
+                .ok_or_else(|| HarnessError::new("capability id is required"))?;
+            let gate = Runtime::capability_gate(capability_id)?;
+            if has_flag(&args, "--json") {
+                print_capability_gate_json(&gate)
+            } else {
+                print_capability_gate(&gate);
+                Ok(())
+            }
+        }
+        "run" => {
+            let capability_id = args
+                .get(1)
+                .ok_or_else(|| HarnessError::new("capability run target is required"))?;
+            if capability_id != "foundation-avp" {
+                return Err(HarnessError::new(format!(
+                    "unknown capability run target: {capability_id}; usage: harness-cli capability run foundation-avp [--database-url <url>] [--json]"
+                )));
+            }
+
+            let report = run_foundation_avp(&args)?;
+            if has_flag(&args, "--json") {
+                print_foundation_avp_json(&report)?;
+            } else {
+                print_foundation_avp_report(&report);
+            }
+
+            if report.gate_passed {
+                Ok(())
+            } else {
+                Err(HarnessError::new("foundation AVP gate failed"))
+            }
+        }
+        other => Err(HarnessError::new(format!(
+            "unknown capability command: {other}; usage: harness-cli capability [list|show|gate|run] [capability_id] [--json]"
+        ))),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FoundationAvpReport {
+    capability_id: String,
+    capability_name: String,
+    gate_status: String,
+    gate_passed: bool,
+    runtime_mode: String,
+    database_mode: String,
+    k3s_status: String,
+    phase_a_implementation: bool,
+    fixture_repo_path: String,
+    session_id: Uuid,
+    task_id: Uuid,
+    worker_final_status: String,
+    worker_pending_commit_state: String,
+    worker_exit_code: String,
+    worker_stdout: String,
+    task_status: String,
+    task_queue_status: String,
+    task_lease_status: String,
+    task_approval_state: String,
+    task_commit_state: String,
+    task_diff_paths: String,
+    task_allocated_worktree_path: String,
+    queue_status_counts: String,
+    queue_projection_kind: String,
+    timeline_event_count: usize,
+    timeline_source_of_truth: String,
+    timeline_projection_kind: String,
+    approval_pending_count: usize,
+    approval_commit_handoff_count: usize,
+    approval_projection_kind: String,
+    worker_lane_current_state: String,
+    worker_diff_paths: String,
+    worker_projection_kind: String,
+    readonly_event_count_before: usize,
+    readonly_event_count_after: usize,
+    original_repo_clean: bool,
+    safety_boundary: String,
+    non_goals: String,
+}
+
+fn run_foundation_avp(args: &[String]) -> HarnessResult<FoundationAvpReport> {
+    let database_url = database_url_from_args(args.to_vec())?;
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let fixture = create_foundation_avp_fixture()?;
+    let repo_path = canonical_repo_path(&fixture.display().to_string())?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let session = runtime.start_session(StartSessionRequest::new(repo_path))?;
+    let task = runtime.create_task(
+        session.session_id,
+        CreateTaskRequest {
+            input: "write the Foundation MVP AVP task".to_owned(),
+            repo_path: None,
+            worker_lane_kind: DEFAULT_TASK_WORKER_LANE_KIND.to_owned(),
+            context: SessionContextCompileRequest::default(),
+            max_output_tokens: 256,
+        },
+    )?;
+    runtime.enqueue_task_with_max_retries(session.session_id, task.task_id, 1)?;
+
+    let timeout_ms = optional_arg_value(args, "--timeout-ms")
+        .map(|value| parse_u64_arg("--timeout-ms", value))
+        .transpose()?
+        .unwrap_or(120_000);
+    let max_stdout_bytes = optional_arg_value(args, "--max-stdout-bytes")
+        .map(|value| parse_usize_arg("--max-stdout-bytes", value))
+        .transpose()?
+        .unwrap_or(4);
+    let mut worker = CodexWorkerLaneRequest::new_subprocess(
+        "Foundation MVP AVP task",
+        foundation_avp_runner_subprocess(&fixture),
+    );
+    worker.timeout_ms = timeout_ms;
+    worker.budget.max_stdout_bytes = max_stdout_bytes;
+
+    let worker_result = runtime
+        .run_next_leased_codex_worker_task(LeasedCodexWorkerTaskRequest {
+            worker_id: "foundation-avp-worker".to_owned(),
+            lease_duration_ms: 60_000,
+            worker,
+        })?
+        .ok_or_else(|| HarnessError::new("foundation AVP did not lease a task"))?;
+
+    let session_before = runtime.inspect_session(session.session_id)?;
+    let task_report = runtime.inspect_task(session.session_id, task.task_id)?;
+    let queue_report = runtime
+        .inspect_task_queue(TaskQueueInspectRequest::new().with_session_id(session.session_id))?;
+    let timeline_report = runtime.inspect_event_timeline(
+        EventTimelineInspectRequest::new(session.session_id)
+            .with_task_id(task.task_id)
+            .with_payload_limit_bytes(512),
+    )?;
+    let approval_report = runtime.inspect_approval_commit(
+        ApprovalCommitInspectRequest::new(session.session_id).with_task_id(task.task_id),
+    )?;
+    let worker_report = runtime.inspect_worker_lane_diff(
+        WorkerLaneDiffInspectRequest::new(session.session_id)
+            .with_task_id(task.task_id)
+            .with_payload_limit_bytes(512),
+    )?;
+    let session_after = runtime.inspect_session(session.session_id)?;
+    let original_repo_status = git_status_short(&fixture)?;
+    let original_repo_clean = original_repo_status.trim().is_empty();
+
+    let worker_lane_current_state = worker_report
+        .lanes
+        .first()
+        .and_then(|lane| lane.current_state.clone())
+        .unwrap_or_default();
+    let worker_diff_paths = worker_report
+        .diffs
+        .first()
+        .map(|diff| diff.paths.join(","))
+        .unwrap_or_default();
+    let worker_exit_code = worker_result
+        .worker
+        .observation
+        .as_ref()
+        .and_then(|observation| observation.exit_code)
+        .map_or_else(String::new, |exit_code| exit_code.to_string());
+    let worker_stdout = worker_result
+        .worker
+        .observation
+        .as_ref()
+        .map(|observation| observation.stdout.clone())
+        .unwrap_or_default();
+    let task_queue_status = task_report
+        .queue
+        .as_ref()
+        .map(|queue| queue.status.clone())
+        .unwrap_or_default();
+    let task_lease_status = task_report
+        .lease
+        .as_ref()
+        .map(|lease| lease.status.clone())
+        .unwrap_or_default();
+    let task_approval_state = task_report
+        .approval
+        .as_ref()
+        .map(|approval| approval.state.clone())
+        .unwrap_or_default();
+    let task_commit_state = task_report
+        .commit
+        .as_ref()
+        .map(|commit| commit.state.clone())
+        .unwrap_or_default();
+    let task_diff_paths = task_report
+        .diff
+        .as_ref()
+        .map(|diff| diff.paths.join(","))
+        .unwrap_or_default();
+    let task_allocated_worktree_path = task_report
+        .workspace
+        .allocated_worktree_path
+        .clone()
+        .unwrap_or_default();
+    let worker_pending_commit_state = worker_result
+        .worker
+        .pending_commit_state
+        .clone()
+        .unwrap_or_default();
+
+    let gate_passed = worker_result.worker.final_status.as_str() == "succeeded"
+        && worker_pending_commit_state == "pending_commit_approval"
+        && task_report.status == "pending_commit_approval"
+        && task_queue_status == "completed"
+        && task_lease_status == "completed"
+        && task_approval_state == "pending_commit_approval"
+        && task_commit_state.is_empty()
+        && task_diff_paths == "README.md"
+        && approval_report.pending_count == 1
+        && approval_report.commit_count == 0
+        && timeline_report.source_of_truth == "EventLog"
+        && timeline_report.projection_kind == "bounded_eventlog_timeline"
+        && worker_lane_current_state == "succeeded"
+        && worker_diff_paths == "README.md"
+        && session_before.event_count == session_after.event_count
+        && original_repo_clean;
+
+    Ok(FoundationAvpReport {
+        capability_id: "foundation-avp".to_owned(),
+        capability_name: "Foundation MVP AVP".to_owned(),
+        gate_status: if gate_passed { "passed" } else { "failed" }.to_owned(),
+        gate_passed,
+        runtime_mode: "windows_binary_or_local_cli".to_owned(),
+        database_mode: "configured_postgres_url".to_owned(),
+        k3s_status: "deferred".to_owned(),
+        phase_a_implementation: false,
+        fixture_repo_path: fixture.display().to_string(),
+        session_id: session.session_id,
+        task_id: task.task_id,
+        worker_final_status: worker_result.worker.final_status.as_str().to_owned(),
+        worker_pending_commit_state,
+        worker_exit_code,
+        worker_stdout,
+        task_status: task_report.status,
+        task_queue_status,
+        task_lease_status,
+        task_approval_state,
+        task_commit_state,
+        task_diff_paths,
+        task_allocated_worktree_path,
+        queue_status_counts: format_task_queue_counts(&queue_report.queue_status_counts),
+        queue_projection_kind: queue_report.projection_kind,
+        timeline_event_count: timeline_report.event_count,
+        timeline_source_of_truth: timeline_report.source_of_truth,
+        timeline_projection_kind: timeline_report.projection_kind,
+        approval_pending_count: approval_report.pending_count,
+        approval_commit_handoff_count: approval_report.commit_count,
+        approval_projection_kind: approval_report.projection_kind,
+        worker_lane_current_state,
+        worker_diff_paths,
+        worker_projection_kind: worker_report.projection_kind,
+        readonly_event_count_before: session_before.event_count,
+        readonly_event_count_after: session_after.event_count,
+        original_repo_clean,
+        safety_boundary: "runtime owns EventLog, Task Queue/Lease, worktree allocation, approval state, and commit handoff".to_owned(),
+        non_goals: "no Phase A model entry, no agent loop, no tools, no MCP, no skills, no hooks, no memory, no subagents, no UI, no daemon, no k3s dependency, no auto commit".to_owned(),
+    })
 }
 
 fn run_report_command(args: Vec<String>) -> HarnessResult<()> {
@@ -854,6 +1149,133 @@ fn canonical_repo_path(repo_path: &str) -> HarnessResult<String> {
     Ok(canonical.display().to_string())
 }
 
+fn create_foundation_avp_fixture() -> HarnessResult<PathBuf> {
+    let repo = env::temp_dir().join(format!(
+        "harness-foundation-avp-{}-{}",
+        std::process::id(),
+        current_time_ms_for_cli()
+    ));
+    fs::create_dir_all(&repo)
+        .map_err(|error| HarnessError::new(format!("could not create AVP fixture: {error}")))?;
+    write_text_file(
+        &repo.join("AGENTS.md"),
+        "# AVP fixture instructions\nOnly the fake runner may edit this temporary fixture.\n",
+    )?;
+    write_text_file(&repo.join("README.md"), "# AVP fixture\n\ninitial\n")?;
+
+    let (runner_name, runner_body) = foundation_avp_runner_script();
+    write_text_file(&repo.join(runner_name), runner_body)?;
+
+    run_git(&repo, &["init"], "initialize AVP fixture git repo")?;
+    run_git(&repo, &["add", "."], "stage AVP fixture files")?;
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Coding Agent Harness QA",
+            "-c",
+            "user.email=harness-qa@example.invalid",
+            "commit",
+            "-m",
+            "initial fixture",
+        ],
+        "commit AVP fixture files",
+    )?;
+
+    Ok(repo)
+}
+
+fn write_text_file(path: &Path, content: &str) -> HarnessResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            HarnessError::new(format!(
+                "could not create parent directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    fs::write(path, content)
+        .map_err(|error| HarnessError::new(format!("could not write {}: {error}", path.display())))
+}
+
+fn run_git(repo: &Path, args: &[&str], action: &str) -> HarnessResult<()> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .map_err(|error| HarnessError::new(format!("could not {action}: {error}")))?;
+
+    if !output.status.success() {
+        return Err(HarnessError::new(format!(
+            "could not {action}: git exited with status {}: {}{}",
+            output
+                .status
+                .code()
+                .map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    Ok(())
+}
+
+fn git_status_short(repo: &Path) -> HarnessResult<String> {
+    let output = Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(repo)
+        .output()
+        .map_err(|error| {
+            HarnessError::new(format!("could not inspect AVP fixture git status: {error}"))
+        })?;
+
+    if !output.status.success() {
+        return Err(HarnessError::new(format!(
+            "could not inspect AVP fixture git status: git exited with status {}: {}{}",
+            output
+                .status
+                .code()
+                .map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn foundation_avp_runner_subprocess(repo: &Path) -> CodexWorkerSubprocess {
+    let (runner_name, _) = foundation_avp_runner_script();
+    let runner = repo.join(runner_name).display().to_string();
+
+    #[cfg(windows)]
+    {
+        CodexWorkerSubprocess::new("cmd", vec!["/C".to_owned(), runner])
+    }
+
+    #[cfg(not(windows))]
+    {
+        CodexWorkerSubprocess::new("sh", vec![runner])
+    }
+}
+
+#[cfg(windows)]
+fn foundation_avp_runner_script() -> (&'static str, &'static str) {
+    (
+        "foundation-avp-runner.cmd",
+        "@echo off\r\necho 0123456789\r\necho changed by Foundation AVP>> README.md\r\nexit /B 0\r\n",
+    )
+}
+
+#[cfg(not(windows))]
+fn foundation_avp_runner_script() -> (&'static str, &'static str) {
+    (
+        "foundation-avp-runner.sh",
+        "#!/bin/sh\nprintf '0123456789\\n'\nprintf 'changed by Foundation AVP\\n' >> README.md\nexit 0\n",
+    )
+}
+
 fn session_id_arg(args: &[String], index: usize) -> HarnessResult<Uuid> {
     let session_id = args
         .get(index)
@@ -879,6 +1301,209 @@ fn print_projection(projection: &SessionProjection) {
     println!("status={}", projection.status.as_str());
     println!("repo_path={}", projection.repo_path);
     println!("event_count={}", projection.event_count);
+}
+
+fn print_capability_registry(report: &CapabilityRegistryReport) {
+    println!("report_id={}", report.report_id);
+    println!("title={}", report.title);
+    println!("summary={}", report.summary);
+    println!("capability_count={}", report.capability_count);
+    println!("source_of_truth={}", report.source_of_truth);
+    println!("projection_kind={}", report.projection_kind);
+
+    for (index, capability) in report.capabilities.iter().enumerate() {
+        println!("capability_{index}_id={}", capability.id);
+        println!("capability_{index}_name={}", capability.name);
+        println!("capability_{index}_phase={}", capability.phase);
+        println!("capability_{index}_status={}", capability.status);
+        println!("capability_{index}_avp_status={}", capability.avp_status);
+        println!(
+            "capability_{index}_dependencies={}",
+            capability.dependencies.join(",")
+        );
+        println!(
+            "capability_{index}_next_owner_gate={}",
+            capability.next_owner_gate
+        );
+    }
+}
+
+fn print_capability_registry_json(report: &CapabilityRegistryReport) -> HarnessResult<()> {
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|error| HarnessError::new(error.to_string()))?;
+    println!("{json}");
+    Ok(())
+}
+
+fn print_capability(capability: &CapabilityNode) {
+    println!("capability_id={}", capability.id);
+    println!("capability_name={}", capability.name);
+    println!("phase={}", capability.phase);
+    println!("status={}", capability.status);
+    println!("avp_status={}", capability.avp_status);
+    println!("problem={}", capability.problem);
+    println!("user_visible_result={}", capability.user_visible_result);
+    println!("current_gap={}", capability.current_gap);
+    println!("dependencies={}", capability.dependencies.join(","));
+    println!(
+        "operation_entries={}",
+        capability.operation_entries.join("|")
+    );
+    println!("acceptance_gates={}", capability.acceptance_gates.join("|"));
+    println!(
+        "runtime_boundaries={}",
+        capability.runtime_boundaries.join("|")
+    );
+    println!("non_goals={}", capability.non_goals.join("|"));
+    println!("next_owner_gate={}", capability.next_owner_gate);
+}
+
+fn print_capability_json(capability: &CapabilityNode) -> HarnessResult<()> {
+    let json = serde_json::to_string_pretty(capability)
+        .map_err(|error| HarnessError::new(error.to_string()))?;
+    println!("{json}");
+    Ok(())
+}
+
+fn print_capability_gate(gate: &CapabilityGateReport) {
+    println!("capability_id={}", gate.capability_id);
+    println!("capability_name={}", gate.capability_name);
+    println!("phase={}", gate.phase);
+    println!("status={}", gate.status);
+    println!("avp_status={}", gate.avp_status);
+    println!("gate_status={}", gate.gate_status);
+    println!("ready_for_implementation={}", gate.ready_for_implementation);
+    println!("ready_for_merge={}", gate.ready_for_merge);
+    println!("blocking_items={}", gate.blocking_items.join("|"));
+    println!("required_evidence={}", gate.required_evidence.join("|"));
+    println!("source_of_truth={}", gate.source_of_truth);
+    println!("projection_kind={}", gate.projection_kind);
+}
+
+fn print_capability_gate_json(gate: &CapabilityGateReport) -> HarnessResult<()> {
+    let json =
+        serde_json::to_string_pretty(gate).map_err(|error| HarnessError::new(error.to_string()))?;
+    println!("{json}");
+    Ok(())
+}
+
+fn print_foundation_avp_report(report: &FoundationAvpReport) {
+    println!("capability_id={}", report.capability_id);
+    println!("capability_name={}", report.capability_name);
+    println!("gate_status={}", report.gate_status);
+    println!("gate_passed={}", report.gate_passed);
+    println!("runtime_mode={}", report.runtime_mode);
+    println!("database_mode={}", report.database_mode);
+    println!("k3s_status={}", report.k3s_status);
+    println!("phase_a_implementation={}", report.phase_a_implementation);
+    println!("fixture_repo_path={}", report.fixture_repo_path);
+    println!("session_id={}", report.session_id);
+    println!("task_id={}", report.task_id);
+    println!("worker_final_status={}", report.worker_final_status);
+    println!(
+        "worker_pending_commit_state={}",
+        report.worker_pending_commit_state
+    );
+    println!("worker_exit_code={}", report.worker_exit_code);
+    println!("worker_stdout={}", report.worker_stdout);
+    println!("task_status={}", report.task_status);
+    println!("task_queue_status={}", report.task_queue_status);
+    println!("task_lease_status={}", report.task_lease_status);
+    println!("task_approval_state={}", report.task_approval_state);
+    println!("task_commit_state={}", report.task_commit_state);
+    println!("task_diff_paths={}", report.task_diff_paths);
+    println!(
+        "task_allocated_worktree_path={}",
+        report.task_allocated_worktree_path
+    );
+    println!("queue_status_counts={}", report.queue_status_counts);
+    println!("queue_projection_kind={}", report.queue_projection_kind);
+    println!("timeline_event_count={}", report.timeline_event_count);
+    println!(
+        "timeline_source_of_truth={}",
+        report.timeline_source_of_truth
+    );
+    println!(
+        "timeline_projection_kind={}",
+        report.timeline_projection_kind
+    );
+    println!("approval_pending_count={}", report.approval_pending_count);
+    println!(
+        "approval_commit_handoff_count={}",
+        report.approval_commit_handoff_count
+    );
+    println!(
+        "approval_projection_kind={}",
+        report.approval_projection_kind
+    );
+    println!(
+        "worker_lane_current_state={}",
+        report.worker_lane_current_state
+    );
+    println!("worker_diff_paths={}", report.worker_diff_paths);
+    println!("worker_projection_kind={}", report.worker_projection_kind);
+    println!(
+        "readonly_event_count_before={}",
+        report.readonly_event_count_before
+    );
+    println!(
+        "readonly_event_count_after={}",
+        report.readonly_event_count_after
+    );
+    println!("original_repo_clean={}", report.original_repo_clean);
+    println!("safety_boundary={}", report.safety_boundary);
+    println!("non_goals={}", report.non_goals);
+    println!("source_of_truth=EventLog+task_queue");
+    println!("projection_kind=foundation_avp_report");
+}
+
+fn print_foundation_avp_json(report: &FoundationAvpReport) -> HarnessResult<()> {
+    let json = serde_json::json!({
+        "capability_id": report.capability_id,
+        "capability_name": report.capability_name,
+        "gate_status": report.gate_status,
+        "gate_passed": report.gate_passed,
+        "runtime_mode": report.runtime_mode,
+        "database_mode": report.database_mode,
+        "k3s_status": report.k3s_status,
+        "phase_a_implementation": report.phase_a_implementation,
+        "fixture_repo_path": report.fixture_repo_path,
+        "session_id": report.session_id.to_string(),
+        "task_id": report.task_id.to_string(),
+        "worker_final_status": report.worker_final_status,
+        "worker_pending_commit_state": report.worker_pending_commit_state,
+        "worker_exit_code": report.worker_exit_code,
+        "worker_stdout": report.worker_stdout,
+        "task_status": report.task_status,
+        "task_queue_status": report.task_queue_status,
+        "task_lease_status": report.task_lease_status,
+        "task_approval_state": report.task_approval_state,
+        "task_commit_state": report.task_commit_state,
+        "task_diff_paths": report.task_diff_paths,
+        "task_allocated_worktree_path": report.task_allocated_worktree_path,
+        "queue_status_counts": report.queue_status_counts,
+        "queue_projection_kind": report.queue_projection_kind,
+        "timeline_event_count": report.timeline_event_count,
+        "timeline_source_of_truth": report.timeline_source_of_truth,
+        "timeline_projection_kind": report.timeline_projection_kind,
+        "approval_pending_count": report.approval_pending_count,
+        "approval_commit_handoff_count": report.approval_commit_handoff_count,
+        "approval_projection_kind": report.approval_projection_kind,
+        "worker_lane_current_state": report.worker_lane_current_state,
+        "worker_diff_paths": report.worker_diff_paths,
+        "worker_projection_kind": report.worker_projection_kind,
+        "readonly_event_count_before": report.readonly_event_count_before,
+        "readonly_event_count_after": report.readonly_event_count_after,
+        "original_repo_clean": report.original_repo_clean,
+        "safety_boundary": report.safety_boundary,
+        "non_goals": report.non_goals,
+        "source_of_truth": "EventLog+task_queue",
+        "projection_kind": "foundation_avp_report",
+    });
+    let json = serde_json::to_string_pretty(&json)
+        .map_err(|error| HarnessError::new(error.to_string()))?;
+    println!("{json}");
+    Ok(())
 }
 
 fn print_architecture_report(report: &RuntimeArchitectureReport) {

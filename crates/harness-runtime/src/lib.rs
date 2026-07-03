@@ -168,6 +168,51 @@ pub struct RuntimeStorageReport {
     pub projection_kind: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CapabilityNode {
+    pub id: String,
+    pub name: String,
+    pub phase: String,
+    pub status: String,
+    pub avp_status: String,
+    pub problem: String,
+    pub user_visible_result: String,
+    pub current_gap: String,
+    pub dependencies: Vec<String>,
+    pub operation_entries: Vec<String>,
+    pub acceptance_gates: Vec<String>,
+    pub runtime_boundaries: Vec<String>,
+    pub non_goals: Vec<String>,
+    pub next_owner_gate: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CapabilityRegistryReport {
+    pub report_id: String,
+    pub title: String,
+    pub summary: String,
+    pub capability_count: usize,
+    pub capabilities: Vec<CapabilityNode>,
+    pub source_of_truth: String,
+    pub projection_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CapabilityGateReport {
+    pub capability_id: String,
+    pub capability_name: String,
+    pub phase: String,
+    pub status: String,
+    pub avp_status: String,
+    pub gate_status: String,
+    pub ready_for_implementation: bool,
+    pub ready_for_merge: bool,
+    pub blocking_items: Vec<String>,
+    pub required_evidence: Vec<String>,
+    pub source_of_truth: String,
+    pub projection_kind: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartSessionRequest {
     pub repo_path: String,
@@ -1239,6 +1284,30 @@ impl Runtime {
     #[must_use]
     pub fn storage_report() -> RuntimeStorageReport {
         runtime_storage_report()
+    }
+
+    #[must_use]
+    pub fn capability_registry() -> CapabilityRegistryReport {
+        runtime_capability_registry()
+    }
+
+    pub fn capability(capability_id: &str) -> HarnessResult<CapabilityNode> {
+        runtime_capability_registry()
+            .capabilities
+            .into_iter()
+            .find(|capability| capability.id == capability_id)
+            .ok_or_else(|| HarnessError::new(format!("capability not found: {capability_id}")))
+    }
+
+    pub fn capability_gate(capability_id: &str) -> HarnessResult<CapabilityGateReport> {
+        let registry = runtime_capability_registry();
+        let capability = registry
+            .capabilities
+            .iter()
+            .find(|capability| capability.id == capability_id)
+            .cloned()
+            .ok_or_else(|| HarnessError::new(format!("capability not found: {capability_id}")))?;
+        Ok(capability_gate_report(capability, &registry.capabilities))
     }
 
     pub fn connect_postgres(database_url: &str) -> HarnessResult<Self> {
@@ -2840,6 +2909,435 @@ struct RecoveryFinish {
     used_repair_bytes: usize,
     max_output_tokens: usize,
     final_state: &'static str,
+}
+
+fn runtime_capability_registry() -> CapabilityRegistryReport {
+    let capabilities = vec![
+        capability_node(
+            "runtime-governance",
+            "Runtime governance source of truth",
+            "foundation",
+            "operational",
+            "running",
+            "The owner needs a runtime-owned truth model instead of chat, UI, or external CLI state.",
+            "Architecture, data-flow, storage, session, timeline, task, queue, approval, worker, and commit reports expose source_of_truth fields.",
+            "Needs to remain invariant as model entry and internal loop are added.",
+            &[],
+            &[
+                "harness-cli report architecture",
+                "harness-cli report data-flow",
+                "harness-cli report storage",
+                "harness-cli session inspect <session_id>",
+                "harness-cli session timeline <session_id>",
+            ],
+            &[
+                "reports expose source_of_truth=EventLog or task_queue+EventLog",
+                "derived projections do not mutate runtime state",
+                "old EventLog replay remains compatible",
+            ],
+            &[
+                "EventLog is the runtime source of truth",
+                "clients and workers are evidence-producing surfaces",
+                "derived reports are not authoritative state",
+            ],
+            &[
+                "do not make UI, external CLI session, MCP, skill, hook, or subagent state authoritative",
+            ],
+            "Keep this invariant green while adding every later capability.",
+        ),
+        capability_node(
+            "task-queue-lease",
+            "Task Queue and Lease ownership",
+            "foundation",
+            "operational",
+            "running",
+            "The owner needs task execution to be schedulable and leased, not a loose chat turn.",
+            "CLI can create, enqueue, lease, heartbeat, expire, retry, stop, complete, fail, and inspect queued tasks.",
+            "Current lease path exists; later workers must continue to use it instead of hidden ownership.",
+            &["runtime-governance"],
+            &[
+                "harness-cli session task queue-inspect",
+                "harness-cli session task lease-next --worker-id <worker>",
+                "harness-cli session task expire-leases",
+            ],
+            &[
+                "leased tasks show worker_id, lease_id, lease_state, retry_count, and stop_reason",
+                "expired leases produce expired, retry_queued, or stopped evidence",
+            ],
+            &[
+                "Task Lease grants temporary ownership only",
+                "lease transitions pair database scheduling state with EventLog evidence",
+            ],
+            &["do not use in-memory locks or permanent worker ownership"],
+            "Use this as the required scheduler for internal agent loop work.",
+        ),
+        capability_node(
+            "approval-commit-handoff",
+            "Approval and Commit Handoff",
+            "foundation",
+            "operational",
+            "running",
+            "The owner needs diffs to wait for approval before durable git history is created.",
+            "CLI can inspect pending approvals, approve or reject task diffs, and commit only approved diffs.",
+            "Rich checkpoint and PR UX are not built; current path is CLI and git commit only.",
+            &["runtime-governance", "task-queue-lease"],
+            &[
+                "harness-cli session approval inspect <session_id>",
+                "harness-cli session task approve <session_id> <task_id>",
+                "harness-cli session task reject <session_id> <task_id> --reason <reason>",
+                "harness-cli session task commit <session_id> <task_id> --message <message>",
+            ],
+            &[
+                "pending diffs cannot commit",
+                "rejected diffs cannot commit",
+                "approved diffs can enter Commit Handoff",
+                "commit failure records failure reason",
+            ],
+            &[
+                "workers propose diffs",
+                "runtime owns approval state",
+                "runtime owns Commit Handoff",
+            ],
+            &["do not auto-push", "do not let a worker commit directly"],
+            "Keep this as the final mutating boundary for Phase A task output.",
+        ),
+        capability_node(
+            "external-codex-lane",
+            "Local governed Codex CLI worker lane",
+            "foundation",
+            "operational",
+            "running_or_skipped",
+            "The owner needs one real external agent lane that can produce evidence without becoming the runtime owner.",
+            "CLI can attempt local Codex acceptance, explicitly skip when unavailable, capture worker output, diff, policy, and pending approval state.",
+            "This proves external-lane governance, not the internal Phase A agent loop.",
+            &[
+                "runtime-governance",
+                "task-queue-lease",
+                "approval-commit-handoff",
+            ],
+            &[
+                "harness-cli session codex-acceptance <session_id>",
+                "harness-cli session task run-next-codex-worker --worker-id <worker> -- <command>",
+                "harness-cli session worker inspect <session_id>",
+            ],
+            &[
+                "unavailable Codex reports codex_acceptance_status=skipped",
+                "successful worker run records policy, output, diff, and pending_commit_approval",
+            ],
+            &[
+                "Codex CLI is an evidence-producing worker lane",
+                "Codex internal state is not source of truth",
+                "worker output and diffs enter EventLog through runtime",
+            ],
+            &["do not treat Codex Cloud or Codex app state as harness state"],
+            "Keep as external-lane proof while internal loop is built separately.",
+        ),
+        capability_node(
+            "observability-replay",
+            "Inspect, report, and replay observability",
+            "foundation",
+            "operational",
+            "running",
+            "The owner needs to inspect what happened instead of trusting a PR summary.",
+            "CLI exposes reports and bounded timelines for sessions, tasks, queue state, worker lanes, approvals, commits, and storage.",
+            "Needs Phase A model, loop, and tool events added without schema breakage.",
+            &["runtime-governance"],
+            &[
+                "harness-cli report architecture --json",
+                "harness-cli session inspect <session_id> --json",
+                "harness-cli session timeline <session_id> --json",
+                "harness-cli session worker inspect <session_id> --json",
+                "harness-cli session approval inspect <session_id> --json",
+            ],
+            &[
+                "JSON reports parse",
+                "bounded payloads report original bytes and truncation",
+                "inspect commands do not mutate state",
+            ],
+            &[
+                "EventLog replay drives reports",
+                "large payloads are bounded before display",
+            ],
+            &["do not expose secrets or unbounded stdout/stderr in reports"],
+            "Use as the owner-visible surface for every future capability.",
+        ),
+        capability_node(
+            "model-entry",
+            "Auditable model entry",
+            "phase-a",
+            "candidate",
+            "not_accepted",
+            "The owner needs model providers to enter the runtime as evidence producers, not file writers or approvers.",
+            "Expected surface: provider request/response, skipped config, and provider error evidence visible through EventLog and inspect/report.",
+            "Draft work exists but is not owner-approved and must pass EventLog compatibility plus secret redaction review.",
+            &["runtime-governance", "observability-replay"],
+            &[
+                "future: harness-cli session model-route <session_id>",
+                "future: harness-cli session timeline <session_id> --json",
+            ],
+            &[
+                "fake provider records deterministic evidence",
+                "missing real-provider config is skipped",
+                "provider error records error evidence",
+                "no approval or commit is produced",
+                "API keys and env values never appear in EventLog, stdout, stderr, inspect, or report",
+            ],
+            &[
+                "model provider can only produce evidence",
+                "model provider cannot mutate files",
+                "model provider cannot approve or commit",
+            ],
+            &[
+                "do not build agent loop",
+                "do not build tools",
+                "do not add MCP, skills, hooks, memory, subagents, UI, daemon, or remote workers",
+            ],
+            "Owner must explicitly approve model-entry implementation before code can be merged.",
+        ),
+        capability_node(
+            "bounded-agent-loop",
+            "Bounded internal agent loop",
+            "phase-a",
+            "missing",
+            "not_built",
+            "The owner needs the harness to run an internal task loop instead of delegating only to external lanes.",
+            "Expected surface: task run report shows loop steps, budget, stop reason, and terminal state.",
+            "Not built. It depends on accepted model entry.",
+            &["model-entry", "runtime-governance", "observability-replay"],
+            &["future: harness-cli session task run-internal <session_id> <task_id>"],
+            &[
+                "loop has max turn and budget limits",
+                "loop records step evidence",
+                "loop stops on done, error, budget, denied action, or required approval",
+            ],
+            &[
+                "runtime owns loop state",
+                "loop cannot bypass Policy Gate or Approval State Machine",
+            ],
+            &["do not add subagents or memory in Phase A"],
+            "Wait for model-entry acceptance.",
+        ),
+        capability_node(
+            "controlled-coding-tools",
+            "Controlled coding tools",
+            "phase-a",
+            "missing",
+            "not_built",
+            "The owner needs file, shell, edit, search, and test actions to be tools under runtime governance.",
+            "Expected surface: tool intent, policy decision, execution observation, and denied/ask/error states visible in timeline/report.",
+            "Policy and Tool Runtime boundaries exist, but the mature internal coding tool set is not complete.",
+            &["bounded-agent-loop", "runtime-governance"],
+            &["future: harness-cli session tool inspect <session_id>"],
+            &[
+                "allowed tools execute through Tool Runtime",
+                "denied tools do not execute",
+                "ask tools wait for approval",
+                "tool output is bounded and redacted",
+            ],
+            &[
+                "Policy Gate is the only authorization surface",
+                "Tool Runtime is the only execution surface",
+            ],
+            &["do not let model output directly mutate files"],
+            "Wait for bounded-agent-loop design and owner gate.",
+        ),
+        capability_node(
+            "planning-mode",
+            "Planning mode",
+            "phase-a",
+            "missing",
+            "not_built",
+            "The owner needs a read-only planning path before implementation begins.",
+            "Expected surface: plan output and evidence can be inspected, and the plan mode proves no file mutation.",
+            "Not built as an enforceable mode.",
+            &["model-entry", "observability-replay"],
+            &["future: harness-cli session plan <session_id> --task <task>"],
+            &[
+                "planning can read and inspect context",
+                "planning cannot write files",
+                "planning output is evidence, not approval",
+            ],
+            &[
+                "planning mode must enforce write blocking",
+                "approval remains runtime-owned",
+            ],
+            &["do not treat a plan as implementation approval"],
+            "Wait until model-entry evidence and read-only boundaries are accepted.",
+        ),
+        capability_node(
+            "end-to-end-task-evidence",
+            "Phase A end-to-end task evidence",
+            "phase-a",
+            "missing",
+            "not_built",
+            "The owner needs one complete internal task path that can be run and inspected without reading PR summaries.",
+            "Expected surface: one CLI acceptance path creates a task, runs the internal loop, uses controlled tools, produces a diff, stops at approval, and exposes replay evidence.",
+            "Not built. This is the Phase A AVP, and it depends on model entry, loop, tools, and planning boundaries.",
+            &[
+                "model-entry",
+                "bounded-agent-loop",
+                "controlled-coding-tools",
+                "planning-mode",
+                "approval-commit-handoff",
+            ],
+            &["future: harness-cli session task accept-phase-a <session_id>"],
+            &[
+                "task evidence covers input, context, model, tool intents, policy decisions, observations, diff, approval state, and replay summary",
+                "normal path stops at pending_commit_approval",
+                "failure paths show skipped, error, denied, expired, or rejected states",
+            ],
+            &[
+                "EventLog remains source of truth",
+                "Task Lease owns execution",
+                "Policy Gate owns tool authorization",
+                "Approval State Machine owns approval",
+                "Commit Handoff owns commits",
+            ],
+            &[
+                "do not include MCP, skills, hooks, memory, subagents, daemon, UI, or remote workers",
+            ],
+            "Build only after the four preceding Phase A capabilities are accepted.",
+        ),
+    ];
+
+    CapabilityRegistryReport {
+        report_id: "capability_workbench".to_owned(),
+        title: "Capability Workbench".to_owned(),
+        summary: "Owner-facing registry of stable runtime capability nodes, their current AVP status, gates, and acceptance surfaces.".to_owned(),
+        capability_count: capabilities.len(),
+        capabilities,
+        source_of_truth: "CONTEXT.md + accepted ADRs + runtime capability registry".to_owned(),
+        projection_kind: "capability_registry_report".to_owned(),
+    }
+}
+
+fn capability_gate_report(
+    capability: CapabilityNode,
+    all_capabilities: &[CapabilityNode],
+) -> CapabilityGateReport {
+    let (gate_status, ready_for_implementation, ready_for_merge, blocking_items) =
+        match capability.status.as_str() {
+            "operational" => (
+                "implemented_capability",
+                false,
+                false,
+                vec![
+                "No new implementation gate is requested for an already operational capability."
+                    .to_owned(),
+            ],
+            ),
+            "candidate" => (
+                "blocked_waiting_owner_implementation_approval",
+                false,
+                false,
+                vec![
+                    "Owner has not explicitly approved implementation for this capability."
+                        .to_owned(),
+                    "Owner Acceptance Demo Pack must be accepted before implementation.".to_owned(),
+                    "EventLog compatibility and secret redaction review must pass.".to_owned(),
+                ],
+            ),
+            "missing" => (
+                "blocked_by_dependencies",
+                false,
+                false,
+                dependency_blocking_items(&capability, all_capabilities),
+            ),
+            "deferred" => (
+                "deferred_to_later_phase",
+                false,
+                false,
+                vec!["Capability is outside the current approved phase.".to_owned()],
+            ),
+            other => (
+                "unknown_status",
+                false,
+                false,
+                vec![format!("Unknown capability status: {other}")],
+            ),
+        };
+
+    CapabilityGateReport {
+        capability_id: capability.id,
+        capability_name: capability.name,
+        phase: capability.phase,
+        status: capability.status,
+        avp_status: capability.avp_status,
+        gate_status: gate_status.to_owned(),
+        ready_for_implementation,
+        ready_for_merge,
+        blocking_items,
+        required_evidence: capability.acceptance_gates,
+        source_of_truth: "capability registry + owner acceptance gate".to_owned(),
+        projection_kind: "capability_gate_report".to_owned(),
+    }
+}
+
+fn dependency_blocking_items(
+    capability: &CapabilityNode,
+    all_capabilities: &[CapabilityNode],
+) -> Vec<String> {
+    let mut blocking_items = Vec::new();
+
+    for dependency in &capability.dependencies {
+        match all_capabilities
+            .iter()
+            .find(|capability| capability.id == *dependency)
+        {
+            Some(dependency_capability) if dependency_capability.status == "operational" => {}
+            Some(dependency_capability) => blocking_items.push(format!(
+                "Dependency capability is not accepted: {} ({})",
+                dependency_capability.id, dependency_capability.status
+            )),
+            None => blocking_items.push(format!(
+                "Dependency capability is not registered: {dependency}"
+            )),
+        }
+    }
+
+    if blocking_items.is_empty() {
+        blocking_items.push(
+            "Capability is missing implementation but its registered dependencies are operational."
+                .to_owned(),
+        );
+    }
+
+    blocking_items
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capability_node(
+    id: &str,
+    name: &str,
+    phase: &str,
+    status: &str,
+    avp_status: &str,
+    problem: &str,
+    user_visible_result: &str,
+    current_gap: &str,
+    dependencies: &[&str],
+    operation_entries: &[&str],
+    acceptance_gates: &[&str],
+    runtime_boundaries: &[&str],
+    non_goals: &[&str],
+    next_owner_gate: &str,
+) -> CapabilityNode {
+    CapabilityNode {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        phase: phase.to_owned(),
+        status: status.to_owned(),
+        avp_status: avp_status.to_owned(),
+        problem: problem.to_owned(),
+        user_visible_result: user_visible_result.to_owned(),
+        current_gap: current_gap.to_owned(),
+        dependencies: strings(dependencies),
+        operation_entries: strings(operation_entries),
+        acceptance_gates: strings(acceptance_gates),
+        runtime_boundaries: strings(runtime_boundaries),
+        non_goals: strings(non_goals),
+        next_owner_gate: next_owner_gate.to_owned(),
+    }
 }
 
 fn runtime_architecture_report() -> RuntimeArchitectureReport {
@@ -5086,13 +5584,16 @@ fn allocate_task_worktree(
         })?;
     }
 
+    let git_repo_path = git_cli_path(repo_path);
+    let git_worktree_path = git_cli_path(&worktree_path);
+
     let output = Command::new("git")
         .arg("-C")
-        .arg(repo_path)
+        .arg(git_repo_path)
         .arg("worktree")
         .arg("add")
         .arg("--detach")
-        .arg(&worktree_path)
+        .arg(git_worktree_path)
         .arg("HEAD")
         .output()
         .map_err(|error| HarnessError::new(format!("could not start git worktree add: {error}")))?;
@@ -5119,6 +5620,20 @@ fn canonicalize_if_possible(path: &Path) -> String {
     let path = path.canonicalize().unwrap_or_else(|_| PathBuf::from(path));
 
     path.display().to_string()
+}
+
+fn git_cli_path(path: &Path) -> PathBuf {
+    let path_text = path.display().to_string();
+
+    if let Some(stripped) = path_text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{stripped}"));
+    }
+
+    if let Some(stripped) = path_text.strip_prefix(r"\\?\") {
+        return PathBuf::from(stripped);
+    }
+
+    PathBuf::from(path)
 }
 
 fn truncate_to_bytes(value: &str, max_bytes: usize) -> String {
