@@ -6,6 +6,18 @@ terms for runtime ownership, worker lanes, approvals, and audit evidence.
 
 ## Language
 
+**Private Coding-Agent Runtime**:
+A self-owned runtime that accepts coding tasks, governs model and tool
+execution, records replayable evidence, produces reviewable diffs, and owns the
+approval-to-commit path.
+_Avoid_: Chat shell, IDE wrapper, external agent source of truth
+
+**Evidence-Producing Participant**:
+A model provider, external CLI, MCP server, skill, hook, subagent, or client
+surface that may contribute observations, outputs, diffs, or decisions while
+the harness remains the runtime source of truth.
+_Avoid_: Runtime owner, independent commit authority, hidden state owner
+
 **Local Governed Codex CLI Worker**:
 A local Codex CLI execution treated as a governed worker lane for one harness
 task. It is an evidence-producing worker, not the runtime source of truth.
