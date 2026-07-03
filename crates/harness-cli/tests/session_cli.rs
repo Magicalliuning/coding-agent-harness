@@ -93,6 +93,179 @@ fn cli_reports_architecture_data_flow_and_storage_text_and_json()
 }
 
 #[test]
+fn cli_reports_capability_workbench_text_and_json() -> Result<(), Box<dyn std::error::Error>> {
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+
+    let list = Command::new(bin).args(["capability", "list"]).output()?;
+    assert!(list.status.success());
+    let list_stdout = String::from_utf8(list.stdout)?;
+    assert!(list_stdout.contains("report_id=capability_workbench"));
+    assert!(list_stdout.contains("projection_kind=capability_registry_report"));
+    assert!(list_stdout.contains("capability_count=10"));
+    assert!(list_stdout.contains("capability_0_id=runtime-governance"));
+    assert!(list_stdout.contains("capability_5_id=model-entry"));
+    assert!(list_stdout.contains("capability_5_status=candidate"));
+    assert!(list_stdout.contains("capability_9_id=end-to-end-task-evidence"));
+    assert!(list_stdout.contains("capability_9_avp_status=not_built"));
+
+    let list_json = Command::new(bin)
+        .args(["capability", "list", "--json"])
+        .output()?;
+    assert!(list_json.status.success());
+    let list_json_stdout = String::from_utf8(list_json.stdout)?;
+    let registry: Value = serde_json::from_str(&list_json_stdout)?;
+    assert_eq!(registry["report_id"], "capability_workbench");
+    assert_eq!(registry["capability_count"], 10);
+    assert!(
+        registry["capabilities"]
+            .as_array()
+            .expect("capabilities")
+            .iter()
+            .any(|capability| capability["id"] == "end-to-end-task-evidence"
+                && capability["status"] == "missing")
+    );
+
+    let show = Command::new(bin)
+        .args(["capability", "show", "model-entry"])
+        .output()?;
+    assert!(show.status.success());
+    let show_stdout = String::from_utf8(show.stdout)?;
+    assert!(show_stdout.contains("capability_id=model-entry"));
+    assert!(show_stdout.contains("capability_name=Auditable model entry"));
+    assert!(show_stdout.contains("status=candidate"));
+    assert!(show_stdout.contains("avp_status=not_accepted"));
+    assert!(show_stdout.contains("model provider cannot mutate files"));
+    assert!(show_stdout.contains("API keys and env values never appear"));
+    assert!(show_stdout.contains("next_owner_gate=Owner must explicitly approve"));
+
+    let show_json = Command::new(bin)
+        .args(["capability", "show", "model-entry", "--json"])
+        .output()?;
+    assert!(show_json.status.success());
+    let model_entry: Value = serde_json::from_str(&String::from_utf8(show_json.stdout)?)?;
+    assert_eq!(model_entry["id"], "model-entry");
+    assert_eq!(model_entry["phase"], "phase-a");
+    assert_eq!(model_entry["status"], "candidate");
+    assert!(
+        model_entry["runtime_boundaries"]
+            .as_array()
+            .expect("runtime boundaries")
+            .iter()
+            .any(|boundary| boundary == "model provider cannot approve or commit")
+    );
+
+    let gate = Command::new(bin)
+        .args(["capability", "gate", "end-to-end-task-evidence"])
+        .output()?;
+    assert!(gate.status.success());
+    let gate_stdout = String::from_utf8(gate.stdout)?;
+    assert!(gate_stdout.contains("capability_id=end-to-end-task-evidence"));
+    assert!(gate_stdout.contains("gate_status=blocked_by_dependencies"));
+    assert!(gate_stdout.contains("ready_for_implementation=false"));
+    assert!(gate_stdout.contains("ready_for_merge=false"));
+    assert!(gate_stdout.contains("Dependency capability is not accepted: model-entry (candidate)"));
+    assert!(
+        gate_stdout.contains("Dependency capability is not accepted: bounded-agent-loop (missing)")
+    );
+    assert!(
+        !gate_stdout.contains("Dependency capability is not accepted: approval-commit-handoff")
+    );
+
+    let gate_json = Command::new(bin)
+        .args(["capability", "gate", "model-entry", "--json"])
+        .output()?;
+    assert!(gate_json.status.success());
+    let gate: Value = serde_json::from_str(&String::from_utf8(gate_json.stdout)?)?;
+    assert_eq!(
+        gate["gate_status"],
+        "blocked_waiting_owner_implementation_approval"
+    );
+    assert_eq!(gate["ready_for_implementation"], false);
+    assert_eq!(gate["ready_for_merge"], false);
+
+    Ok(())
+}
+
+#[test]
+fn cli_runs_foundation_avp_capability_gate() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    let bin = env!("CARGO_BIN_EXE_harness-cli");
+
+    let avp = Command::new(bin)
+        .args([
+            "capability",
+            "run",
+            "foundation-avp",
+            "--database-url",
+            &database_url,
+        ])
+        .output()?;
+    assert!(avp.status.success());
+
+    let stdout = String::from_utf8(avp.stdout)?;
+    assert!(stdout.contains("capability_id=foundation-avp"));
+    assert!(stdout.contains("gate_status=passed"));
+    assert!(stdout.contains("gate_passed=true"));
+    assert!(stdout.contains("runtime_mode=windows_binary_or_local_cli"));
+    assert!(stdout.contains("database_mode=configured_postgres_url"));
+    assert!(stdout.contains("k3s_status=deferred"));
+    assert!(stdout.contains("phase_a_implementation=false"));
+    assert!(stdout.contains("worker_final_status=succeeded"));
+    assert!(stdout.contains("worker_pending_commit_state=pending_commit_approval"));
+    assert!(stdout.contains("worker_exit_code=0"));
+    assert!(stdout.contains("worker_stdout=0123"));
+    assert!(stdout.contains("task_status=pending_commit_approval"));
+    assert!(stdout.contains("task_queue_status=completed"));
+    assert!(stdout.contains("task_lease_status=completed"));
+    assert!(stdout.contains("task_approval_state=pending_commit_approval"));
+    assert!(stdout.contains("task_commit_state="));
+    assert!(stdout.contains("task_diff_paths=README.md"));
+    assert!(stdout.contains("queue_status_counts=completed:1"));
+    assert!(stdout.contains("timeline_source_of_truth=EventLog"));
+    assert!(stdout.contains("timeline_projection_kind=bounded_eventlog_timeline"));
+    assert!(stdout.contains("approval_pending_count=1"));
+    assert!(stdout.contains("approval_commit_handoff_count=0"));
+    assert!(stdout.contains("worker_lane_current_state=succeeded"));
+    assert!(stdout.contains("worker_diff_paths=README.md"));
+    assert!(stdout.contains("original_repo_clean=true"));
+    assert!(stdout.contains("source_of_truth=EventLog+task_queue"));
+    assert!(stdout.contains("projection_kind=foundation_avp_report"));
+    assert!(stdout.contains("no Phase A model entry"));
+
+    let json = Command::new(bin)
+        .args([
+            "capability",
+            "run",
+            "foundation-avp",
+            "--database-url",
+            &database_url,
+            "--json",
+        ])
+        .output()?;
+    assert!(json.status.success());
+
+    let json: Value = serde_json::from_slice(&json.stdout)?;
+    assert_eq!(json["capability_id"], "foundation-avp");
+    assert_eq!(json["gate_status"], "passed");
+    assert_eq!(json["gate_passed"], true);
+    assert_eq!(json["task_status"], "pending_commit_approval");
+    assert_eq!(json["task_queue_status"], "completed");
+    assert_eq!(json["task_lease_status"], "completed");
+    assert_eq!(json["task_approval_state"], "pending_commit_approval");
+    assert_eq!(json["task_commit_state"], "");
+    assert_eq!(json["approval_pending_count"], 1);
+    assert_eq!(json["approval_commit_handoff_count"], 0);
+    assert_eq!(json["timeline_source_of_truth"], "EventLog");
+    assert_eq!(json["original_repo_clean"], true);
+    assert_eq!(json["projection_kind"], "foundation_avp_report");
+
+    Ok(())
+}
+
+#[test]
 fn cli_starts_and_shows_session_from_postgres_eventlog() -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
         return Ok(());
@@ -320,6 +493,7 @@ fn cli_inspects_session_text_and_json_without_mutating_state()
 
     let start_stdout = String::from_utf8(start.stdout)?;
     let session_id = value_for_key(&start_stdout, "session_id").expect("session_id output");
+    let repo_path = value_for_key(&start_stdout, "repo_path").expect("repo_path output");
 
     let first = Command::new(bin)
         .args([
@@ -479,6 +653,39 @@ fn cli_inspects_session_text_and_json_without_mutating_state()
     assert!(after_task.status.success());
     let after_task_stdout = String::from_utf8(after_task.stdout)?;
     assert!(after_task_stdout.contains("task_queue_status=queued"));
+
+    let cleanup_lease = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "lease-next",
+            "--database-url",
+            &database_url,
+            "--worker-id",
+            "cli-session-inspect-cleanup",
+        ])
+        .output()?;
+    assert!(cleanup_lease.status.success());
+    let cleanup_lease_stdout = String::from_utf8(cleanup_lease.stdout)?;
+    assert!(cleanup_lease_stdout.contains(&format!("task_id={first_task_id}")));
+    let cleanup_lease_id =
+        value_for_key(&cleanup_lease_stdout, "task_lease_id").expect("cleanup lease id output");
+
+    let cleanup_complete = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "complete",
+            first_task_id,
+            "--database-url",
+            &database_url,
+            "--lease-id",
+            cleanup_lease_id,
+            "--reason",
+            "test cleanup completed queued inspect task",
+        ])
+        .output()?;
+    assert!(cleanup_complete.status.success());
 
     Ok(())
 }
@@ -942,6 +1149,22 @@ fn cli_inspects_task_text_and_json_without_mutating_state() -> Result<(), Box<dy
     assert!(after_task_stdout.contains("task_queue_status=leased"));
     assert!(after_task_stdout.contains(&format!("task_lease_id={lease_id}")));
 
+    let cleanup_complete = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "complete",
+            task_id,
+            "--database-url",
+            &database_url,
+            "--lease-id",
+            lease_id,
+            "--reason",
+            "test cleanup completed inspected leased task",
+        ])
+        .output()?;
+    assert!(cleanup_complete.status.success());
+
     Ok(())
 }
 
@@ -1163,6 +1386,22 @@ fn cli_inspects_task_queue_text_and_json_without_mutating_state()
     assert!(after_task_stdout.contains(&format!("task_lease_id={lease_id}")));
     assert!(after_task_stdout.contains(&format!("task_lease_deadline_ms={lease_deadline_ms}")));
 
+    let cleanup_complete = Command::new(bin)
+        .args([
+            "session",
+            "task",
+            "complete",
+            task_id,
+            "--database-url",
+            &database_url,
+            "--lease-id",
+            lease_id,
+            "--reason",
+            "test cleanup completed queue inspected task",
+        ])
+        .output()?;
+    assert!(cleanup_complete.status.success());
+
     Ok(())
 }
 
@@ -1352,7 +1591,7 @@ fn cli_renews_expires_retries_and_stops_task_leases() -> Result<(), Box<dyn std:
             "--worker-id",
             "cli-worker-1",
             "--lease-ms",
-            "1",
+            "60000",
         ])
         .output()?;
     assert!(first_lease.status.success());
@@ -2071,7 +2310,7 @@ fn cli_v04_observability_acceptance_commands_are_read_only()
         "--database-url",
         &database_url,
     ])?;
-    assert!(session_text.contains("projection_kind=session_inspect_report"));
+    assert!(session_text.contains("projection_kind=derived_from_eventlog"));
     let session_json = run_cli(&[
         "session",
         "inspect",
@@ -2082,7 +2321,7 @@ fn cli_v04_observability_acceptance_commands_are_read_only()
     ])?;
     assert_eq!(
         serde_json::from_str::<Value>(&session_json)?["projection_kind"],
-        "session_inspect_report"
+        "derived_from_eventlog"
     );
 
     let task_json = run_cli(&[
