@@ -22,12 +22,13 @@ use harness_runtime::{
     CodexWorkerLaneWorkspace, CodexWorkerSubprocess, CodexWorkerUsage, ContextBudget,
     CreateTaskRequest, DEFAULT_TASK_WORKER_LANE_KIND, EventTimelineInspectRequest,
     FakeModelTurnRequest, HeartbeatTaskLeaseRequest, LeaseNextTaskRequest,
-    LeasedCodexWorkerTaskRequest, PENDING_COMMIT_APPROVAL_STATE, RECOVERY_FAILED_STATE,
-    RecoveryStopReason, Runtime, SelfRecoveryLoopRequest, SessionContextCompileRequest,
-    SessionStatus, SmallCodingTaskRequest, StartSessionRequest, TASK_CANCELLED_STATE,
-    TASK_COMPLETED_STATE, TASK_FAILED_STATE, TASK_LEASED_STATE, TASK_QUEUED_STATE,
-    TASK_RETRY_QUEUED_STATE, TASK_STOP_REASON_LEASE_EXPIRED, TASK_STOP_REASON_MAX_RETRIES_EXCEEDED,
-    TASK_STOPPED_STATE, TaskQueueInspectRequest, UsageConfidence, VerificationCommandRequest,
+    LeasedCodexWorkerTaskRequest, ModelProviderRoutingRequest, ModelProviderRoutingStatus,
+    PENDING_COMMIT_APPROVAL_STATE, RECOVERY_FAILED_STATE, RecoveryStopReason, Runtime,
+    RuntimeModelProvider, SelfRecoveryLoopRequest, SessionContextCompileRequest, SessionStatus,
+    SmallCodingTaskRequest, StartSessionRequest, TASK_CANCELLED_STATE, TASK_COMPLETED_STATE,
+    TASK_FAILED_STATE, TASK_LEASED_STATE, TASK_QUEUED_STATE, TASK_RETRY_QUEUED_STATE,
+    TASK_STOP_REASON_LEASE_EXPIRED, TASK_STOP_REASON_MAX_RETRIES_EXCEEDED, TASK_STOPPED_STATE,
+    TaskQueueInspectRequest, UsageConfidence, VerificationCommandRequest,
     WorkerLaneDiffInspectRequest, WorkerLaneStatus, detect_codex_cli_availability,
 };
 use postgres::{Client, NoTls};
@@ -2151,6 +2152,156 @@ fn session_context_compilation_is_recorded() -> Result<(), Box<dyn std::error::E
 }
 
 #[test]
+fn model_provider_route_records_fake_response_evidence() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = fixture_repo()?;
+    write_file(&repo, "AGENTS.md", "Use deterministic agent fixtures.")?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo.display().to_string()))?;
+
+    let result = runtime.run_model_provider_route(
+        started.session_id,
+        ModelProviderRoutingRequest {
+            provider: RuntimeModelProvider::deterministic_fake(),
+            task: "route a model request".to_owned(),
+            context: SessionContextCompileRequest {
+                budget: ContextBudget {
+                    max_bytes: 4096,
+                    max_files: 8,
+                    max_skill_files: 8,
+                },
+                focus_terms: vec!["agent".to_owned()],
+            },
+            max_output_tokens: 256,
+        },
+    )?;
+    let events = runtime.events_for_session(started.session_id)?;
+    let event_types = events
+        .iter()
+        .map(|event| event.event_type)
+        .collect::<Vec<_>>();
+
+    assert_eq!(result.status, ModelProviderRoutingStatus::Responded);
+    assert_eq!(result.provider_kind, "deterministic_fake");
+    assert_eq!(result.model_id, "deterministic-fake-model");
+    assert!(result.usage_known);
+    assert!(result.prompt_tokens.is_some());
+    assert!(result.completion_tokens.is_some());
+    assert_eq!(result.event_count, 4);
+    assert_eq!(
+        event_types,
+        vec![
+            EventType::SessionStarted,
+            EventType::ContextCompiled,
+            EventType::ModelRequestRecorded,
+            EventType::ModelDecisionRecorded,
+        ]
+    );
+    assert_eq!(events[2].payload["provider_kind"], "deterministic_fake");
+    assert_eq!(events[2].payload["model_id"], "deterministic-fake-model");
+    assert_eq!(events[3].payload["usage_known"], true);
+
+    Ok(())
+}
+
+#[test]
+fn model_provider_route_records_unconfigured_real_provider_skip()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = fixture_repo()?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo.display().to_string()))?;
+
+    let result = runtime.run_model_provider_route(
+        started.session_id,
+        ModelProviderRoutingRequest {
+            provider: RuntimeModelProvider::OpenAiCompatible {
+                model_id: "gpt-test".to_owned(),
+                api_key_env: "HARNESS_TEST_MISSING_OPENAI_KEY".to_owned(),
+            },
+            task: "try a real provider".to_owned(),
+            context: SessionContextCompileRequest::default(),
+            max_output_tokens: 256,
+        },
+    )?;
+    let events = runtime.events_for_session(started.session_id)?;
+
+    assert_eq!(result.status, ModelProviderRoutingStatus::Skipped);
+    assert_eq!(result.provider_kind, "openai_compatible");
+    assert_eq!(result.model_id, "gpt-test");
+    assert_eq!(
+        result.skipped_reason.as_deref(),
+        Some("openai-compatible provider credentials are not configured")
+    );
+    assert_eq!(result.patch, None);
+    assert!(!result.usage_known);
+    assert_eq!(events[3].event_type, EventType::ModelProviderSkipped);
+    assert_eq!(
+        events[3].payload["skipped_reason"],
+        "openai-compatible provider credentials are not configured"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn model_provider_route_records_error_without_approval_or_commit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = database_url() else {
+        return Ok(());
+    };
+
+    harness_runtime::apply_database_migrations(&database_url)?;
+
+    let repo = fixture_repo()?;
+    let mut runtime = Runtime::connect_postgres(&database_url)?;
+    let started = runtime.start_session(StartSessionRequest::new(repo.display().to_string()))?;
+
+    let error = runtime
+        .run_model_provider_route(
+            started.session_id,
+            ModelProviderRoutingRequest {
+                provider: RuntimeModelProvider::deterministic_fake(),
+                task: "force a model budget error".to_owned(),
+                context: SessionContextCompileRequest::default(),
+                max_output_tokens: 1,
+            },
+        )
+        .expect_err("model budget error");
+    let events = runtime.events_for_session(started.session_id)?;
+    let event_types = events
+        .iter()
+        .map(|event| event.event_type)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        error.message(),
+        "fake model patch exceeds output token budget"
+    );
+    assert!(event_types.contains(&EventType::ModelProviderError));
+    assert!(!event_types.contains(&EventType::CommitApprovalPending));
+    assert!(!event_types.contains(&EventType::CommitApproved));
+    assert!(!event_types.contains(&EventType::CommitStarted));
+    assert!(!event_types.contains(&EventType::CommitSucceeded));
+    assert_eq!(
+        events.last().expect("last event").payload["error"],
+        "fake model patch exceeds output token budget"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn fake_model_turn_records_patch_observation() -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = database_url() else {
         return Ok(());
@@ -2186,6 +2337,8 @@ fn fake_model_turn_records_patch_observation() -> Result<(), Box<dyn std::error:
         .collect::<Vec<_>>();
 
     assert_eq!(result.decision, PolicyDecision::Allow);
+    assert_eq!(result.provider_kind, "deterministic_fake");
+    assert_eq!(result.model_id, "deterministic-fake-model");
     assert!(result.observation.is_some());
     assert!(written.contains("write the first fake patch"));
     assert_eq!(result.event_count, 7);

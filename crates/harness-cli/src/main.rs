@@ -8,18 +8,20 @@ use harness_runtime::{
     CodexCliAcceptanceRequest, CodexCliAcceptanceResult, CodexCliAvailabilityRequest,
     CodexWorkerLaneRequest, CodexWorkerSubprocess, CommitHandoffProjection, ContextBudget,
     CreateTaskRequest, DEFAULT_CODEX_CLI_ACCEPTANCE_TASK, DEFAULT_CODEX_CLI_ACCEPTANCE_TIMEOUT_MS,
-    DEFAULT_CODEX_CLI_PROGRAM, DEFAULT_TASK_WORKER_LANE_KIND, DEFAULT_TIMELINE_PAYLOAD_LIMIT_BYTES,
+    DEFAULT_CODEX_CLI_PROGRAM, DEFAULT_OPENAI_COMPATIBLE_API_KEY_ENV,
+    DEFAULT_TASK_WORKER_LANE_KIND, DEFAULT_TIMELINE_PAYLOAD_LIMIT_BYTES,
     EventTimelineInspectRequest, EventTimelineReport, FakeModelTurnRequest, FakeModelTurnResult,
     HeartbeatTaskLeaseRequest, LeaseNextTaskRequest, LeasedCodexWorkerTaskRequest,
-    LeasedCodexWorkerTaskResult, Runtime, RuntimeArchitectureReport, RuntimeDataFlowReport,
-    RuntimeDataFlowStep, RuntimeReportEdge, RuntimeReportNode, RuntimeReportNonGoal,
-    RuntimeReportSection, RuntimeStorageProjectionReport, RuntimeStorageReport,
-    RuntimeStorageTableReport, SelfRecoveryLoopRequest, SelfRecoveryLoopResult,
-    SessionContextCompileRequest, SessionContextCompileResult, SessionInspectReport,
-    SessionProjection, SmallCodingTaskRequest, SmallCodingTaskResult, StartSessionRequest,
-    TaskInspectReport, TaskProjection, TaskQueueInspectReport, TaskQueueInspectRequest,
-    TaskQueueInspectStatusCount, VerificationCommandRequest, VerificationCommandResult,
-    WorkerLaneDiffInspectReport, WorkerLaneDiffInspectRequest,
+    LeasedCodexWorkerTaskResult, ModelProviderRoutingRequest, ModelProviderRoutingResult, Runtime,
+    RuntimeArchitectureReport, RuntimeDataFlowReport, RuntimeDataFlowStep, RuntimeModelProvider,
+    RuntimeReportEdge, RuntimeReportNode, RuntimeReportNonGoal, RuntimeReportSection,
+    RuntimeStorageProjectionReport, RuntimeStorageReport, RuntimeStorageTableReport,
+    SelfRecoveryLoopRequest, SelfRecoveryLoopResult, SessionContextCompileRequest,
+    SessionContextCompileResult, SessionInspectReport, SessionProjection, SmallCodingTaskRequest,
+    SmallCodingTaskResult, StartSessionRequest, TaskInspectReport, TaskProjection,
+    TaskQueueInspectReport, TaskQueueInspectRequest, TaskQueueInspectStatusCount,
+    VerificationCommandRequest, VerificationCommandResult, WorkerLaneDiffInspectReport,
+    WorkerLaneDiffInspectRequest,
 };
 use uuid::Uuid;
 
@@ -504,6 +506,38 @@ fn run_session_command(args: Vec<String>) -> HarnessResult<()> {
             print_context_compile_result(&result);
             Ok(())
         }
+        "model-route" => {
+            let session_id = args
+                .get(1)
+                .ok_or_else(|| HarnessError::new("session id is required"))?;
+            let session_id = Uuid::parse_str(session_id)
+                .map_err(|error| HarnessError::new(error.to_string()))?;
+            let database_url = database_url_from_args(args.clone())?;
+            let task = required_arg_value(&args, "--task")?;
+            let budget = context_budget_from_args(&args)?;
+            let focus_terms = repeated_arg_values(&args, "--focus");
+            let max_output_tokens = optional_arg_value(&args, "--max-output-tokens")
+                .map(|value| parse_usize_arg("--max-output-tokens", value))
+                .transpose()?
+                .unwrap_or(256);
+            let provider = model_provider_from_args(&args)?;
+            let mut runtime = Runtime::connect_postgres(&database_url)?;
+            let result = runtime.run_model_provider_route(
+                session_id,
+                ModelProviderRoutingRequest {
+                    provider,
+                    task: task.to_owned(),
+                    context: SessionContextCompileRequest {
+                        budget,
+                        focus_terms,
+                    },
+                    max_output_tokens,
+                },
+            )?;
+
+            print_model_provider_routing_result(&result);
+            Ok(())
+        }
         "fake-turn" => {
             let session_id = args
                 .get(1)
@@ -773,6 +807,25 @@ fn context_budget_from_args(args: &[String]) -> HarnessResult<ContextBudget> {
     }
 
     Ok(budget)
+}
+
+fn model_provider_from_args(args: &[String]) -> HarnessResult<RuntimeModelProvider> {
+    match optional_arg_value(args, "--provider").unwrap_or("deterministic-fake") {
+        "deterministic-fake" | "fake" => Ok(RuntimeModelProvider::deterministic_fake()),
+        "openai-compatible" => {
+            let model_id = required_arg_value(args, "--model")?;
+            let api_key_env = optional_arg_value(args, "--api-key-env")
+                .unwrap_or(DEFAULT_OPENAI_COMPATIBLE_API_KEY_ENV);
+
+            Ok(RuntimeModelProvider::OpenAiCompatible {
+                model_id: model_id.to_owned(),
+                api_key_env: api_key_env.to_owned(),
+            })
+        }
+        other => Err(HarnessError::new(format!(
+            "unknown model provider: {other}; expected deterministic-fake or openai-compatible"
+        ))),
+    }
 }
 
 fn parse_usize_arg(name: &str, value: &str) -> HarnessResult<usize> {
@@ -2054,8 +2107,43 @@ fn print_context_compile_result(result: &SessionContextCompileResult) {
     println!("event_count={}", result.event_count);
 }
 
+fn print_model_provider_routing_result(result: &ModelProviderRoutingResult) {
+    println!("session_id={}", result.session_id);
+    println!("model_provider={}", result.provider);
+    println!("model_provider_kind={}", result.provider_kind);
+    println!("model_id={}", result.model_id);
+    println!("model_status={}", result.status.as_str());
+    println!("usage_known={}", result.usage_known);
+    println!("max_output_tokens={}", result.max_output_tokens);
+
+    if let Some(summary) = &result.summary {
+        println!("model_summary={summary}");
+    }
+
+    if let Some(skipped_reason) = &result.skipped_reason {
+        println!("model_skipped_reason={skipped_reason}");
+    }
+
+    if let Some(prompt_tokens) = result.prompt_tokens {
+        println!("prompt_tokens={prompt_tokens}");
+    }
+
+    if let Some(completion_tokens) = result.completion_tokens {
+        println!("completion_tokens={completion_tokens}");
+    }
+
+    if let Some(patch) = &result.patch {
+        println!("patch_path={}", patch.path);
+    }
+
+    println!("event_count={}", result.event_count);
+}
+
 fn print_fake_model_turn_result(result: &FakeModelTurnResult) {
     println!("session_id={}", result.session_id);
+    println!("model_provider={}", result.provider);
+    println!("model_provider_kind={}", result.provider_kind);
+    println!("model_id={}", result.model_id);
     println!("patch_path={}", result.patch.path);
     println!("policy_decision={}", result.decision.as_str());
     println!("policy_reason={}", result.reason);
